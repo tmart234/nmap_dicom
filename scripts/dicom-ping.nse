@@ -54,81 +54,6 @@ local http = require "http"
 
 portrule = shortport.port_or_service({104, 2345, 2761, 2762, 4242, 11112}, "dicom", "tcp", "open")
 
--- Extract version from version string based on vendor
-local function extract_clean_version(version_str, vendor)
-  if not version_str then return nil end
-  
-  -- DCMTK versions
-  if vendor == "DCMTK" then
-    -- Common DCMTK version format: OFFIS_DCMTK_362 -> 3.6.2
-    local major, minor, patch = version_str:match("DCMTK_(%d)(%d+)(%d)")
-    if major and minor and patch then
-      return string.format("%s.%s.%s", major, minor, patch)
-    end
-    
-    -- Alternative format: DCMTK_364
-    major, minor, patch = version_str:match("DCMTK_(%d)(%d)(%d)")
-    if major and minor and patch then
-      return string.format("%s.%s.%s", major, minor, patch)
-    end
-  end
-  
-  -- Horos/OsiriX versions
-  if vendor == "Horos" or vendor == "OsiriX" then
-    -- Format: Horos-v3.3.6 or OsiriX-v9.0.2
-    local ver = version_str:match("v(%d+%.%d+%.%d+)")
-    if ver then
-      return ver
-    end
-  end
-  
-  -- ClearCanvas versions
-  if vendor == "ClearCanvas" then
-    -- Format: ClearCanvas_2.0.12345.37893
-    local major, minor = version_str:match("ClearCanvas_(%d+)%.(%d+)")
-    if major and minor then
-      local build = version_str:match("ClearCanvas_%d+%.%d+%.(%d+)")
-      if build then
-        return string.format("%s.%s.%s", major, minor, build)
-      end
-      return string.format("%s.%s", major, minor)
-    end
-  end
-  
-  -- FujiFilm Synapse versions
-  if vendor == "FujiFilm" then
-    -- Format: Synapse_5.7.110
-    local ver = version_str:match("Synapse_(%d+%.%d+%.%d+)")
-    if ver then
-      return ver
-    end
-  end
-  
-  -- Agfa IMPAX versions
-  if vendor == "Agfa" then
-    -- Format: IMPAX_6.5.1.1234
-    local ver = version_str:match("IMPAX_(%d+%.%d+%.%d+%.%d+)")
-    if ver then
-      return ver
-    end
-  end
-  
-  -- Generic version detection: Try standard version format first
-  local version = version_str:match("(%d+%.%d+%.%d+)")
-  if version then
-    return version
-  end
-  
-  -- Try just major.minor format
-  version = version_str:match("(%d+%.%d+)")
-  if version then
-    return version
-  end
-  
-  -- If all else fails, return as is
-  return version_str
-end
-
 action = function(host, port)
   local output = stdnse.output_table()
   
@@ -144,6 +69,7 @@ action = function(host, port)
   
       output.dicom = "DICOM Service Provider discovered!"
       output.config = "Called AET check enabled"
+      output.auth = "Cannot test User Identity Negotiation (AET required)"
     end
     return output
   end
@@ -227,6 +153,45 @@ action = function(host, port)
         nmap.set_port_version(host, port)
       end
     end
+  end
+
+  -- Test for User Identity Negotiation support
+  -- We know that ANY-SCP works as an AET because our initial association succeeded
+  stdnse.debug1("Testing DICOM User Identity Negotiation with AET: ANY-SCP")
+  
+  -- First test with username identity (type 1)
+  local username_status, err = dicom.associate(host, port, "IDCHECK1", "ANY-SCP", "username", nil)
+  
+  -- Second test with username+password identity (type 2)
+  local userpw_status, err2 = dicom.associate(host, port, "IDCHECK2", "ANY-SCP", "username", "password")
+  
+  -- Analyze results
+  if not username_status and not userpw_status then
+    stdnse.debug1("Both identity tests failed, server may require valid credentials")
+    output.auth = "User Identity Negotiation required (credentials rejected)"
+    
+    -- Update Nmap's version information
+    port.version.extrainfo = (port.version.extrainfo or "") .. 
+                             (port.version.extrainfo and " " or "") .. 
+                             "Authentication required"
+    nmap.set_port_version(host, port)
+  elseif username_status and userpw_status then
+    stdnse.debug1("Both identity tests succeeded, server accepts any credentials")
+    output.auth = "User Identity Negotiation supported (accepts any credentials)"
+  elseif username_status and not userpw_status then
+    stdnse.debug1("Username auth succeeded but username+password failed")
+    output.auth = "User Identity Negotiation supported (accepts username only)"
+  elseif not username_status and userpw_status then
+    stdnse.debug1("Username+password auth succeeded but username failed")
+    output.auth = "User Identity Negotiation supported (username+password required)"
+    
+    -- Update Nmap's version information
+    port.version.extrainfo = (port.version.extrainfo or "") .. 
+                             (port.version.extrainfo and " " or "") .. 
+                             "Username+password required"
+    nmap.set_port_version(host, port)
+  else
+    output.auth = "No User Identity Negotiation required (Insecure)"
   end
 
   return output

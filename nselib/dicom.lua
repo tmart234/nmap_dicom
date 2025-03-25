@@ -418,7 +418,43 @@ function associate(host, port, calling_aet, called_aet)
                                 0x55,
                                 0x0,
                                 implementation_version)
-  
+    -- Add User Identity item if credentials are provided
+    if username then
+      local identity_item = ""
+      
+      if password then
+        -- Type 2: Username/Password
+        identity_item = string.pack(">B B I2 B B s2 s2",
+                                   0x58, -- User Identity Type (0x58)
+                                   0x0,  -- Reserved
+                                   4 + #username + 2 + #password, -- Length
+                                   0x2,  -- Identity Type 2 (Username/Password)
+                                   0x0,  -- Reserved
+                                   username, -- Username
+                                   password) -- Password
+      else
+        -- Type 1: Username only
+        identity_item = string.pack(">B B I2 B B s2", 
+                                   0x58, -- User Identity Type (0x58)
+                                   0x0,  -- Reserved
+                                   4 + #username, -- Length
+                                   0x1,  -- Identity Type 1 (Username)
+                                   0x0,  -- Reserved
+                                   username) -- Username
+      end
+      
+      -- Add identity item to userinfo context
+      if #identity_item > 0 then
+        -- Update length field in userinfo context
+        local _, userinfo_length = string.unpack(">I2", userinfo_context:sub(3, 4))
+        local new_userinfo_length = userinfo_length + #identity_item
+        userinfo_context = userinfo_context:sub(1, 2) .. 
+                            string.pack(">I2", new_userinfo_length) .. 
+                            userinfo_context:sub(5) ..
+                            identity_item
+      end
+    end
+                        
   local called_ae_title = called_aet or stdnse.get_script_args("dicom.called_aet") or "ANY-SCP"
   local calling_ae_title = calling_aet or stdnse.get_script_args("dicom.calling_aet") or "ECHOSCU"
   if #called_ae_title > 16 or #calling_ae_title > 16 then

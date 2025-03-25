@@ -1,0 +1,22 @@
+version: '3'
+
+services:
+  orthanc:
+    image: orthancteam/orthanc:latest
+    ports:
+      - "11112:4242"  # DICOM port
+      - "8042:8042"  # Web UI
+    environment:
+      - ORTHANC__NAME=ORTHANC_TEST
+      - ORTHANC__DICOM_SERVER_ENABLED=true
+      - VERBOSE_ENABLED=true
+      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_ECHO=true # always answer C-ECHO
+      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_FIND=true
+      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_MOVE=true
+      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_STORE=true
+      - ORTHANC__DICOM_SERVER_VERIFY_CALLED_AET=false # No AE Title Validation
+    volumes:
+      - orthanc_db:/var/lib/orthanc/db
+
+volumes:
+  orthanc_db:

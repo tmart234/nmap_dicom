@@ -3,11 +3,9 @@
 # place in the nmap directory
 
 # Get the current directory
-SCRIPT_DIR="$(pwd)/scripts/"
 PORT=11112
-echo "Script dir is: $SCRIPT_DIR and port is: $PORT"
 
-# Start the Orthanc container
+# Start the Orthanc containcd er
 echo "Starting Orthanc DICOM server..."
 docker-compose up -d
 
@@ -20,7 +18,7 @@ sleep 15
 #   scanning localhost:4242 will reach the containers DICOM service, 
 #   eliminating the need to scan against the container's IP address.
 echo -e "\nTesting DICOM server on host port $PORT..."
-nmap -p $PORT -d --script="$SCRIPT_DIR/dicom-ping.nse" --script-trace localhost
+nmap -p $PORT -d --script="dicom-ping.nse" --script-trace localhost
 
 # Show Orthanc logs
 echo -e "\nOrthanc server logs:"

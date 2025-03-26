@@ -155,44 +155,5 @@ action = function(host, port)
     end
   end
 
-  -- Test for User Identity Negotiation support
-  -- We know that ANY-SCP works as an AET because our initial association succeeded
-  stdnse.debug1("Testing DICOM User Identity Negotiation with AET: ANY-SCP")
-  
-  -- First test with username identity (type 1)
-  local username_status, err = dicom.associate(host, port, "IDCHECK1", "ANY-SCP", "username", nil)
-  
-  -- Second test with username+password identity (type 2)
-  local userpw_status, err2 = dicom.associate(host, port, "IDCHECK2", "ANY-SCP", "username", "password")
-  
-  -- Analyze results
-  if not username_status and not userpw_status then
-    stdnse.debug1("Both identity tests failed, server may require valid credentials")
-    output.auth = "User Identity Negotiation required (credentials rejected)"
-    
-    -- Update Nmap's version information
-    port.version.extrainfo = (port.version.extrainfo or "") .. 
-                             (port.version.extrainfo and " " or "") .. 
-                             "Authentication required"
-    nmap.set_port_version(host, port)
-  elseif username_status and userpw_status then
-    stdnse.debug1("Both identity tests succeeded, server accepts any credentials")
-    output.auth = "User Identity Negotiation supported (accepts any credentials)"
-  elseif username_status and not userpw_status then
-    stdnse.debug1("Username auth succeeded but username+password failed")
-    output.auth = "User Identity Negotiation supported (accepts username only)"
-  elseif not username_status and userpw_status then
-    stdnse.debug1("Username+password auth succeeded but username failed")
-    output.auth = "User Identity Negotiation supported (username+password required)"
-    
-    -- Update Nmap's version information
-    port.version.extrainfo = (port.version.extrainfo or "") .. 
-                             (port.version.extrainfo and " " or "") .. 
-                             "Username+password required"
-    nmap.set_port_version(host, port)
-  else
-    output.auth = "No User Identity Negotiation required (Insecure)"
-  end
-
   return output
 end

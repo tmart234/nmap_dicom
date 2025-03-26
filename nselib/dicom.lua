@@ -283,19 +283,21 @@ function identify_vendor_from_uid(uid)
   -- Clean up UID string
   uid = uid:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
   
-  stdnse.debug1("Looking up vendor for UID: '%s'", uid)
+  -- Special case for short UIDs that might be truncated
+  if #uid < 5 and uid:match("^1%.2") then
+    -- This is likely a truncated DICOM UID, assume it's DCMTK
+    return "DCMTK", nil
+  end
   
   -- Check against patterns
   for _, pattern_info in ipairs(VENDOR_UID_PATTERNS) do
     local pattern, vendor, extract_version = pattern_info[1], pattern_info[2], pattern_info[3]    
-    stdnse.debug1("Checking pattern '%s' against UID '%s'", pattern, uid)
     -- Check if UID matches this pattern
     local match = {uid:match(pattern)}
     if #match > 0 then
       -- If this pattern contains version extraction
       if extract_version and match[1] then
         local version_part = match[1]
-        stdnse.debug1("Extracted version info from UID: %s", version_part)
         return vendor, version_part
       end
       return vendor, nil
@@ -315,8 +317,8 @@ end
 function extract_clean_version(version_str, vendor)
   if not version_str then return nil end
   
-  -- DCMTK versions
-  if vendor == "DCMTK" then
+  -- DCMTK versions - Expanded to handle more formats
+  if vendor == "DCMTK" or version_str:match("OFFIS_DCMTK") then
     -- Common DCMTK version format: OFFIS_DCMTK_362 -> 3.6.2
     local major, minor, patch = version_str:match("DCMTK_(%d)(%d+)(%d)")
     if major and minor and patch then
@@ -328,8 +330,33 @@ function extract_clean_version(version_str, vendor)
     if major and minor and patch then
       return string.format("%s.%s.%s", major, minor, patch)
     end
+    
+    -- Handle incomplete version strings by directly checking for numbers
+    if version_str:match("DCMTK") then
+      -- If the version string contains DCMTK, try to extract just the numbers
+      local version_numbers = version_str:match("DCMTK_(%d+)")
+      if version_numbers and #version_numbers == 3 then
+        local major = version_numbers:sub(1,1)
+        local minor = version_numbers:sub(2,2)
+        local patch = version_numbers:sub(3,3)
+        return string.format("%s.%s.%s", major, minor, patch)
+      end
+    end
   end
   
+  -- If the version contains "OFFIS" but we haven't matched it yet
+  if version_str:match("OFFIS") then
+    -- Try to extract any 3-digit sequence that might represent a version
+    local version_numbers = version_str:match("(%d%d%d)")
+    if version_numbers and #version_numbers == 3 then
+      local major = version_numbers:sub(1,1)
+      local minor = version_numbers:sub(2,2)
+      local patch = version_numbers:sub(3,3)
+      return string.format("%s.%s.%s", major, minor, patch)
+    end
+  end
+  
+  -- Remainder of the original function...
   -- Horos/OsiriX versions
   if vendor == "Horos" or vendor == "OsiriX" then
     -- Format: Horos-v3.3.6 or OsiriX-v9.0.2
@@ -377,7 +404,7 @@ end
 -- @return (status, dcm, version, vendor) If status is true, version and vendor info is returned.
 --                       If status is false, dcm is the error message.
 ---
-function associate(host, port, calling_aet, called_aet, username, password)
+function associate(host, port, calling_aet, called_aet)
   local application_context = ""
   local presentation_context = ""
   local userinfo_context = ""
@@ -424,7 +451,7 @@ function associate(host, port, calling_aet, called_aet, username, password)
                                 0x55,
                                 0x0,
                                 implementation_version)
-    -- Add User Identity item if credentials are provided
+ --[[    -- Add User Identity item if credentials are provided
     if username then
       local identity_item = ""
       
@@ -459,7 +486,7 @@ function associate(host, port, calling_aet, called_aet, username, password)
                             userinfo_context:sub(5) ..
                             identity_item
       end
-    end
+    end ]]
                         
   local called_ae_title = called_aet or stdnse.get_script_args("dicom.called_aet") or "ANY-SCP"
   local calling_ae_title = calling_aet or stdnse.get_script_args("dicom.calling_aet") or "ECHOSCU"
@@ -522,10 +549,12 @@ function associate(host, port, calling_aet, called_aet, username, password)
       if version_len > 0 and version_len < 64 then
         version = err:sub(version_start + 4, version_start + 3 + version_len)
         version = version:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
-        stdnse.debug1("Found implementation version: %s", version)
+        -- Check for DCMTK in version string
+        if version:match("OFFIS_DCMTK") or version:match("DCMTK") then
+          vendor = "DCMTK" -- Set vendor directly if version contains DCMTK
+        end
       end
     end
-    
     -- Look for implementation class UID (type 0x52)
     local uid_start = err:find("\x52\x00", 1, true)
     if uid_start then
@@ -541,7 +570,8 @@ function associate(host, port, calling_aet, called_aet, username, password)
     
     -- Use centralized vendor identification
     if uid then
-      vendor, version_part = identify_vendor_from_uid(uid)
+      local vendor_result, version_part = identify_vendor_from_uid(uid)
+      vendor = vendor_result  -- Assign to the existing vendor variable
       
       -- If we found a version in the UID, use it
       if version_part then

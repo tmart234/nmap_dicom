@@ -89,7 +89,7 @@ action = function(host, port)
   -- Add version information if available
   if version then
     stdnse.debug1("Detected DICOM version string: %s", version)
-    local clean_version = extract_clean_version(version, vendor)
+    local clean_version = dicom.extract_clean_version(version, vendor)
     if clean_version then
       stdnse.debug1("Cleaned version: %s", clean_version)
       output.version = clean_version

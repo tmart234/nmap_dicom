@@ -58,7 +58,7 @@ end
 
 -- Define vendor UIDs lookup table with patterns and version indicators
 local VENDOR_UID_PATTERNS = {
-  {"^1%.2%.276%.0%.7230010%.3%.0%.3%.6%.(%d+)$", "DCMTK", true},    -- DCMTK with version extraction
+  {"^1%.2%.276%.0%.7230010%.3%.0%.3%.6%.(%d+)", "DCMTK", true},    -- DCMTK with version extraction
   {"^1%.2%.276%.0%.7230010%.3%.0%.3%.6",         "DCMTK"},          -- General DCMTK
   {"^1%.4%.3%.6%.1%.4%.1%.78293%.3%.1",          "Orthanc"},        -- Orthanc
   {"^1%.3%.46%.670589%.50%.1%.4",                "Conquest"},       -- Conquest PACS
@@ -179,36 +179,43 @@ function parse_implementation_version(data)
     return nil, nil
   end
   
-  -- First try direct hex pattern extraction for common patterns
-  -- Look for type 0x52 (implementation UID) and type 0x55 (implementation version)
-  -- Format is typically: Type(1) + Reserved(1) + Length(2) + Value(N)
+  -- First try direct binary search for key markers
+  -- Type 0x52 = Implementation Class UID, type 0x55 = Implementation Version Name
   
-  -- Find all patterns that look like UIDs (type 0x52)
-  for pattern in data:gmatch("\x52\x00..([%d%.]+)") do
-    if pattern:match("^%d+%.%d+%.%d+%.") then
-      -- Found a potential UID pattern
-      uid = pattern:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
-      stdnse.debug1("Pattern extraction - UID: %s", uid)
-      break
+  -- Look for Implementation Class UID (type 0x52)
+  local uid_start = data:find(string.char(0x52, 0x00), 1, true)
+  if uid_start then
+    stdnse.debug2("Found UID marker at offset %d", uid_start)
+    -- Get length (2 bytes after marker)
+    local _, uid_len = string.unpack(">I2", data, uid_start + 2)
+    if uid_len > 0 and uid_len < 64 and uid_start + 4 + uid_len <= #data then
+      -- Extract the UID from the correct position
+      uid = data:sub(uid_start + 4, uid_start + 4 + uid_len - 1)
+      uid = uid:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
+      stdnse.debug1("Extracted UID: %s", uid)
     end
   end
   
-  -- Find all patterns that look like version strings (type 0x55)
-  for pattern in data:gmatch("\x55\x00..(.-)\0") do
-    if #pattern > 0 then
-      -- Found a potential version string
-      version = pattern:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
-      stdnse.debug1("Pattern extraction - Version: %s", version)
-      break
+  -- Look for Implementation Version Name (type 0x55)
+  local version_start = data:find(string.char(0x55, 0x00), 1, true)
+  if version_start then
+    stdnse.debug2("Found Version marker at offset %d", version_start)
+    -- Get length (2 bytes after marker)
+    local _, version_len = string.unpack(">I2", data, version_start + 2)
+    if version_len > 0 and version_len < 64 and version_start + 4 + version_len <= #data then
+      -- Extract the version from the correct position
+      version = data:sub(version_start + 4, version_start + 4 + version_len - 1)
+      version = version:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
+      stdnse.debug1("Extracted Version: %s", version)
     end
   end
   
-  -- If we found both through pattern matching, return early
+  -- If we found both through direct binary search, return early
   if uid and version then
     return version, uid
   end
   
-  -- Fall back to traditional parsing
+  -- Fall back to traditional parsing if direct search fails
   -- Start after the fixed association header (68 bytes)
   local offset = 68
   
@@ -263,7 +270,6 @@ function parse_implementation_version(data)
   
   return version, uid
 end
-
 ---
 -- identify_vendor_from_uid(uid) Gets vendor name and version from the UID using pattern matching
 --
@@ -281,8 +287,8 @@ function identify_vendor_from_uid(uid)
   
   -- Check against patterns
   for _, pattern_info in ipairs(VENDOR_UID_PATTERNS) do
-    local pattern, vendor, extract_version = pattern_info[1], pattern_info[2], pattern_info[3]
-    
+    local pattern, vendor, extract_version = pattern_info[1], pattern_info[2], pattern_info[3]    
+    stdnse.debug1("Checking pattern '%s' against UID '%s'", pattern, uid)
     -- Check if UID matches this pattern
     local match = {uid:match(pattern)}
     if #match > 0 then
@@ -371,7 +377,7 @@ end
 -- @return (status, dcm, version, vendor) If status is true, version and vendor info is returned.
 --                       If status is false, dcm is the error message.
 ---
-function associate(host, port, calling_aet, called_aet)
+function associate(host, port, calling_aet, called_aet, username, password)
   local application_context = ""
   local presentation_context = ""
   local userinfo_context = ""

@@ -163,113 +163,129 @@ function pdu_header_encode(pdu_type, length)
 end
 
 ---
--- parse_implementation_version(data) Extracts implementation version and UID from DICOM response
+-- parse_implementation_version(data) Extracts implementation version and UID from DICOM A-ASSOCIATE-AC PDU
 --
--- @param data DICOM response data
--- @return version, uid Implementation version string and UID
+-- @param data Full A-ASSOCIATE-AC PDU data
+-- @return version, uid Implementation version string and UID (both can be nil)
 ---
 function parse_implementation_version(data)
-  stdnse.debug1("Parsing implementation version from response of length %d", #data)
-  
-  -- Initialize variables
+  stdnse.debug1("Parsing implementation info from response of length %d", #data)
   local version, uid = nil, nil
-  
-  if #data < 74 then -- Minimum length for a response with user info
-    stdnse.debug1("Response too short for version parsing: %d bytes", #data)
+  local data_len = #data
+
+  -- Minimum length check (PDU header + fixed AC fields + User Info item header)
+  -- PDU Header(6) + ProtoVer(2) + Reserved(2) + CalledAE(16) + CallingAE(16) + Reserved(32) + AppCtxItemHeader(4) = 78
+  -- Let's be slightly less strict, require at least enough for User Info Item header (approx 72 based on request structure)
+  if data_len < 72 then
+    stdnse.debug1("Response too short for reliable User Information parsing: %d bytes", data_len)
     return nil, nil
   end
-  
-  -- First try direct binary search for key markers
-  -- Type 0x52 = Implementation Class UID, type 0x55 = Implementation Version Name
-  
-  -- Look for Implementation Class UID (type 0x52)
-  local uid_start = data:find(string.char(0x52, 0x00), 1, true)
-  if uid_start then
-    stdnse.debug2("Found UID marker at offset %d", uid_start)
-    -- Get length (2 bytes after marker)
-    local _, uid_len = string.unpack(">I2", data, uid_start + 2)
-    if uid_len > 0 and uid_len < 64 and uid_start + 4 + uid_len <= #data then
-      -- Extract the UID from the correct position
-      uid = data:sub(uid_start + 4, uid_start + 4 + uid_len - 1)
-      uid = uid:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
-      stdnse.debug1("Extracted UID: %s", uid)
+
+  -- *** Find User Information item (0x50) ***
+  -- It should follow the fixed association parameters (68 bytes in request, similar in accept)
+  local userinfo_marker = string.char(0x50, 0x00)
+  -- Start searching after the fixed header part (approx 68 bytes) for efficiency, but search whole string for robustness.
+  local userinfo_start = data:find(userinfo_marker, 60, true) -- Start search around where it should be
+
+  if not userinfo_start then
+      stdnse.debug1("User Information item (0x50 0x00) marker not found.")
+      return nil, nil -- Can't proceed without User Info item
+  end
+  stdnse.debug2("Found User Information marker at offset %d", userinfo_start)
+
+  -- Check if there's enough data for User Info Length field (2 bytes)
+  if userinfo_start + 3 > data_len then
+     stdnse.debug1("Not enough data for User Information length at offset %d.", userinfo_start)
+     return nil, nil
+  end
+
+  -- Get User Info Length
+  local _, userinfo_len = string.unpack(">I2", data, userinfo_start + 2) -- Length is 2 bytes after marker
+  local userinfo_payload_start = userinfo_start + 4
+  local userinfo_payload_end = userinfo_start + 3 + userinfo_len
+  stdnse.debug2("User Information item length: %d. Payload offsets: %d - %d", userinfo_len, userinfo_payload_start, userinfo_payload_end)
+
+  -- Validate User Info boundaries
+  if userinfo_payload_end > data_len then
+     stdnse.debug1("User Information length (%d) exceeds data boundary (%d). Truncating parse range.", userinfo_len, data_len)
+     userinfo_payload_end = data_len
+  end
+  if userinfo_payload_start > userinfo_payload_end then
+      stdnse.debug1("User Information payload start offset is beyond its end offset. Cannot parse sub-items.")
+      return nil, nil
+  end
+
+  -- *** Iterate through sub-items within User Information ***
+  local offset = userinfo_payload_start
+  while offset < userinfo_payload_end - 3 do -- Need at least 4 bytes for Type, Reserved, Length
+    local sub_type = string.byte(data, offset + 1)
+    local reserved_byte = string.byte(data, offset + 2)
+
+    -- Expect Reserved byte to be 0x00
+    if reserved_byte ~= 0x00 then
+        stdnse.debug2("Sub-item at offset %d has non-zero reserved byte (0x%02X). Skipping item (assuming fixed length or error).", offset, reserved_byte)
+        -- This case is tricky. We don't know the length. Advance by a minimum? For now, stop parsing sub-items.
+        break
     end
-  end
-  
-  -- Look for Implementation Version Name (type 0x55)
-  local version_start = data:find(string.char(0x55, 0x00), 1, true)
-  if version_start then
-    stdnse.debug2("Found Version marker at offset %d", version_start)
-    -- Get length (2 bytes after marker)
-    local _, version_len = string.unpack(">I2", data, version_start + 2)
-    if version_len > 0 and version_len < 64 and version_start + 4 + version_len <= #data then
-      -- Extract the version from the correct position
-      version = data:sub(version_start + 4, version_start + 4 + version_len - 1)
-      version = version:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
-      stdnse.debug1("Extracted Version: %s", version)
+
+    -- Check for sub-item length field
+    if offset + 3 > userinfo_payload_end then
+        stdnse.debug1("Not enough data for sub-item length at offset %d", offset)
+        break
     end
-  end
-  
-  -- If we found both through direct binary search, return early
-  if uid and version then
-    return version, uid
-  end
-  
-  -- Fall back to traditional parsing if direct search fails
-  -- Start after the fixed association header (68 bytes)
-  local offset = 68
-  
-  -- Find the User Information item (type 0x50)
-  while offset < #data - 4 do
-    local item_type = string.byte(data, offset + 1)
-    
-    if item_type == 0x50 then -- User Information
-      stdnse.debug2("Found User Information at offset %d", offset)
-      
-      -- Get item length
-      local _, item_length = string.unpack(">I2", data, offset + 3)
-      local item_end = offset + 4 + item_length
-      offset = offset + 4 -- Move past item header
-      
-      -- Search for implementation items in user info
-      while offset < item_end - 4 and offset < #data - 4 do
-        local sub_type = string.byte(data, offset + 1)
-        local _, sub_length = string.unpack(">I2", data, offset + 3)
-        
-        -- Sanity check on length
-        if sub_length > 64 or offset + 4 + sub_length > #data then
-          stdnse.debug1("Invalid sub-item length: %d at offset %d", sub_length, offset)
-          break
+
+    local _, sub_length = string.unpack(">I2", data, offset + 2) -- Length starts 2 bytes after type
+    local sub_value_start = offset + 4
+    local sub_value_end = offset + 3 + sub_length
+    stdnse.debug2("Found sub-item type 0x%02X, length %d at offset %d. Value range: %d - %d", sub_type, sub_length, offset, sub_value_start, sub_value_end)
+
+    -- Validate sub-item value boundaries
+    if sub_value_end > userinfo_payload_end then
+        stdnse.debug1("Sub-item (type 0x%02X) length %d exceeds User Info boundary (%d) at offset %d. Stopping sub-item parse.", sub_type, sub_length, userinfo_payload_end, offset)
+        break
+    end
+    if sub_value_start > sub_value_end then
+        stdnse.debug1("Sub-item (type 0x%02X) value start offset %d is beyond end offset %d. Skipping item.", sub_type, sub_value_start, sub_value_end)
+        offset = sub_value_end + 1 -- Move to where next item should be
+        goto continue_loop -- Use goto for clarity to continue outer while loop
+    end
+
+    -- Extract and clean value if length is positive
+    if sub_length > 0 then
+        -- Sanity check length (e.g., max 64 for UIDs/Versions)
+        if sub_length > 128 then -- Increased limit slightly
+             stdnse.debug1("Sub-item (type 0x%02X) length %d seems excessive (>128) at offset %d. Skipping value extraction.", sub_type, sub_length, offset)
+        else
+            local value_raw = data:sub(sub_value_start, sub_value_end)
+            local value_cleaned = value_raw:gsub("%z", ""):gsub("^%s*", ""):gsub("%s*$", "") -- Trim whitespace and nulls
+
+            if sub_type == 0x52 then -- Implementation Class UID
+                if not uid then -- Only take the first one found
+                    uid = value_cleaned
+                    stdnse.debug1("Extracted UID: '%s'", uid)
+                end
+            elseif sub_type == 0x55 then -- Implementation Version Name
+                if not version then -- Only take the first one found
+                    version = value_cleaned
+                    stdnse.debug1("Extracted Version: '%s'", version)
+                end
+            -- Add other user info sub-types here if needed (e.g., 0x51 Max PDU Length)
+            end
         end
-        
-        if sub_type == 0x52 then -- Implementation Class UID
-          local extracted_uid = string.sub(data, offset + 5, offset + 4 + sub_length)
-          extracted_uid = extracted_uid:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
-          stdnse.debug2("Found Implementation UID: %s", extracted_uid)
-          if not uid then uid = extracted_uid end
-        elseif sub_type == 0x55 then -- Implementation Version
-          local extracted_version = string.sub(data, offset + 5, offset + 4 + sub_length)
-          extracted_version = extracted_version:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
-          stdnse.debug2("Found Implementation Version: %s", extracted_version)
-          if not version then version = extracted_version end
-        end
-        
-        offset = offset + 4 + sub_length
-      end
-      break
     else
-      -- Skip to next item
-      local _, item_length = string.unpack(">I2", data, offset + 3)
-      offset = offset + 4 + item_length
+         stdnse.debug2("Sub-item (type 0x%02X) has zero length.", sub_type)
     end
-  end
-  
-  -- Add detailed debug output
-  stdnse.debug1("Final extracted values - Version: %s, UID: %s", 
-                version or "nil", uid or "nil")
-  
+
+    -- Move offset to the beginning of the next sub-item
+    offset = sub_value_end + 1
+
+    ::continue_loop::
+  end -- while offset
+
+  stdnse.debug1("Finished parsing User Info sub-items. Final raw values - Version: '%s', UID: '%s'", version or "nil", uid or "nil")
   return version, uid
 end
+
 ---
 -- identify_vendor_from_uid(uid) Gets vendor name and version from the UID using pattern matching
 --
@@ -397,210 +413,144 @@ end
 
 
 ---
+---
 -- associate(host, port) Attempts to associate to a DICOM Service Provider by sending an A-ASSOCIATE request.
 --
 -- @param host Host object
 -- @param port Port object
--- @return (status, dcm, version, vendor) If status is true, version and vendor info is returned.
---                       If status is false, dcm is the error message.
+-- @return (status, dcm_or_error, version, vendor) If status is true, version and vendor info is returned.
+--                                                If status is false, dcm_or_error is the error message.
 ---
 function associate(host, port, calling_aet, called_aet)
   local application_context = ""
   local presentation_context = ""
   local userinfo_context = ""
-  
+
   local status, dcm = start_connection(host, port)
   if status == false then
-    return false, dcm
+    return false, dcm -- dcm contains the error message from start_connection
   end
-  
-  local application_context_name = "1.2.840.10008.3.1.1.1"
-  application_context = string.pack(">B B s2",
-                                    0x10,
-                                    0x0,
-                                    application_context_name)
-  
-  local abstract_syntax_name = "1.2.840.10008.1.1"
-  local transfer_syntax_name = "1.2.840.10008.1.2"
-  presentation_context = string.pack(">B B I2 B B B B B B s2 B B s2",
-                                    0x20, -- Presentation context type ( 1 byte )
-                                    0x0,  -- Reserved ( 1 byte )
-                                    0x2e,   -- Item Length ( 2 bytes )
-                                    0x1,  -- Presentation context id ( 1 byte )
-                                    0x0,0x0,0x0,  -- Reserved ( 3 bytes )
-                                    0x30, -- Abstract Syntax Tree ( 1 byte )
-                                    0x0,  -- Reserved ( 1 byte )
-                                    abstract_syntax_name,
-                                    0x40, -- Transfer Syntax ( 1 byte )
-                                    0x0,  -- Reserved ( 1 byte )
-                                    transfer_syntax_name)
-                                    
-  local implementation_id = "1.2.276.0.7230010.3.0.3.6.2"
-  local implementation_version = "OFFIS_DCMTK_362"
-  userinfo_context = string.pack(">B B I2 B B I2 I4 B B s2 B B s2",
-                                0x50,    -- Type 0x50 (1 byte)
-                                0x0,     -- Reserved ( 1 byte )
-                                0x3a,    -- Length ( 2 bytes )
-                                0x51,    -- Type 0x51 ( 1 byte) 
-                                0x0,     -- Reserved ( 1 byte)
-                                0x04,     -- Length ( 2 bytes )
-                                0x4000,   -- DATA ( 4 bytes )
-                                0x52,    -- Type 0x52 (1 byte)
-                                0x0,
-                                implementation_id,
-                                0x55,
-                                0x0,
-                                implementation_version)
- --[[    -- Add User Identity item if credentials are provided
-    if username then
-      local identity_item = ""
-      
-      if password then
-        -- Type 2: Username/Password
-        identity_item = string.pack(">B B I2 B B s2 s2",
-                                   0x58, -- User Identity Type (0x58)
-                                   0x0,  -- Reserved
-                                   4 + #username + 2 + #password, -- Length
-                                   0x2,  -- Identity Type 2 (Username/Password)
-                                   0x0,  -- Reserved
-                                   username, -- Username
-                                   password) -- Password
+
+  -- *** Ensure socket closure using try/finally pattern ***
+  local assoc_request, header, err, resp_type, resp_length, version_str, uid_str, vendor, clean_version
+  status, err = stdnse.catch(function()
+
+    -- (Keep the existing code here to build application_context, presentation_context, userinfo_context)
+    local application_context_name = "1.2.840.10008.3.1.1.1"
+    application_context = string.pack(">B B s2", 0x10, 0x0, application_context_name)
+
+    local abstract_syntax_name = "1.2.840.10008.1.1"
+    local transfer_syntax_name = "1.2.840.10008.1.2"
+    presentation_context = string.pack(">B B I2 B B B B B B s2 B B s2", 0x20, 0x0, 0x2e, 0x1, 0x0,0x0,0x0, 0x30, 0x0, abstract_syntax_name, 0x40, 0x0, transfer_syntax_name)
+
+    local implementation_id = "1.2.276.0.7230010.3.0.3.6.2" -- Note: This is hardcoded client info, not server's
+    local implementation_version = "OFFIS_DCMTK_362"      -- Note: This is hardcoded client info, not server's
+    userinfo_context = string.pack(">B B I2 B B I2 I4 B B s2 B B s2", 0x50, 0x0, 0x3a, 0x51, 0x0, 0x04, 0x4000, 0x52, 0x0, implementation_id, 0x55, 0x0, implementation_version)
+    -- (End of building context)
+
+    local called_ae_title = called_aet or stdnse.get_script_args("dicom.called_aet") or "ANY-SCP"
+    local calling_ae_title = calling_aet or stdnse.get_script_args("dicom.calling_aet") or "ECHOSCU"
+    if #called_ae_title > 16 or #calling_ae_title > 16 then
+      error("Calling/Called Application Entity Title must be less than 16 bytes")
+    end
+    called_ae_title = ("%-16s"):format(called_ae_title)
+    calling_ae_title = ("%-16s"):format(calling_ae_title)
+
+    -- ASSOCIATE request body
+    assoc_request = string.pack(">I2 I2 c16 c16 c32", 0x1, 0x0, called_ae_title, calling_ae_title, "")
+                       .. application_context
+                       .. presentation_context
+                       .. userinfo_context
+
+    local header_status
+    header_status, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"], #assoc_request)
+    if header_status == false then
+      error("Failed to encode PDU header: " .. header)
+    end
+
+    assoc_request = header .. assoc_request
+
+    stdnse.debug2("PDU len minus header:%d", #assoc_request-#header)
+    if #assoc_request < MIN_SIZE_ASSOC_REQ then
+      error(string.format("ASSOCIATE request PDU must be at least %d bytes and we tried to send %d.", MIN_SIZE_ASSOC_REQ, #assoc_request))
+    end
+
+    local send_status, send_err = send(dcm, assoc_request)
+    if send_status == false then
+      error(string.format("Couldn't send ASSOCIATE request:%s", send_err))
+    end
+
+    local receive_status, receive_data = receive(dcm)
+    if receive_status == false then
+      error(string.format("Couldn't read ASSOCIATE response:%s", receive_data))
+    end
+    err = receive_data -- Assign received data to err for parsing
+
+    -- Check minimum length before unpacking header
+    if #err < MIN_HEADER_LEN then
+      error("Received response too short for PDU header")
+    end
+    resp_type, _, resp_length = string.unpack(">B B I4", err) -- Unpack header
+    stdnse.debug1("PDU Type:%d Length:%d", resp_type, resp_length)
+
+    -- Check if it's an ACCEPT PDU
+    if resp_type ~= PDU_CODES["ASSOCIATE_ACCEPT"] then
+      if resp_type == PDU_CODES["ASSOCIATE_REJECT"] then
+         stdnse.debug1("ASSOCIATE REJECT message found!")
+         -- TODO: Optionally parse reject reason/source/diagnostic here
+         error("ASSOCIATE REJECT received")
       else
-        -- Type 1: Username only
-        identity_item = string.pack(">B B I2 B B s2", 
-                                   0x58, -- User Identity Type (0x58)
-                                   0x0,  -- Reserved
-                                   4 + #username, -- Length
-                                   0x1,  -- Identity Type 1 (Username)
-                                   0x0,  -- Reserved
-                                   username) -- Username
-      end
-      
-      -- Add identity item to userinfo context
-      if #identity_item > 0 then
-        -- Update length field in userinfo context
-        local _, userinfo_length = string.unpack(">I2", userinfo_context:sub(3, 4))
-        local new_userinfo_length = userinfo_length + #identity_item
-        userinfo_context = userinfo_context:sub(1, 2) .. 
-                            string.pack(">I2", new_userinfo_length) .. 
-                            userinfo_context:sub(5) ..
-                            identity_item
-      end
-    end ]]
-                        
-  local called_ae_title = called_aet or stdnse.get_script_args("dicom.called_aet") or "ANY-SCP"
-  local calling_ae_title = calling_aet or stdnse.get_script_args("dicom.calling_aet") or "ECHOSCU"
-  if #called_ae_title > 16 or #calling_ae_title > 16 then
-    return false, "Calling/Called Application Entity Title must be less than 16 bytes"
-  end
-  called_ae_title = ("%-16s"):format(called_ae_title)
-  calling_ae_title = ("%-16s"):format(calling_ae_title)
-
- -- ASSOCIATE request
-  local assoc_request = string.pack(">I2 I2 c16 c16 c32",
-                                  0x1, -- Protocol version ( 2 bytes )
-                                  0x0, -- Reserved section ( 2 bytes that should be set to 0x0 )
-                                  called_ae_title, -- Called AE title ( 16 bytes)
-                                  calling_ae_title, -- Calling AE title ( 16 bytes)
-                                  "") -- Reserved section ( 32 bytes set to 0x0 )
-                                  .. application_context
-                                  .. presentation_context
-                                  .. userinfo_context
- 
-  local status, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"], #assoc_request)
-
-  -- Something might be wrong with our header
-  if status == false then 
-    return false, header
-  end
-
-  assoc_request = header .. assoc_request
- 
-  stdnse.debug2("PDU len minus header:%d", #assoc_request-#header)
-  if #assoc_request < MIN_SIZE_ASSOC_REQ then
-    return false, string.format("ASSOCIATE request PDU must be at least %d bytes and we tried to send %d.", MIN_SIZE_ASSOC_REQ, #assoc_request)
-  end 
-  local status, err = send(dcm, assoc_request)
-  if status == false then
-    return false, string.format("Couldn't send ASSOCIATE request:%s", err)
-  end
-  status, err = receive(dcm)
-  if status == false then
-    return false, string.format("Couldn't read ASSOCIATE response:%s", err)
-  end
-
-  local resp_type, _, resp_length = string.unpack(">B B I4", err)
-  stdnse.debug1("PDU Type:%d Length:%d", resp_type, resp_length)
-
-  if resp_type == PDU_CODES["ASSOCIATE_ACCEPT"] then
-    stdnse.debug1("ASSOCIATE ACCEPT message found!")
-    
-    -- Direct string inspection - more reliable than complex parsing
-    local version = nil
-    local uid = nil
-    local vendor = nil
-    
-    -- Look for implementation version name (type 0x55)
-    local version_start = err:find("\x55\x00", 1, true)
-    if version_start then
-      -- Pattern: Type(0x55) + Reserved(0x00) + Length(2 bytes) + String
-      local len_bytes = err:sub(version_start + 2, version_start + 3)
-      local _, version_len = string.unpack(">I2", len_bytes)
-      if version_len > 0 and version_len < 64 then
-        version = err:sub(version_start + 4, version_start + 3 + version_len)
-        version = version:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
-        -- Check for DCMTK in version string
-        if version:match("OFFIS_DCMTK") or version:match("DCMTK") then
-          vendor = "DCMTK" -- Set vendor directly if version contains DCMTK
-        end
+         stdnse.debug1("Received unexpected PDU type: %d", resp_type)
+         error("Received unexpected response PDU type")
       end
     end
-    -- Look for implementation class UID (type 0x52)
-    local uid_start = err:find("\x52\x00", 1, true)
-    if uid_start then
-      -- Pattern: Type(0x52) + Reserved(0x00) + Length(2 bytes) + String
-      local len_bytes = err:sub(uid_start + 2, uid_start + 3)
-      local _, uid_len = string.unpack(">I2", len_bytes)
-      if uid_len > 0 and uid_len < 64 then
-        uid = err:sub(uid_start + 4, uid_start + 3 + uid_len)
-        uid = uid:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
-        stdnse.debug1("Found implementation UID: %s", uid)
+
+    -- *** PARSE using dedicated function ***
+    stdnse.debug1("ASSOCIATE ACCEPT message found! Parsing User Information.")
+    version_str, uid_str = parse_implementation_version(err) -- Pass the *entire* received PDU
+
+    -- Identify Vendor and Clean Version
+    if uid_str then
+      local vendor_result, version_part_from_uid = identify_vendor_from_uid(uid_str)
+      if vendor_result then vendor = vendor_result end
+
+      if version_part_from_uid then
+         clean_version = extract_clean_version(version_part_from_uid, vendor)
+      elseif version_str then
+         clean_version = extract_clean_version(version_str, vendor)
       end
+    elseif version_str then
+       -- Fallback if UID wasn't found/parsed
+       if version_str:match("OFFIS_DCMTK") or version_str:match("DCMTK") then
+           vendor = "DCMTK"
+       end
+       clean_version = extract_clean_version(version_str, vendor)
     end
-    
-    -- Use centralized vendor identification
-    if uid then
-      local vendor_result, version_part = identify_vendor_from_uid(uid)
-      vendor = vendor_result  -- Assign to the existing vendor variable
-      
-      -- If we found a version in the UID, use it
-      if version_part then
-        version = extract_clean_version(version_part, vendor)
-      elseif version then
-        -- Otherwise use the version from the response
-        version = extract_clean_version(version, vendor)
-      end
-    -- Fallback to version-based detection if no UID found
-    elseif version then
-      if version:match("OFFIS_DCMTK") then
-        vendor = "DCMTK"
-        version = extract_clean_version(version, vendor)
-      end
-    end
-    
-    -- Log what we found for debugging
-    stdnse.debug1("Final values - Version: %s, UID: %s, Vendor: %s", 
-                  version or "nil", 
-                  uid or "nil", 
+
+    stdnse.debug1("Final values - Version: %s, UID: %s, Vendor: %s",
+                  clean_version or "nil",
+                  uid_str or "nil",
                   vendor or "nil")
-    
-    return true, nil, version, vendor
-  elseif resp_type == PDU_CODES["ASSOCIATE_REJECT"] then
-    stdnse.debug1("ASSOCIATE REJECT message found!")
-    return false, "ASSOCIATE REJECT received"
-  else
-    return false, "Received unknown response"
+
+    -- Success, return parsed info
+    return true, nil, clean_version, vendor -- Return structure matches original intent
+
+  end) -- end catch
+
+  -- *** Finally block: close the socket ***
+  if dcm and dcm['socket'] then
+    dcm['socket']:close()
   end
+
+  -- Check status of the try block
+  if not status then
+    -- An error occurred inside the catch block
+    stdnse.debug1("Error during association: %s", err)
+    return false, err -- Return the error message
+  end
+
+  -- If catch block succeeded, return the values captured inside it
+  return status, nil, clean_version, vendor -- Status is true here
 end
 
 function send_pdata(dicom, data)

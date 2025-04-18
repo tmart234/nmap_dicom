@@ -58,36 +58,28 @@ action = function(host, port)
   local output = stdnse.output_table()
 
   -- Try association
-  -- Get status, error message OR nil, version string, vendor string
   local dcm_status, err_or_nil, version, vendor = dicom.associate(host, port)
 
-  -- Handle association rejection or pcall errors from associate
+  -- Handle association rejection or pcall errors
   if dcm_status == false then
     stdnse.debug1("Association failed: %s", err_or_nil or "Unknown error")
-    -- Check specifically for the REJECT error string set inside associate
     if err_or_nil == "ASSOCIATE REJECT received" then
       port.version.name = "dicom"
       nmap.set_port_version(host, port)
-
       output.dicom = "DICOM Service Provider discovered!"
       output.config = "Called AET check enabled"
       output.auth = "Cannot test User Identity Negotiation (AET required)"
     end
-    -- Also print final table on failure for debugging
     stdnse.debug1("Final output table contents (on failure):\n%s", stdnse.format_output(true, output))
     return output
   end
 
-  -- If status is true, err_or_nil should be nil (as returned by associate on success)
-  -- version and vendor might be nil if parsing failed internally
-
-  -- Debug output for troubleshooting
+  -- Association successful
   stdnse.debug1("Associate success - Raw Version: %s, Raw Vendor: %s",
                 version or "nil",
                 vendor or "nil")
 
-  -- Association successful, report basic discovery
-  port.version.name = "dicom" -- Base service name
+  port.version.name = "dicom"
   nmap.set_port_version(host, port)
 
   output.dicom = "DICOM Service Provider discovered!"
@@ -96,41 +88,36 @@ action = function(host, port)
   local final_version = nil
   local final_vendor = nil
 
-  -- Process version information if available from associate
+  -- Process version information
   if version then
     stdnse.debug1("Raw version string from associate: %s", version)
-    -- Try cleaning the version string (e.g., OFFIS_DCMTK_369 -> 3.6.9)
-    -- Pass vendor hint, as clean_version might need it
     local clean_version = dicom.extract_clean_version(version, vendor)
     if clean_version then
       stdnse.debug1("Cleaned version: %s", clean_version)
       final_version = clean_version
     else
       stdnse.debug1("Could not clean version string, using raw: %s", version)
-      final_version = version -- Fallback to raw version string
+      final_version = version
     end
-    output.version = final_version -- Add to output table
+    output.version = final_version
   else
      stdnse.debug1("No version string returned from associate.")
   end
 
-  -- Process vendor information if available from associate
+  -- Process vendor information (REMOVED the 'else' part of this block)
   if vendor then
     stdnse.debug1("Vendor from associate: %s", vendor)
     final_vendor = vendor
-    output.vendor = final_vendor -- Add to output table
+    output.vendor = final_vendor
 
-    -- Orthanc-specific REST check (only if vendor identified as Orthanc)
+    -- Orthanc-specific REST check
     if final_vendor == "Orthanc" then
       stdnse.debug1("Vendor identified as Orthanc, trying REST API for version...")
-
-      local ports_to_try = {8042, port.number} -- Try default 8042 first
+      local ports_to_try = {8042, port.number}
       local orthanc_version_found = false
-
       for _, test_port in ipairs(ports_to_try) do
         stdnse.debug1("Trying Orthanc REST API on port %d", test_port)
-        local status, response = pcall(http.get, host, test_port, "/system", {timeout=3000}) -- Use pcall for safety
-
+        local status, response = pcall(http.get, host, test_port, "/system", {timeout=3000})
         if status and response and response.status then
           stdnse.debug1("HTTP response status: %d from port %d", response.status, test_port)
           if response.status == 200 and response.body then
@@ -138,51 +125,41 @@ action = function(host, port)
             local rest_ver = response.body:match('"Version"%s*:%s*"([%d.]+)"')
             if rest_ver then
               stdnse.debug1("Found Orthanc version via REST: %s", rest_ver)
-              output.version = rest_ver -- Overwrite version if found via REST
-              output.vendor = "Orthanc"  -- Ensure vendor is Orthanc
+              output.version = rest_ver
+              output.vendor = "Orthanc"
               output.notes = "Version confirmed via REST API"
-              final_version = rest_ver -- Update final_version as well
+              final_version = rest_ver
               orthanc_version_found = true
-
-              -- Update Nmap's service detection info
               port.version.product = "Orthanc"
               port.version.version = rest_ver
               nmap.set_port_version(host, port)
-              break -- Stop trying ports if version found
+              break
             else
               stdnse.debug1("Version field not found in JSON response from port %d", test_port)
             end
           end
         else
-          -- Log error from pcall if http.get failed
           stdnse.debug1("Failed to connect/get from REST API on port %d: %s", test_port, (response and tostring(response)) or "pcall failed")
         end
       end -- end for loop
-
       if not orthanc_version_found then
         stdnse.debug1("Could not determine Orthanc version via REST API")
-        -- Still set product in Nmap's version detection if vendor was Orthanc
         port.version.product = "Orthanc"
         nmap.set_port_version(host, port)
       end
-    else
-       -- If vendor wasn't Orthanc, still try setting product if vendor known
-       -- Use final_vendor and final_version captured earlier
+    else -- Else for: if final_vendor == "Orthanc"
+       -- If vendor wasn't Orthanc, set product/version info if known
        if final_vendor then
           port.version.product = final_vendor
           if final_version then port.version.version = final_version end
           nmap.set_port_version(host, port)
        end
-    end -- end if final_vendor == "Orthanc" block
-  else
-     stdnse.debug1("No vendor returned from associate.")
-  -- *** ADD THIS 'end' KEYWORD ***
-  end -- end if vendor block
-  -- *** END ADDED 'end' KEYWORD ***
-
+    end -- end if final_vendor == "Orthanc"
+  -- NOTE: The 'else' block for 'if vendor then' was removed here.
+  end -- end if vendor
 
   -- Final debug output before returning
   stdnse.debug1("Final output table contents:\n%s", stdnse.format_output(true, output))
 
   return output
-end -- This closes action = function(...)
+end -- closes action = function(...)

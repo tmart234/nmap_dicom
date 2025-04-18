@@ -1,0 +1,127 @@
+name: Nmap DICOM Ping Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-nmap-dicom:
+    runs-on: ubuntu-latest
+    # No matrix needed here as the test script and compose file define the setup
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch history if needed
+
+      - name: Set up Python # Optional, keep if other steps need it
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            nmap \
+            tcpdump \
+            tshark \
+            docker-compose # Added docker-compose
+
+      - name: Copy custom Nmap files
+        run: |
+          # --- IMPORTANT ---
+          # Ensure these paths match the location in YOUR repository
+          # ASSUMED SCRIPT LOCATION - Please verify nmap_dicom/scripts/dicom-ping.nse exists
+          NMAP_SCRIPT_SRC="nmap_dicom/scripts/dicom-ping.nse"
+          # FROM UPLOADED FILE nmap_dicom/nselib/dicom.lua
+          NMAP_LIB_SRC="nmap_dicom/nselib/dicom.lua"
+
+          if [ ! -f "$NMAP_SCRIPT_SRC" ]; then
+            echo "::error::Nmap script file not found at '$NMAP_SCRIPT_SRC'. Please ensure it exists in your repository."
+            exit 1
+          fi
+          if [ ! -f "$NMAP_LIB_SRC" ]; then
+            echo "::error::Nmap library file not found at '$NMAP_LIB_SRC'. Please ensure it exists in your repository."
+            exit 1
+          fi
+
+          NMAP_DATA_DIR=$(nmap --datadir)
+          echo "Nmap data directory: $NMAP_DATA_DIR"
+
+          echo "Copying Nmap script and library..."
+          sudo mkdir -p "${NMAP_DATA_DIR}/scripts/"
+          sudo mkdir -p "${NMAP_DATA_DIR}/nselib/"
+          sudo cp "$NMAP_SCRIPT_SRC" "${NMAP_DATA_DIR}/scripts/"
+          sudo cp "$NMAP_LIB_SRC" "${NMAP_DATA_DIR}/nselib/"
+
+          echo "Updating Nmap script database..."
+          sudo nmap --script-updatedb
+          echo "Nmap script database updated."
+
+      - name: Start tcpdump capture
+        id: start_tcpdump
+        run: |
+          # Port 11112 is defined in test_nmap.sh and docker-compose.yml
+          DICOM_PORT=11112
+          echo "Starting tcpdump capture for port $DICOM_PORT..."
+          sudo tcpdump -i any -s 0 port $DICOM_PORT -w dicom_capture_orthanc.pcap &
+          echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
+
+      - name: Make test script executable
+        run: chmod +x nmap_dicom/test_nmap.sh # Use the path to your script
+
+      - name: Run DICOM Test Script
+        id: test_script # Give this step an ID to check its outcome
+        # Specify the working directory if docker-compose.yml and test_nmap.sh
+        # are inside nmap_dicom/
+        working-directory: ./nmap_dicom
+        run: |
+          # Execute the test script
+          ./test_nmap.sh
+        # Note: The script itself runs docker-compose up/down and nmap
+
+      - name: Stop tcpdump capture
+        if: always() # Ensure capture stops even if tests fail
+        run: |
+          echo "Stopping tcpdump (PID: ${{ steps.start_tcpdump.outputs.tcpdump_pid }})..."
+          if [ -n "${{ steps.start_tcpdump.outputs.tcpdump_pid }}" ]; then
+            sudo kill ${{ steps.start_tcpdump.outputs.tcpdump_pid }} || echo "tcpdump already stopped or kill signal failed."
+            sleep 2
+            sudo kill -0 ${{ steps.start_tcpdump.outputs.tcpdump_pid }} 2>/dev/null && sudo kill -9 ${{ steps.start_tcpdump.outputs.tcpdump_pid }} || echo "tcpdump cleanly stopped or already gone."
+          else
+            echo "tcpdump PID not found in step outputs. Capture might not have started correctly."
+          fi
+          sleep 2
+
+      - name: Print PCAP Info
+        if: always()
+        run: |
+          # PCAP file is created in the root directory by the tcpdump step
+          PCAP_FILE="dicom_capture_orthanc.pcap"
+          if [[ -f "$PCAP_FILE" ]]; then
+            echo "--- PCAP Info for $PCAP_FILE ---"
+            tshark -r "$PCAP_FILE" -c 50 -Y dicom || echo "No DICOM packets found or tshark error."
+            echo "--- End PCAP Info ---"
+          else
+            echo "PCAP file $PCAP_FILE not found."
+          fi
+        continue-on-error: true
+
+      - name: Upload pcap artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dicom-pcap-capture-orthanc # Fixed name as matrix is removed
+          path: dicom_capture_orthanc.pcap
+          if-no-files-found: ignore
+
+      # Removed Show Logs and Stop Container steps as test_nmap.sh handles them
+
+      - name: Check test script outcome
+        # Check the outcome of the step that ran the script
+        if: steps.test_script.outcome != 'success'
+        run: |
+          echo "::error::Test script 'test_nmap.sh' failed!"
+          exit 1

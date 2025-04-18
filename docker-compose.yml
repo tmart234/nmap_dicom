@@ -70,7 +70,7 @@ services:
 
   # OpenLDAP for Archive Configuration
   ldap:
-    image: dcm4che/slapd-dcm4chee:latest # Use the corresponding LDAP image
+    image: dcm4che/slapd-dcm4chee:2.6.7-33.1
     container_name: dcm4chee_ldap_test # Optional
     environment:
       - LDAP_ROOTPASS=secret

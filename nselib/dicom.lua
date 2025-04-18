@@ -173,19 +173,16 @@ function parse_implementation_version(data)
   local version, uid = nil, nil
   local data_len = #data
 
-  -- Minimum length check (PDU header + fixed AC fields + User Info item header)
-  -- PDU Header(6) + ProtoVer(2) + Reserved(2) + CalledAE(16) + CallingAE(16) + Reserved(32) + AppCtxItemHeader(4) = 78
-  -- Let's be slightly less strict, require at least enough for User Info Item header (approx 72 based on request structure)
-  if data_len < 72 then
+  -- Minimum length check for PDU header + fixed fields up to User Info Item marker
+  if data_len < 72 then -- Approx offset where User Info might start
     stdnse.debug1("Response too short for reliable User Information parsing: %d bytes", data_len)
     return nil, nil
   end
 
-  -- *** Find User Information item (0x50) ***
-  -- It should follow the fixed association parameters (68 bytes in request, similar in accept)
+  -- *** Find User Information item (Type 0x50, Reserved 0x00) ***
   local userinfo_marker = string.char(0x50, 0x00)
-  -- Start searching after the fixed header part (approx 68 bytes) for efficiency, but search whole string for robustness.
-  local userinfo_start = data:find(userinfo_marker, 60, true) -- Start search around where it should be
+  -- Search robustly, but start near expected location (~byte 68-70)
+  local userinfo_start = data:find(userinfo_marker, 65, true)
 
   if not userinfo_start then
       stdnse.debug1("User Information item (0x50 0x00) marker not found.")
@@ -193,96 +190,117 @@ function parse_implementation_version(data)
   end
   stdnse.debug2("Found User Information marker at offset %d", userinfo_start)
 
-  -- Check if there's enough data for User Info Length field (2 bytes)
+  -- Check if there's enough data for User Info Length field (2 bytes after marker)
   if userinfo_start + 3 > data_len then
-     stdnse.debug1("Not enough data for User Information length at offset %d.", userinfo_start)
+     stdnse.debug1("Not enough data for User Information length field at offset %d.", userinfo_start)
      return nil, nil
   end
 
-  -- Get User Info Length
-  local _, userinfo_len = string.unpack(">I2", data, userinfo_start + 2) -- Length is 2 bytes after marker
-  local userinfo_payload_start = userinfo_start + 4
+  -- Get User Info Item Length (2 bytes, Big Endian)
+  local _, userinfo_len = string.unpack(">I2", data, userinfo_start + 2)
+  local userinfo_payload_start = userinfo_start + 4 -- Start of payload is after Type(1)+Reserved(1)+Length(2)
   local userinfo_payload_end = userinfo_start + 3 + userinfo_len
-  stdnse.debug2("User Information item length: %d. Payload offsets: %d - %d", userinfo_len, userinfo_payload_start, userinfo_payload_end)
+  stdnse.debug2("User Information Item Type 0x50 found. Length: %d. Payload byte range: %d - %d (relative to PDU start)", userinfo_len, userinfo_payload_start, userinfo_payload_end)
 
-  -- Validate User Info boundaries
+  -- Validate User Info calculated end against overall PDU length
   if userinfo_payload_end > data_len then
-     stdnse.debug1("User Information length (%d) exceeds data boundary (%d). Truncating parse range.", userinfo_len, data_len)
+     stdnse.debug1("User Information item's calculated end (%d) exceeds PDU data length (%d). Truncating parse boundary to PDU length.", userinfo_payload_end, data_len)
      userinfo_payload_end = data_len
   end
+  -- Ensure start is not already past the (potentially truncated) end
   if userinfo_payload_start > userinfo_payload_end then
-      stdnse.debug1("User Information payload start offset is beyond its end offset. Cannot parse sub-items.")
+      stdnse.debug1("User Information payload start offset (%d) is beyond its end offset (%d). Cannot parse sub-items.", userinfo_payload_start, userinfo_payload_end)
       return nil, nil
   end
 
-  -- *** Iterate through sub-items within User Information ***
+  -- *** Iterate through sub-items within User Information payload ***
   local offset = userinfo_payload_start
-  while offset < userinfo_payload_end - 3 do -- Need at least 4 bytes for Type, Reserved, Length
-    local sub_type = string.byte(data, offset + 1)
-    local reserved_byte = string.byte(data, offset + 2)
+  local MAX_REASONABLE_SUBITEM_LEN = 256 -- Sanity check limit for sub-item value lengths
+  local MAX_SUBITEMS = 10 -- Limit loop iterations to prevent infinite loops on malformed data
 
-    -- Expect Reserved byte to be 0x00
+  local item_count = 0
+  while offset <= userinfo_payload_end - 4 and item_count < MAX_SUBITEMS do -- Need at least 4 bytes for Type, Reserved, Length
+    item_count = item_count + 1
+    -- Read Type and Reserved bytes for the sub-item
+    local sub_type = string.byte(data, offset)
+    local reserved_byte = string.byte(data, offset + 1)
+
+    stdnse.debug2("Parsing sub-item #%d at offset %d. Type byte: 0x%02X, Reserved byte: 0x%02X", item_count, offset, sub_type, reserved_byte)
+
+    -- Check for expected User Info sub-item types (add others if needed)
+    -- Common types from DICOM Part 7, Annex D.3.3.2 & Part 8, Annex B
+    if sub_type ~= 0x51 and sub_type ~= 0x52 and sub_type ~= 0x55 and sub_type ~= 0x53 and sub_type ~= 0x54 then
+         stdnse.debug1("Unexpected or unhandled sub-item type 0x%02X encountered at offset %d. Stopping User Info parse.", sub_type, offset)
+         break -- Stop parsing User Info if type is unknown/invalid
+    end
+
+    -- Expect Reserved byte to be 0x00 for these items
     if reserved_byte ~= 0x00 then
-        stdnse.debug2("Sub-item at offset %d has non-zero reserved byte (0x%02X). Skipping item (assuming fixed length or error).", offset, reserved_byte)
-        -- This case is tricky. We don't know the length. Advance by a minimum? For now, stop parsing sub-items.
+        stdnse.debug1("Sub-item type 0x%02X at offset %d has non-zero reserved byte (0x%02X). Stopping User Info parse.", sub_type, offset, reserved_byte)
+        break -- Stop parsing if reserved byte is wrong
+    end
+
+    -- Read sub-item length (2 bytes, Big Endian, starts after Type and Reserved)
+    local _, sub_length = string.unpack(">I2", data, offset + 2)
+    local sub_value_start = offset + 4 -- Value starts after Type(1)+Reserved(1)+Length(2)
+    local sub_value_end = offset + 3 + sub_length -- End of value field
+    stdnse.debug2("Found sub-item type 0x%02X, Length: %d. Calculated value byte range: %d - %d", sub_type, sub_length, sub_value_start, sub_value_end)
+
+    -- Sanity check the reported length
+    if sub_length > MAX_REASONABLE_SUBITEM_LEN then
+        stdnse.debug1("Sub-item (type 0x%02X) reported length %d seems excessive (>%d) at offset %d. Stopping User Info parse.", sub_type, sub_length, MAX_REASONABLE_SUBITEM_LEN, offset)
         break
     end
 
-    -- Check for sub-item length field
-    if offset + 3 > userinfo_payload_end then
-        stdnse.debug1("Not enough data for sub-item length at offset %d", offset)
-        break
-    end
-
-    local _, sub_length = string.unpack(">I2", data, offset + 2) -- Length starts 2 bytes after type
-    local sub_value_start = offset + 4
-    local sub_value_end = offset + 3 + sub_length
-    stdnse.debug2("Found sub-item type 0x%02X, length %d at offset %d. Value range: %d - %d", sub_type, sub_length, offset, sub_value_start, sub_value_end)
-
-    -- Validate sub-item value boundaries
+    -- Validate sub-item's calculated end boundary against the User Info payload end boundary
     if sub_value_end > userinfo_payload_end then
-        stdnse.debug1("Sub-item (type 0x%02X) length %d exceeds User Info boundary (%d) at offset %d. Stopping sub-item parse.", sub_type, sub_length, userinfo_payload_end, offset)
+        stdnse.debug1("Sub-item (type 0x%02X) calculated end offset %d exceeds User Info payload boundary (%d) at offset %d. Stopping User Info parse.", sub_type, sub_value_end, userinfo_payload_end, offset)
         break
-    end
-    if sub_value_start > sub_value_end then
-        stdnse.debug1("Sub-item (type 0x%02X) value start offset %d is beyond end offset %d. Skipping item.", sub_type, sub_value_start, sub_value_end)
-        offset = sub_value_end + 1 -- Move to where next item should be
-        goto continue_loop -- Use goto for clarity to continue outer while loop
     end
 
     -- Extract and clean value if length is positive
     if sub_length > 0 then
-        -- Sanity check length (e.g., max 64 for UIDs/Versions)
-        if sub_length > 128 then -- Increased limit slightly
-             stdnse.debug1("Sub-item (type 0x%02X) length %d seems excessive (>128) at offset %d. Skipping value extraction.", sub_type, sub_length, offset)
-        else
-            local value_raw = data:sub(sub_value_start, sub_value_end)
-            local value_cleaned = value_raw:gsub("%z", ""):gsub("^%s*", ""):gsub("%s*$", "") -- Trim whitespace and nulls
+        local value_raw = data:sub(sub_value_start, sub_value_end)
+        -- Trim null bytes and leading/trailing whitespace for string values
+        local value_cleaned = value_raw:gsub("%z", ""):gsub("^%s*", ""):gsub("%s*$", "")
 
-            if sub_type == 0x52 then -- Implementation Class UID
-                if not uid then -- Only take the first one found
-                    uid = value_cleaned
-                    stdnse.debug1("Extracted UID: '%s'", uid)
-                end
-            elseif sub_type == 0x55 then -- Implementation Version Name
-                if not version then -- Only take the first one found
-                    version = value_cleaned
-                    stdnse.debug1("Extracted Version: '%s'", version)
-                end
-            -- Add other user info sub-types here if needed (e.g., 0x51 Max PDU Length)
+        if sub_type == 0x52 then -- Implementation Class UID
+            if not uid then -- Only take the first one found
+                uid = value_cleaned
+                stdnse.debug1("Extracted Implementation Class UID (0x52): '%s'", uid)
+            else
+                stdnse.debug2("Ignoring subsequent Implementation Class UID: '%s'", value_cleaned)
             end
+        elseif sub_type == 0x55 then -- Implementation Version Name
+            if not version then -- Only take the first one found
+                version = value_cleaned
+                stdnse.debug1("Extracted Implementation Version Name (0x55): '%s'", version)
+            else
+                stdnse.debug2("Ignoring subsequent Implementation Version Name: '%s'", value_cleaned)
+            end
+        elseif sub_type == 0x51 then -- Maximum Length Received (UInt32)
+             if sub_length == 4 then
+                 local _, max_len = string.unpack(">I4", value_raw) -- It's 4 bytes Big Endian
+                 stdnse.debug1("Extracted Max PDU Length Received (0x51): %d", max_len)
+             else
+                 stdnse.debug1("Incorrect length (%d) for Max PDU Length sub-item (0x51). Expected 4.", sub_length)
+             end
+        -- Add handling for other types like Asynchronous Operations Window (0x53) if needed
         end
     else
          stdnse.debug2("Sub-item (type 0x%02X) has zero length.", sub_type)
     end
 
     -- Move offset to the beginning of the next sub-item
-    offset = sub_value_end + 1
+    offset = sub_value_end + 1 -- Next item starts right after the current item's value
 
-    ::continue_loop::
-  end -- while offset
+  end -- while loop
 
-  stdnse.debug1("Finished parsing User Info sub-items. Final raw values - Version: '%s', UID: '%s'", version or "nil", uid or "nil")
+  if item_count >= MAX_SUBITEMS then
+    stdnse.debug1("Reached maximum sub-item limit (%d) while parsing User Information.", MAX_SUBITEMS)
+  end
+
+  stdnse.debug1("Finished parsing User Info sub-items. Final extracted values - Version: '%s', UID: '%s'", version or "nil", uid or "nil")
   return version, uid
 end
 

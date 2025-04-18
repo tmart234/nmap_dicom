@@ -58,12 +58,14 @@ action = function(host, port)
   local output = stdnse.output_table()
 
   -- Try association
-  local dcm_status, err, version, vendor = dicom.associate(host, port)
+  -- Get status, error message OR nil, version string, vendor string
+  local dcm_status, err_or_nil, version, vendor = dicom.associate(host, port)
 
-  -- Handle association rejection
+  -- Handle association rejection or pcall errors from associate
   if dcm_status == false then
-    stdnse.debug1("Association failed: %s", err or "Unknown error")
-    if err == "ASSOCIATE REJECT received" then
+    stdnse.debug1("Association failed: %s", err_or_nil or "Unknown error")
+    -- Check specifically for the REJECT error string set inside associate
+    if err_or_nil == "ASSOCIATE REJECT received" then
       port.version.name = "dicom"
       nmap.set_port_version(host, port)
 
@@ -76,14 +78,17 @@ action = function(host, port)
     return output
   end
 
+  -- If status is true, err_or_nil should be nil (as returned by associate on success)
+  -- version and vendor might be nil if parsing failed internally
+
   -- Debug output for troubleshooting
   stdnse.debug1("Associate success - Raw Version: %s, Raw Vendor: %s",
                 version or "nil",
                 vendor or "nil")
 
-  -- Association successful
-  port.version.name = "dicom"
-  nmap.set_port_version(host, port) -- Set base service name
+  -- Association successful, report basic discovery
+  port.version.name = "dicom" -- Base service name
+  nmap.set_port_version(host, port)
 
   output.dicom = "DICOM Service Provider discovered!"
   output.config = "Any AET is accepted (Insecure)"
@@ -95,7 +100,8 @@ action = function(host, port)
   if version then
     stdnse.debug1("Raw version string from associate: %s", version)
     -- Try cleaning the version string (e.g., OFFIS_DCMTK_369 -> 3.6.9)
-    local clean_version = dicom.extract_clean_version(version, vendor) -- Pass vendor hint
+    -- Pass vendor hint, as clean_version might need it
+    local clean_version = dicom.extract_clean_version(version, vendor)
     if clean_version then
       stdnse.debug1("Cleaned version: %s", clean_version)
       final_version = clean_version
@@ -115,6 +121,8 @@ action = function(host, port)
     output.vendor = final_vendor -- Add to output table
 
     -- Orthanc-specific REST check (only if vendor identified as Orthanc)
+    -- NOTE: In this case, vendor was DCMTK, so this block won't run,
+    -- but keeping it for generality.
     if final_vendor == "Orthanc" then
       stdnse.debug1("Vendor identified as Orthanc, trying REST API for version...")
 
@@ -135,6 +143,7 @@ action = function(host, port)
               output.version = rest_ver -- Overwrite version if found via REST
               output.vendor = "Orthanc"  -- Ensure vendor is Orthanc
               output.notes = "Version confirmed via REST API"
+              final_version = rest_ver -- Update final_version as well
               orthanc_version_found = true
 
               -- Update Nmap's service detection info
@@ -160,6 +169,7 @@ action = function(host, port)
       end
     else
        -- If vendor wasn't Orthanc, still try setting product if vendor known
+       -- Use final_vendor and final_version captured earlier
        if final_vendor then
           port.version.product = final_vendor
           if final_version then port.version.version = final_version end
@@ -170,9 +180,8 @@ action = function(host, port)
      stdnse.debug1("No vendor returned from associate.")
   end -- end vendor check
 
-  -- *** ADDED DEBUG LINE ***
+  -- Final debug output before returning
   stdnse.debug1("Final output table contents:\n%s", stdnse.format_output(true, output))
-  -- *** END ADDED DEBUG LINE ***
 
   return output
-end -- end action function
+end -- <<<--- THIS IS THE MISSING 'end' THAT WAS ADDED BACK

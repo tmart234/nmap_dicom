@@ -241,16 +241,16 @@ function parse_implementation_version(data)
         local sub_value_end = offset + 3 + sub_length
         stdnse.debug2("Found known sub-item type 0x%02X, Declared Length: %d. Value range: %d - %d", sub_type, sub_length, sub_value_start, sub_value_end)
 
-        -- Check for reasons to skip processing the *value* but continue the loop
+        stdnse.debug1("[DEBUG] Checking boundaries: sub_length=%d, sub_value_end=%d, effective_userinfo_end=%d", sub_length or -1, sub_value_end or -1, effective_userinfo_end or -1)
         if sub_length > MAX_REASONABLE_SUBITEM_LEN then
             stdnse.debug1("Sub-item reported length %d seems excessive (>%d). Skipping value.", sub_length, MAX_REASONABLE_SUBITEM_LEN)
             -- Keep advance_offset = 4
-        elseif sub_value_end > effective_userinfo_end then
-            stdnse.debug1("Sub-item calculated end offset %d exceeds User Info payload boundary (%d). Skipping value.", sub_value_end, effective_userinfo_end)
+        elseif sub_value_end > effective_userinfo_end then -- <<< PROBLEM CHECK
+            stdnse.debug1("Boundary check failed: Sub-item calculated end offset %d exceeds User Info payload boundary (%d). Skipping value.", sub_value_end, effective_userinfo_end)
             -- Keep advance_offset = 4
         else
             -- Item looks completely valid and fits within boundaries. Process it.
-            stdnse.debug2("Sub-item looks valid. Processing value.")
+             stdnse.debug1("[DEBUG] Boundary check PASSED.") -- Add confirmation
             if sub_length > 0 then
                 local value_raw = data:sub(sub_value_start, sub_value_end)
                 local value_cleaned = value_raw:gsub("%z", ""):gsub("^%s*", ""):gsub("%s*$", "")

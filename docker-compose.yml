@@ -23,33 +23,35 @@ services:
 
   # --- DCM4CHEE Archive Stack ---
   # Archive Application (replaces the old dcm4chee service)
-  arc:
-    image: dcm4che/dcm4chee-arc-psql:5.33.1
-    container_name: dcm4chee_arc_test # Optional: Give it a fixed name
+arc:
+    image: dcm4che/dcm4chee-arc-psql:5.33.1 # Use the specific tag
+    container_name: dcm4chee_arc_test
     ports:
-      - "11113:11112" # Map container DICOM port 11112 to host 11113
-      - "8081:8080"   # Map container Web UI 8080 to host 8081
+      - "11113:11112"
+      - "8081:8080"
     environment:
-      # Connect to the PostgreSQL DB service defined below
+      # --- Add this line ---
+      - WILDFLY_WAIT_FOR=ldap:389 db:5432 # Tells arc to wait for ldap and db ports
+      # --- Existing variables ---
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - POSTGRES_DB=pacsdb
       - POSTGRES_USER=pacs
       - POSTGRES_PASSWORD=pacs
-      # Connect to the LDAP service defined below
       - LDAP_URL=ldap://ldap:389
       - LDAP_BASE_DN=dc=dcm4che,dc=org
       - LDAP_ROOTPASS=secret
-      - WILDFLY_ADMIN_USER=admin # Default admin user/pass for Wildfly console
+      - WILDFLY_ADMIN_USER=admin
       - WILDFLY_ADMIN_PASSWORD=admin
-      # Set lower memory limits for CI environment (adjust if needed)
       - JAVA_OPTS=-Xms64m -Xmx512m -XX:MetaspaceSize=96m -XX:MaxMetaspaceSize=256m -Djava.net.preferIPv4Stack=true -Djboss.modules.system.pkgs=org.jboss.byteman -Djava.awt.headless=true
     depends_on:
       db:
-        condition: service_healthy # Wait for DB to be ready
+        condition: service_healthy
       ldap:
-        condition: service_healthy # Wait for LDAP to be ready
+        condition: service_healthy
     restart: unless-stopped
+    # NOTE: The 'arc' image itself doesn't have a simple TCP healthcheck defined here,
+    #       it relies on internal Wildfly status. Docker compose reports it unhealthy if startup fails.
 
   # PostgreSQL Database for Archive
   db:

@@ -231,8 +231,18 @@ function parse_implementation_version(data)
 
     -- Check for expected User Info sub-item types
     if sub_type ~= 0x51 and sub_type ~= 0x52 and sub_type ~= 0x55 and sub_type ~= 0x53 and sub_type ~= 0x54 then
-         stdnse.debug1("Unexpected or unhandled sub-item type 0x%02X encountered at offset %d. Stopping User Info parse.", sub_type, offset)
-         break -- Stop parsing if type is unknown/invalid
+      stdnse.debug1("Unexpected or unhandled sub-item type 0x%02X encountered at offset %d. Skipping header and continuing.", sub_type, offset)
+      -- Skip the header of this unknown item (4 bytes) and continue the loop
+      offset = offset + 4
+      item_count = item_count + 1 -- Ensure counter increments even when skipping
+      goto continue_loop -- Use goto to skip the rest of the loop body for this iteration
+      -- Note: Lua 5.2+ required for goto. If using older Lua, restructure slightly.
+    end
+
+    -- Expect Reserved byte to be 0x00 for these items
+    if reserved_byte ~= 0x00 then
+        stdnse.debug1("Sub-item type 0x%02X at offset %d has non-zero reserved byte (0x%02X). Stopping User Info parse.", sub_type, offset, reserved_byte)
+        break -- Stop parsing if reserved byte is wrong (This break can probably stay)
     end
 
     -- Expect Reserved byte to be 0x00 for these items

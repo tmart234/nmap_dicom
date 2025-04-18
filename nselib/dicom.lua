@@ -421,6 +421,16 @@ end
 -- @return (status, dcm_or_error, version, vendor) If status is true, version and vendor info is returned.
 --                                                If status is false, dcm_or_error is the error message.
 ---
+---
+-- associate(host, port) Attempts to associate to a DICOM Service Provider by sending an A-ASSOCIATE request.
+--
+-- @param host Host object
+-- @param port Port object
+-- @param calling_aet Optional Calling Application Entity Title override
+-- @param called_aet Optional Called Application Entity Title override
+-- @return (status, dcm_or_error, version, vendor) If status is true, version and vendor info is returned.
+--                                                If status is false, dcm_or_error is the error message.
+---
 function associate(host, port, calling_aet, called_aet)
   local application_context = ""
   local presentation_context = ""
@@ -431,11 +441,14 @@ function associate(host, port, calling_aet, called_aet)
     return false, dcm -- dcm contains the error message from start_connection
   end
 
-  -- *** Ensure socket closure using try/finally pattern ***
+  -- *** Ensure socket closure using pcall and manual finally ***
   local assoc_request, header, err, resp_type, resp_length, version_str, uid_str, vendor, clean_version
-  status, err = stdnse.catch(function()
+  local success -- Declare variable to hold success state from pcall
 
-    -- (Keep the existing code here to build application_context, presentation_context, userinfo_context)
+  -- Wrap the main logic in pcall
+  success, err = pcall(function()
+
+    -- Build application_context, presentation_context, userinfo_context
     local application_context_name = "1.2.840.10008.3.1.1.1"
     application_context = string.pack(">B B s2", 0x10, 0x0, application_context_name)
 
@@ -448,16 +461,16 @@ function associate(host, port, calling_aet, called_aet)
     userinfo_context = string.pack(">B B I2 B B I2 I4 B B s2 B B s2", 0x50, 0x0, 0x3a, 0x51, 0x0, 0x04, 0x4000, 0x52, 0x0, implementation_id, 0x55, 0x0, implementation_version)
     -- (End of building context)
 
-    local called_ae_title = called_aet or stdnse.get_script_args("dicom.called_aet") or "ANY-SCP"
-    local calling_ae_title = calling_aet or stdnse.get_script_args("dicom.calling_aet") or "ECHOSCU"
-    if #called_ae_title > 16 or #calling_ae_title > 16 then
+    local called_ae_title_val = called_aet or stdnse.get_script_args("dicom.called_aet") or "ANY-SCP"
+    local calling_ae_title_val = calling_aet or stdnse.get_script_args("dicom.calling_aet") or "ECHOSCU"
+    if #called_ae_title_val > 16 or #calling_ae_title_val > 16 then
       error("Calling/Called Application Entity Title must be less than 16 bytes")
     end
-    called_ae_title = ("%-16s"):format(called_ae_title)
-    calling_ae_title = ("%-16s"):format(calling_ae_title)
+    called_ae_title_val = ("%-16s"):format(called_ae_title_val)
+    calling_ae_title_val = ("%-16s"):format(calling_ae_title_val)
 
     -- ASSOCIATE request body
-    assoc_request = string.pack(">I2 I2 c16 c16 c32", 0x1, 0x0, called_ae_title, calling_ae_title, "")
+    assoc_request = string.pack(">I2 I2 c16 c16 c32", 0x1, 0x0, called_ae_title_val, calling_ae_title_val, "")
                        .. application_context
                        .. presentation_context
                        .. userinfo_context
@@ -465,49 +478,51 @@ function associate(host, port, calling_aet, called_aet)
     local header_status
     header_status, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"], #assoc_request)
     if header_status == false then
-      error("Failed to encode PDU header: " .. header)
+      error("Failed to encode PDU header: " .. header) -- Will be caught by pcall
     end
 
     assoc_request = header .. assoc_request
 
     stdnse.debug2("PDU len minus header:%d", #assoc_request-#header)
     if #assoc_request < MIN_SIZE_ASSOC_REQ then
-      error(string.format("ASSOCIATE request PDU must be at least %d bytes and we tried to send %d.", MIN_SIZE_ASSOC_REQ, #assoc_request))
+      error(string.format("ASSOCIATE request PDU must be at least %d bytes and we tried to send %d.", MIN_SIZE_ASSOC_REQ, #assoc_request)) -- Will be caught by pcall
     end
 
     local send_status, send_err = send(dcm, assoc_request)
     if send_status == false then
-      error(string.format("Couldn't send ASSOCIATE request:%s", send_err))
+      error(string.format("Couldn't send ASSOCIATE request:%s", send_err)) -- Will be caught by pcall
     end
 
     local receive_status, receive_data = receive(dcm)
     if receive_status == false then
-      error(string.format("Couldn't read ASSOCIATE response:%s", receive_data))
+      error(string.format("Couldn't read ASSOCIATE response:%s", receive_data)) -- Will be caught by pcall
     end
-    err = receive_data -- Assign received data to err for parsing
+    -- Store received data for parsing, even if it's potentially an error PDU
+    local response_data = receive_data
 
     -- Check minimum length before unpacking header
-    if #err < MIN_HEADER_LEN then
-      error("Received response too short for PDU header")
+    if #response_data < MIN_HEADER_LEN then
+      error("Received response too short for PDU header") -- Will be caught by pcall
     end
-    resp_type, _, resp_length = string.unpack(">B B I4", err) -- Unpack header
+    resp_type, _, resp_length = string.unpack(">B B I4", response_data) -- Unpack header
     stdnse.debug1("PDU Type:%d Length:%d", resp_type, resp_length)
 
-    -- Check if it's an ACCEPT PDU
+    -- Check if it's an ACCEPT PDU before proceeding with detailed parsing
     if resp_type ~= PDU_CODES["ASSOCIATE_ACCEPT"] then
       if resp_type == PDU_CODES["ASSOCIATE_REJECT"] then
          stdnse.debug1("ASSOCIATE REJECT message found!")
-         -- TODO: Optionally parse reject reason/source/diagnostic here
-         error("ASSOCIATE REJECT received")
+         -- TODO: Optionally parse reject reason/source/diagnostic here from response_data
+         error("ASSOCIATE REJECT received") -- Will be caught by pcall
       else
          stdnse.debug1("Received unexpected PDU type: %d", resp_type)
-         error("Received unexpected response PDU type")
+         error("Received unexpected response PDU type") -- Will be caught by pcall
       end
     end
 
-    -- *** PARSE using dedicated function ***
+    -- *** PARSE ACCEPT PDU using dedicated function ***
     stdnse.debug1("ASSOCIATE ACCEPT message found! Parsing User Information.")
-    version_str, uid_str = parse_implementation_version(err) -- Pass the *entire* received PDU
+    -- Pass the *entire* received PDU data
+    version_str, uid_str = parse_implementation_version(response_data)
 
     -- Identify Vendor and Clean Version
     if uid_str then
@@ -532,25 +547,38 @@ function associate(host, port, calling_aet, called_aet)
                   uid_str or "nil",
                   vendor or "nil")
 
-    -- Success, return parsed info
-    return true, nil, clean_version, vendor -- Return structure matches original intent
+    -- Return the results on success for pcall to capture
+    return clean_version, vendor, uid_str
 
-  end) -- end catch
+  end) -- end pcall
 
-  -- *** Finally block: close the socket ***
+  -- *** Manual "finally" block: always close the socket ***
   if dcm and dcm['socket'] then
+    stdnse.debug1("Closing socket after association attempt.")
     dcm['socket']:close()
   end
 
-  -- Check status of the try block
-  if not status then
-    -- An error occurred inside the catch block
-    stdnse.debug1("Error during association: %s", err)
-    return false, err -- Return the error message
-  end
+  -- Check the status returned by pcall
+  if not success then
+    -- An error occurred inside pcall. 'err' contains the error message/object.
+    stdnse.debug1("Error during association (pcall failed): %s", tostring(err))
+    return false, tostring(err) -- Return false and the error message
+  else
+    -- pcall succeeded. 'err' contains the *return values* from the anonymous function.
+    -- Assign the captured return values back to the original variables.
+    -- Note: The order must match the 'return' statement inside pcall's function
+    clean_version = err[1] -- First return value was clean_version
+    vendor = err[2]        -- Second return value was vendor
+    -- uid_str = err[3]    -- Third return value was uid_str (optional to capture)
 
-  -- If catch block succeeded, return the values captured inside it
-  return status, nil, clean_version, vendor -- Status is true here
+    stdnse.debug1("Association successful. Parsed Version: %s, Vendor: %s",
+                  clean_version or "nil", vendor or "nil")
+
+    -- Return true and the extracted info, matching the expected format:
+    -- (status, dcm_or_error, version, vendor)
+    -- Returning nil for the second argument (dcm_or_error) on success.
+    return true, nil, clean_version, vendor
+  end
 end
 
 function send_pdata(dicom, data)

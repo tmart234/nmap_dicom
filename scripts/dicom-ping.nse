@@ -121,8 +121,6 @@ action = function(host, port)
     output.vendor = final_vendor -- Add to output table
 
     -- Orthanc-specific REST check (only if vendor identified as Orthanc)
-    -- NOTE: In this case, vendor was DCMTK, so this block won't run,
-    -- but keeping it for generality.
     if final_vendor == "Orthanc" then
       stdnse.debug1("Vendor identified as Orthanc, trying REST API for version...")
 
@@ -175,13 +173,16 @@ action = function(host, port)
           if final_version then port.version.version = final_version end
           nmap.set_port_version(host, port)
        end
-    end -- end Orthanc check
+    end -- end if final_vendor == "Orthanc" block
   else
      stdnse.debug1("No vendor returned from associate.")
-  end -- end vendor check
+  -- *** ADD THIS 'end' KEYWORD ***
+  end -- end if vendor block
+  -- *** END ADDED 'end' KEYWORD ***
+
 
   -- Final debug output before returning
   stdnse.debug1("Final output table contents:\n%s", stdnse.format_output(true, output))
 
   return output
-end -- <<<--- THIS IS THE MISSING 'end' THAT WAS ADDED BACK
+end -- This closes action = function(...)

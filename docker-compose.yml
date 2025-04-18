@@ -23,16 +23,15 @@ services:
 
   # --- DCM4CHEE Archive Stack ---
   # Archive Application (replaces the old dcm4chee service)
-arc:
+  # --- Indent this block ---
+  arc: # <<< Correctly indented
     image: dcm4che/dcm4chee-arc-psql:5.33.1 # Use the specific tag
     container_name: dcm4chee_arc_test
     ports:
       - "11113:11112"
       - "8081:8080"
     environment:
-      # --- Add this line ---
       - WILDFLY_WAIT_FOR=ldap:389 db:5432 # Tells arc to wait for ldap and db ports
-      # --- Existing variables ---
       - POSTGRES_HOST=db
       - POSTGRES_PORT=5432
       - POSTGRES_DB=pacsdb
@@ -52,6 +51,7 @@ arc:
     restart: unless-stopped
     # NOTE: The 'arc' image itself doesn't have a simple TCP healthcheck defined here,
     #       it relies on internal Wildfly status. Docker compose reports it unhealthy if startup fails.
+  # --- End of indented arc block ---
 
   # PostgreSQL Database for Archive
   db:
@@ -72,7 +72,7 @@ arc:
 
   # OpenLDAP for Archive Configuration
   ldap:
-    image: dcm4che/slapd-dcm4chee:2.6.7-33.1
+    image: dcm4che/slapd-dcm4chee:2.6.7-33.1 # Use specific tag found previously
     container_name: dcm4chee_ldap_test # Optional
     environment:
       - LDAP_ROOTPASS=secret

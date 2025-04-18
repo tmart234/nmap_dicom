@@ -31,34 +31,42 @@ jobs:
 
       - name: Copy custom Nmap files
         run: |
-          # --- IMPORTANT ---
-          # Ensure these paths match the location in YOUR repository
-          # ASSUMED SCRIPT LOCATION - Please verify nmap_dicom/scripts/dicom-ping.nse exists
-          NMAP_SCRIPT_SRC="nmap_dicom/scripts/dicom-ping.nse"
-          # FROM UPLOADED FILE nmap_dicom/nselib/dicom.lua
-          NMAP_LIB_SRC="nmap_dicom/nselib/dicom.lua"
+            # --- Paths based on the CONFIRMED structure ---
+            # nmap_dicom/ is the top-level directory containing scripts/ and nselib/
+            NMAP_SCRIPT_SRC="nmap_dicom/scripts/dicom-ping.nse" # <-- Path includes nmap_dicom/
+            NMAP_LIB_SRC="nmap_dicom/nselib/dicom.lua"        # <-- Path includes nmap_dicom/
 
-          if [ ! -f "$NMAP_SCRIPT_SRC" ]; then
-            echo "::error::Nmap script file not found at '$NMAP_SCRIPT_SRC'. Please ensure it exists in your repository."
+            echo "Checking for Nmap script at: $PWD/$NMAP_SCRIPT_SRC"
+            if [ ! -f "$NMAP_SCRIPT_SRC" ]; then
+            echo "::error::Nmap script file not found at '$NMAP_SCRIPT_SRC'. Please verify the path relative to the repository root."
+            # List contents of the expected parent directory for debugging
+            echo "Listing contents of nmap_dicom/scripts/:"
+            ls -l nmap_dicom/scripts/ || echo "Could not list nmap_dicom/scripts/"
             exit 1
-          fi
-          if [ ! -f "$NMAP_LIB_SRC" ]; then
-            echo "::error::Nmap library file not found at '$NMAP_LIB_SRC'. Please ensure it exists in your repository."
+            fi
+
+            echo "Checking for Nmap library at: $PWD/$NMAP_LIB_SRC"
+            if [ ! -f "$NMAP_LIB_SRC" ]; then
+            echo "::error::Nmap library file not found at '$NMAP_LIB_SRC'. Please verify the path relative to the repository root."
+            # List contents of the expected parent directory for debugging
+            echo "Listing contents of nmap_dicom/nselib/:"
+            ls -l nmap_dicom/nselib/ || echo "Could not list nmap_dicom/nselib/"
             exit 1
-          fi
+            fi
 
-          NMAP_DATA_DIR=$(nmap --datadir)
-          echo "Nmap data directory: $NMAP_DATA_DIR"
+            NMAP_DATA_DIR=$(nmap --datadir)
+            echo "Nmap data directory: $NMAP_DATA_DIR"
 
-          echo "Copying Nmap script and library..."
-          sudo mkdir -p "${NMAP_DATA_DIR}/scripts/"
-          sudo mkdir -p "${NMAP_DATA_DIR}/nselib/"
-          sudo cp "$NMAP_SCRIPT_SRC" "${NMAP_DATA_DIR}/scripts/"
-          sudo cp "$NMAP_LIB_SRC" "${NMAP_DATA_DIR}/nselib/"
+            echo "Copying Nmap script and library..."
+            sudo mkdir -p "${NMAP_DATA_DIR}/scripts/"
+            sudo mkdir -p "${NMAP_DATA_DIR}/nselib/"
+            # Use the correct source paths again
+            sudo cp "$NMAP_SCRIPT_SRC" "${NMAP_DATA_DIR}/scripts/"
+            sudo cp "$NMAP_LIB_SRC" "${NMAP_DATA_DIR}/nselib/"
 
-          echo "Updating Nmap script database..."
-          sudo nmap --script-updatedb
-          echo "Nmap script database updated."
+            echo "Updating Nmap script database..."
+            sudo nmap --script-updatedb
+            echo "Nmap script database updated."
 
       - name: Start tcpdump capture
         id: start_tcpdump

@@ -1,15 +1,14 @@
-version: '3'
-
+version: '3.7'
 services:
   orthanc:
     image: orthancteam/orthanc:latest
     ports:
-      - "11112:4242"  # DICOM port
-      - "8042:8042"  # Web UI
+      - "11112:4242"  # DICOM port (Host:Container)
+      - "8042:8042"   # Web UI (Host:Container)
     environment:
       - ORTHANC__NAME=ORTHANC_TEST
       - ORTHANC__DICOM_SERVER_ENABLED=true
-      - VERBOSE_ENABLED=true
+      - VERBOSE_ENABLED=true # Enable verbose logging in Orthanc
       - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_ECHO=true # always answer C-ECHO
       - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_FIND=true
       - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_MOVE=true
@@ -17,6 +16,21 @@ services:
       - ORTHANC__DICOM_SERVER_VERIFY_CALLED_AET=false # No AE Title Validation
     volumes:
       - orthanc_db:/var/lib/orthanc/db
+    restart: unless-stopped # Optional: Keep container running if needed locally
+
+  dcm4chee:
+    image: jodogne/dcm4chee:latest # The image specified by the user
+    ports:
+      - "11113:11112" # Map container DICOM port 11112 to UNIQUE host port 11113
+      - "8081:8080"   # Map container Web UI 8080 to UNIQUE host port 8081
+    # Add healthcheck (optional but recommended) - this is a basic TCP check
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "11112"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped # Optional
 
 volumes:
-  orthanc_db:
+  orthanc_db: # Keep volume for Orthanc persistence
+  # No volume needed for dcm4chee based on its description unless persistence is desired

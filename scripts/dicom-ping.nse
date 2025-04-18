@@ -58,108 +58,107 @@ action = function(host, port)
   local output = stdnse.output_table()
 
   -- Try association
-  local dcm_status, err_or_nil, version, vendor = dicom.associate(host, port)
+  local dcm_status, err, version, vendor = dicom.associate(host, port) -- Capture original return values
 
-  -- Handle association rejection or pcall errors
+  -- Handle association rejection
+  -- NOTE: Using 'err' here as per original script logic, assumes associate returns error msg in 'err' on failure
   if dcm_status == false then
-    stdnse.debug1("Association failed: %s", err_or_nil or "Unknown error")
-    if err_or_nil == "ASSOCIATE REJECT received" then
+    stdnse.debug1("Association failed: %s", err or "Unknown error")
+    if err == "ASSOCIATE REJECT received" then
       port.version.name = "dicom"
       nmap.set_port_version(host, port)
+
       output.dicom = "DICOM Service Provider discovered!"
       output.config = "Called AET check enabled"
       output.auth = "Cannot test User Identity Negotiation (AET required)"
     end
+    -- Debug print on failure
     stdnse.debug1("Final output table contents (on failure):\n%s", stdnse.format_output(true, output))
     return output
   end
 
-  -- Association successful
-  stdnse.debug1("Associate success - Raw Version: %s, Raw Vendor: %s",
+  -- Debug output for troubleshooting using original variable names
+  stdnse.debug1("Associate success - Version: %s, Vendor: %s",
                 version or "nil",
                 vendor or "nil")
 
+  -- Association successful
   port.version.name = "dicom"
-  nmap.set_port_version(host, port)
+  nmap.set_port_version(host, port) -- Set base service name
 
   output.dicom = "DICOM Service Provider discovered!"
   output.config = "Any AET is accepted (Insecure)"
 
-  local final_version = nil
-  local final_vendor = nil
-
-  -- Process version information
+  -- Add version information if available (using original logic)
   if version then
-    stdnse.debug1("Raw version string from associate: %s", version)
+    stdnse.debug1("Detected DICOM version string: %s", version)
     local clean_version = dicom.extract_clean_version(version, vendor)
     if clean_version then
       stdnse.debug1("Cleaned version: %s", clean_version)
-      final_version = clean_version
+      output.version = clean_version
     else
-      stdnse.debug1("Could not clean version string, using raw: %s", version)
-      final_version = version
+      output.version = version
     end
-    output.version = final_version
-  else
-     stdnse.debug1("No version string returned from associate.")
   end
 
-  -- Process vendor information (REMOVED the 'else' part of this block)
+  -- Add vendor information if available (using original logic)
   if vendor then
-    stdnse.debug1("Vendor from associate: %s", vendor)
-    final_vendor = vendor
-    output.vendor = final_vendor
+    stdnse.debug1("Detected DICOM vendor: %s", vendor)
+    output.vendor = vendor
 
-    -- Orthanc-specific REST check
-    if final_vendor == "Orthanc" then
-      stdnse.debug1("Vendor identified as Orthanc, trying REST API for version...")
+    -- Orthanc-specific REST check (original logic)
+    if vendor == "Orthanc" then
+      stdnse.debug1("Detected Orthanc, trying REST API for version...")
+
       local ports_to_try = {8042, port.number}
       local orthanc_version_found = false
+
       for _, test_port in ipairs(ports_to_try) do
         stdnse.debug1("Trying Orthanc REST API on port %d", test_port)
+        -- NOTE: Original script didn't use pcall here, adding it for safety
         local status, response = pcall(http.get, host, test_port, "/system", {timeout=3000})
-        if status and response and response.status then
+
+        if status and response and response.status then -- Check pcall status first
           stdnse.debug1("HTTP response status: %d from port %d", response.status, test_port)
-          if response.status == 200 and response.body then
-            stdnse.debug1("Response body length: %d", #(response.body))
-            local rest_ver = response.body:match('"Version"%s*:%s*"([%d.]+)"')
-            if rest_ver then
-              stdnse.debug1("Found Orthanc version via REST: %s", rest_ver)
-              output.version = rest_ver
-              output.vendor = "Orthanc"
-              output.notes = "Version confirmed via REST API"
-              final_version = rest_ver
-              orthanc_version_found = true
-              port.version.product = "Orthanc"
-              port.version.version = rest_ver
-              nmap.set_port_version(host, port)
-              break
-            else
-              stdnse.debug1("Version field not found in JSON response from port %d", test_port)
+
+          if response.status == 200 then
+            stdnse.debug1("Response body length: %d", #(response.body or ""))
+
+            if response.body then
+              local ver = response.body:match('"Version"%s*:%s*"([%d.]+)"')
+              if ver then
+                stdnse.debug1("Found Orthanc version via REST: %s", ver)
+                output.version = ver
+                output.vendor = "Orthanc"
+                output.notes = "Version confirmed via REST API"
+                orthanc_version_found = true
+
+                port.version.product = "Orthanc"
+                port.version.version = ver
+                nmap.set_port_version(host, port)
+                break
+              else
+                stdnse.debug1("Version field not found in JSON response")
+              end
             end
           end
         else
           stdnse.debug1("Failed to connect/get from REST API on port %d: %s", test_port, (response and tostring(response)) or "pcall failed")
         end
       end -- end for loop
+
       if not orthanc_version_found then
         stdnse.debug1("Could not determine Orthanc version via REST API")
+        output.vendor = "Orthanc" -- Set output vendor even if REST fails
         port.version.product = "Orthanc"
         nmap.set_port_version(host, port)
       end
-    else -- Else for: if final_vendor == "Orthanc"
-       -- If vendor wasn't Orthanc, set product/version info if known
-       if final_vendor then
-          port.version.product = final_vendor
-          if final_version then port.version.version = final_version end
-          nmap.set_port_version(host, port)
-       end
-    end -- end if final_vendor == "Orthanc"
-  -- NOTE: The 'else' block for 'if vendor then' was removed here.
-  end -- end if vendor
+    end -- end Orthanc check
+  end -- end vendor check
 
-  -- Final debug output before returning
+  -- *** ADDED DEBUG LINE ***
   stdnse.debug1("Final output table contents:\n%s", stdnse.format_output(true, output))
+  -- *** END ADDED DEBUG LINE ***
 
   return output
-end -- closes action = function(...)
+end -- end action function

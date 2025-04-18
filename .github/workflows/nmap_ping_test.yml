@@ -60,19 +60,38 @@ jobs:
           sudo nmap --script-updatedb
           echo "Nmap script database updated."
 
-      - name: Start DICOM Server (${{ matrix.dicom_server.name }})
-        run: |
-          echo "Starting Docker service: ${{ matrix.dicom_server.service_name }}"
-          # Start only the specific service for this matrix job
-          docker-compose up -d --remove-orphans ${{ matrix.dicom_server.service_name }}
-          # Add a significant wait time, especially for dcm4chee
-          # Alternatively, implement a more robust wait-for-port logic
-          WAIT_TIME=30
-          echo "Waiting ${WAIT_TIME}s for ${{ matrix.dicom_server.service_name }} to initialize..."
-          sleep ${WAIT_TIME}
-          echo "Checking if port ${{ matrix.dicom_server.host_port }} is listening..."
-          nc -z -v localhost ${{ matrix.dicom_server.host_port }} || { echo "::error::Port ${{ matrix.dicom_server.host_port }} is not open after wait."; exit 1; }
-
+          - name: Start DICOM Server (${{ matrix.dicom_server.name }})
+          run: |
+            echo "Starting Docker service: ${{ matrix.dicom_server.service_name }}"
+            # Attempt to start the service
+            docker-compose up -d --remove-orphans ${{ matrix.dicom_server.service_name }}
+            UP_EXIT_CODE=$? # Capture exit code
+  
+            # Check if docker-compose up failed immediately
+            if [ $UP_EXIT_CODE -ne 0 ]; then
+              echo "::error::'docker-compose up' failed with exit code $UP_EXIT_CODE. Dumping logs:"
+              # Attempt to get logs even if compose up failed
+              docker-compose logs ${{ matrix.dicom_server.service_name }} || echo "Failed to get logs after compose up failure."
+              exit $UP_EXIT_CODE # Exit with the failure code
+            fi
+  
+            # If compose up seemed okay, proceed with wait and check
+            WAIT_TIME=60
+            echo "Waiting ${WAIT_TIME}s for ${{ matrix.dicom_server.service_name }} to initialize..."
+            sleep ${WAIT_TIME}
+  
+            echo "Checking if port ${{ matrix.dicom_server.host_port }} is listening..."
+            # Check if port is open using netcat
+            if ! nc -z -v localhost ${{ matrix.dicom_server.host_port }}; then
+              echo "::error::Port ${{ matrix.dicom_server.host_port }} is not open after wait. Dumping logs:"
+              docker-compose logs ${{ matrix.dicom_server.service_name }} || echo "Failed to get logs after port check failure."
+              # Also check docker ps status for more clues
+              echo "Docker container status:"
+              docker ps -a --filter "name=${{ matrix.dicom_server.service_name }}"
+              exit 1 # Exit with failure
+            else
+              echo "Port ${{ matrix.dicom_server.host_port }} is open. Proceeding with test."
+            fi
 
       - name: Start tcpdump capture (${{ matrix.dicom_server.name }})
         id: start_tcpdump

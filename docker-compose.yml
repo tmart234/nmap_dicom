@@ -24,7 +24,7 @@ services:
   # --- DCM4CHEE Archive Stack ---
   # Archive Application (replaces the old dcm4chee service)
   arc:
-    image: dcm4che/dcm4chee-arc-psql:latest # Use the new image
+    image: dcm4che/dcm4chee-arc-psql:5.33.1
     container_name: dcm4chee_arc_test # Optional: Give it a fixed name
     ports:
       - "11113:11112" # Map container DICOM port 11112 to host 11113

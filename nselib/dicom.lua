@@ -202,14 +202,15 @@ function parse_implementation_version(data)
   local userinfo_payload_end = userinfo_start + 3 + userinfo_len
   stdnse.debug2("User Information Item Type 0x50 found. Length: %d. Payload byte range: %d - %d (relative to PDU start)", userinfo_len, userinfo_payload_start, userinfo_payload_end)
 
-  -- Validate User Info calculated end against overall PDU length
+  -- Validate User Info calculated end against overall PDU length and truncate if necessary
+  local effective_userinfo_end = userinfo_payload_end
   if userinfo_payload_end > data_len then
-     stdnse.debug1("User Information item's calculated end (%d) exceeds PDU data length (%d). Truncating parse boundary to PDU length.", userinfo_payload_end, data_len)
-     userinfo_payload_end = data_len
+     stdnse.debug1("User Information item's declared end (%d) exceeds PDU data length (%d). Truncating parse boundary to PDU length.", userinfo_payload_end, data_len)
+     effective_userinfo_end = data_len
   end
   -- Ensure start is not already past the (potentially truncated) end
-  if userinfo_payload_start > userinfo_payload_end then
-      stdnse.debug1("User Information payload start offset (%d) is beyond its end offset (%d). Cannot parse sub-items.", userinfo_payload_start, userinfo_payload_end)
+  if userinfo_payload_start > effective_userinfo_end then
+      stdnse.debug1("User Information payload start offset (%d) is beyond its end offset (%d). Cannot parse sub-items.", userinfo_payload_start, effective_userinfo_end)
       return nil, nil
   end
 
@@ -219,7 +220,8 @@ function parse_implementation_version(data)
   local MAX_SUBITEMS = 10 -- Limit loop iterations to prevent infinite loops on malformed data
 
   local item_count = 0
-  while offset <= userinfo_payload_end - 4 and item_count < MAX_SUBITEMS do -- Need at least 4 bytes for Type, Reserved, Length
+  -- Loop while there are at least 4 bytes remaining for a sub-item header within the effective boundary
+  while offset <= effective_userinfo_end - 4 and item_count < MAX_SUBITEMS do
     item_count = item_count + 1
     -- Read Type and Reserved bytes for the sub-item
     local sub_type = string.byte(data, offset)
@@ -227,11 +229,10 @@ function parse_implementation_version(data)
 
     stdnse.debug2("Parsing sub-item #%d at offset %d. Type byte: 0x%02X, Reserved byte: 0x%02X", item_count, offset, sub_type, reserved_byte)
 
-    -- Check for expected User Info sub-item types (add others if needed)
-    -- Common types from DICOM Part 7, Annex D.3.3.2 & Part 8, Annex B
+    -- Check for expected User Info sub-item types
     if sub_type ~= 0x51 and sub_type ~= 0x52 and sub_type ~= 0x55 and sub_type ~= 0x53 and sub_type ~= 0x54 then
          stdnse.debug1("Unexpected or unhandled sub-item type 0x%02X encountered at offset %d. Stopping User Info parse.", sub_type, offset)
-         break -- Stop parsing User Info if type is unknown/invalid
+         break -- Stop parsing if type is unknown/invalid
     end
 
     -- Expect Reserved byte to be 0x00 for these items
@@ -243,56 +244,62 @@ function parse_implementation_version(data)
     -- Read sub-item length (2 bytes, Big Endian, starts after Type and Reserved)
     local _, sub_length = string.unpack(">I2", data, offset + 2)
     local sub_value_start = offset + 4 -- Value starts after Type(1)+Reserved(1)+Length(2)
-    local sub_value_end = offset + 3 + sub_length -- End of value field
+    local sub_value_end = offset + 3 + sub_length -- End of value field based on its own length
     stdnse.debug2("Found sub-item type 0x%02X, Length: %d. Calculated value byte range: %d - %d", sub_type, sub_length, sub_value_start, sub_value_end)
 
-    -- Sanity check the reported length
+    -- *** MODIFIED LOGIC START ***
+    local advance_offset = 4 -- Default advance is just the header size
+
+    -- Sanity check the reported length - if excessive, treat as invalid item
     if sub_length > MAX_REASONABLE_SUBITEM_LEN then
-        stdnse.debug1("Sub-item (type 0x%02X) reported length %d seems excessive (>%d) at offset %d. Stopping User Info parse.", sub_type, sub_length, MAX_REASONABLE_SUBITEM_LEN, offset)
-        break
-    end
+        stdnse.debug1("Sub-item (type 0x%02X) reported length %d seems excessive (>%d) at offset %d. Skipping item.", sub_type, sub_length, MAX_REASONABLE_SUBITEM_LEN, offset)
+        -- Keep advance_offset = 4
+    -- Check if the sub-item's calculated end fits within the *effective* user info boundary
+    elseif sub_value_end <= effective_userinfo_end then
+        stdnse.debug2("Sub-item (type 0x%02X) is within boundaries. Processing value.", sub_type)
+        -- Proceed to extract value if length is positive
+        if sub_length > 0 then
+            local value_raw = data:sub(sub_value_start, sub_value_end)
+            -- Trim null bytes and leading/trailing whitespace for string values
+            local value_cleaned = value_raw:gsub("%z", ""):gsub("^%s*", ""):gsub("%s*$", "")
 
-    -- Validate sub-item's calculated end boundary against the User Info payload end boundary
-    if sub_value_end > userinfo_payload_end then
-        stdnse.debug1("Sub-item (type 0x%02X) calculated end offset %d exceeds User Info payload boundary (%d) at offset %d. Stopping User Info parse.", sub_type, sub_value_end, userinfo_payload_end, offset)
-        break
-    end
-
-    -- Extract and clean value if length is positive
-    if sub_length > 0 then
-        local value_raw = data:sub(sub_value_start, sub_value_end)
-        -- Trim null bytes and leading/trailing whitespace for string values
-        local value_cleaned = value_raw:gsub("%z", ""):gsub("^%s*", ""):gsub("%s*$", "")
-
-        if sub_type == 0x52 then -- Implementation Class UID
-            if not uid then -- Only take the first one found
-                uid = value_cleaned
-                stdnse.debug1("Extracted Implementation Class UID (0x52): '%s'", uid)
-            else
-                stdnse.debug2("Ignoring subsequent Implementation Class UID: '%s'", value_cleaned)
+            if sub_type == 0x52 then -- Implementation Class UID
+                if not uid then -- Only take the first one found
+                    uid = value_cleaned
+                    stdnse.debug1("Extracted Implementation Class UID (0x52): '%s'", uid)
+                else
+                    stdnse.debug2("Ignoring subsequent Implementation Class UID: '%s'", value_cleaned)
+                end
+            elseif sub_type == 0x55 then -- Implementation Version Name
+                if not version then -- Only take the first one found
+                    version = value_cleaned
+                    stdnse.debug1("Extracted Implementation Version Name (0x55): '%s'", version)
+                else
+                    stdnse.debug2("Ignoring subsequent Implementation Version Name: '%s'", value_cleaned)
+                end
+            elseif sub_type == 0x51 then -- Maximum Length Received (UInt32)
+                 if sub_length == 4 then
+                     local _, max_len = string.unpack(">I4", value_raw) -- It's 4 bytes Big Endian
+                     stdnse.debug1("Extracted Max PDU Length Received (0x51): %d", max_len)
+                 else
+                     stdnse.debug1("Incorrect length (%d) for Max PDU Length sub-item (0x51). Expected 4.", sub_length)
+                 end
+            -- Add handling for other types like Asynchronous Operations Window (0x53) if needed
             end
-        elseif sub_type == 0x55 then -- Implementation Version Name
-            if not version then -- Only take the first one found
-                version = value_cleaned
-                stdnse.debug1("Extracted Implementation Version Name (0x55): '%s'", version)
-            else
-                stdnse.debug2("Ignoring subsequent Implementation Version Name: '%s'", value_cleaned)
-            end
-        elseif sub_type == 0x51 then -- Maximum Length Received (UInt32)
-             if sub_length == 4 then
-                 local _, max_len = string.unpack(">I4", value_raw) -- It's 4 bytes Big Endian
-                 stdnse.debug1("Extracted Max PDU Length Received (0x51): %d", max_len)
-             else
-                 stdnse.debug1("Incorrect length (%d) for Max PDU Length sub-item (0x51). Expected 4.", sub_length)
-             end
-        -- Add handling for other types like Asynchronous Operations Window (0x53) if needed
+        else
+             stdnse.debug2("Sub-item (type 0x%02X) has zero length.", sub_type)
         end
+        -- Set offset advancement based on this valid item's size (header + value length)
+        advance_offset = 4 + sub_length
     else
-         stdnse.debug2("Sub-item (type 0x%02X) has zero length.", sub_type)
+        -- Item exceeds boundary - log and skip processing its value
+        stdnse.debug1("Sub-item (type 0x%02X) calculated end offset %d exceeds User Info payload boundary (%d) at offset %d. Skipping value processing.", sub_type, sub_value_end, effective_userinfo_end, offset)
+        -- Keep advance_offset = 4 (just skip header)
     end
+    -- *** MODIFIED LOGIC END ***
 
-    -- Move offset to the beginning of the next sub-item
-    offset = sub_value_end + 1 -- Next item starts right after the current item's value
+    -- Advance the offset for the next iteration
+    offset = offset + advance_offset
 
   end -- while loop
 

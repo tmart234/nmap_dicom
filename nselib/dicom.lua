@@ -365,14 +365,14 @@ end
 function extract_clean_version(version_str, vendor)
   if not version_str then return nil end
 
-  -- Clean the input string first
+  -- Clean the input string first (remove null bytes, trim whitespace)
   version_str = version_str:gsub("%z", ""):gsub("^%s*", ""):gsub("%s*$", "")
 
   -- DCMTK versions - Expanded to handle more formats
   -- Check vendor hint OR if the string contains DCMTK identifiers
   if vendor == "DCMTK" or version_str:match("OFFIS_DCMTK") or version_str:match("DCMTK") then
 
-    -- *** ADD THIS PATTERN FIRST for OFFIS_DCMTK_369 format -> 3.6.9 ***
+    -- Handle OFFIS_DCMTK_369 format -> 3.6.9
     local major, minor, patch = version_str:match("OFFIS_DCMTK_(%d)(%d)(%d)")
     if major and minor and patch then
       stdnse.debug1("Matched OFFIS_DCMTK_ddd format: %s.%s.%s", major, minor, patch)
@@ -380,13 +380,14 @@ function extract_clean_version(version_str, vendor)
     end
 
     -- Handle DCMTK_362 format -> 3.6.2 (Adjusted pattern)
-    major, minor, patch = version_str:match("DCMTK_(%d)(%d)(%d)")
+    major, minor, patch = version_str:match("DCMTK_(%d)(%d)(%d)") -- Removed '+' from middle digit group
     if major and minor and patch then
       stdnse.debug1("Matched DCMTK_ddd format: %s.%s.%s", major, minor, patch)
       return string.format("%s.%s.%s", major, minor, patch)
     end
 
     -- Handle just 3 digits if other patterns failed (e.g., if only "369" was passed somehow)
+    -- This might catch cases where only the numeric part from the UID was passed.
     if #version_str == 3 and version_str:match("^(%d)(%d)(%d)$") then
        major, minor, patch = version_str:match("^(%d)(%d)(%d)$")
        if major and minor and patch then
@@ -409,17 +410,48 @@ function extract_clean_version(version_str, vendor)
     end
   end
 
-  -- ... (rest of the function for Horos, ClearCanvas, Generic checks remains the same) ...
+  -- Horos/OsiriX versions
+  if vendor == "Horos" or vendor == "OsiriX" then
+    -- Format: Horos-v3.3.6 or OsiriX-v9.0.2
+    local ver = version_str:match("[vV](%d+%.%d+%.%d+)") -- Allow V or v
+    if ver then
+       stdnse.debug1("Matched Horos/OsiriX format: %s", ver)
+       return ver
+    end
+     -- Try matching without 'v' prefix as well
+     ver = version_str:match("(%d+%.%d+%.%d+)")
+     if ver then
+        stdnse.debug1("Matched Horos/OsiriX numeric format: %s", ver)
+        return ver
+     end
+  end
 
-  -- Generic version detection: Try standard version format first
+  -- ClearCanvas versions
+  if vendor == "ClearCanvas" then
+    -- Format: ClearCanvas_2.0.12345.37893
+    local major, minor = version_str:match("ClearCanvas_(%d+)%.(%d+)")
+    if major and minor then
+      local build = version_str:match("ClearCanvas_%d+%.%d+%.(%d+)")
+      if build then
+        stdnse.debug1("Matched ClearCanvas format (Major.Minor.Build): %s.%s.%s", major, minor, build)
+        return string.format("%s.%s.%s", major, minor, build)
+      end
+      stdnse.debug1("Matched ClearCanvas format (Major.Minor): %s.%s", major, minor)
+      return string.format("%s.%s", major, minor)
+    end
+  end
+
+  -- Generic version detection: Try standard X.Y.Z format first
   local version = version_str:match("(%d+%.%d+%.%d+)")
   if version then
+    stdnse.debug1("Matched generic X.Y.Z format: %s", version)
     return version
   end
 
-  -- Try just major.minor format
+  -- Try just X.Y format
   version = version_str:match("(%d+%.%d+)")
   if version then
+    stdnse.debug1("Matched generic X.Y format: %s", version)
     return version
   end
 
@@ -427,7 +459,6 @@ function extract_clean_version(version_str, vendor)
   stdnse.debug1("No specific version format matched for '%s'. Returning as is.", version_str)
   return version_str
 end
-
 
 ---
 -- associate(host, port) Attempts to associate to a DICOM Service Provider by sending an A-ASSOCIATE request.

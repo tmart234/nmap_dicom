@@ -15,15 +15,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      # --- NEW DIAGNOSTIC STEP ---
-      - name: List files after checkout
+      # Optional: Keep the diagnostic step for future debugging if needed, or remove it.
+      - name: List files after checkout (Diagnostic)
         run: |
           echo "Current directory: $PWD"
           echo "Listing root directory contents:"
           ls -la .
-          echo "Listing 'nmap_dicom' directory contents (if it exists):"
-          ls -la nmap_dicom || echo "'nmap_dicom' directory not found at root level."
-      # --- END NEW DIAGNOSTIC STEP ---
 
       - name: Set up Python # Optional
         uses: actions/setup-python@v5
@@ -40,19 +37,20 @@ jobs:
 
       - name: Copy custom Nmap files
         run: |
-          # Paths based on the confirmed structure relative to repo root
-          NMAP_SCRIPT_SRC="nmap_dicom/scripts/dicom-ping.nse"
-          NMAP_LIB_SRC="nmap_dicom/nselib/dicom.lua"
+          # --- CORRECTED PATHS based on ls output ---
+          # Paths relative to the repository root (which is $PWD)
+          NMAP_SCRIPT_SRC="scripts/dicom-ping.nse" # NO nmap_dicom/ prefix
+          NMAP_LIB_SRC="nselib/dicom.lua"        # NO nmap_dicom/ prefix
 
-          echo "Attempting to access Nmap script at: $PWD/$NMAP_SCRIPT_SRC"
+          echo "Checking for Nmap script at: $PWD/$NMAP_SCRIPT_SRC"
           if [ ! -f "$NMAP_SCRIPT_SRC" ]; then
-            echo "::error::Nmap script file not found at '$NMAP_SCRIPT_SRC'. Please check the output of the 'List files after checkout' step."
+            echo "::error::Nmap script file not found at '$PWD/$NMAP_SCRIPT_SRC'."
             exit 1
           fi
 
-          echo "Attempting to access Nmap library at: $PWD/$NMAP_LIB_SRC"
+          echo "Checking for Nmap library at: $PWD/$NMAP_LIB_SRC"
           if [ ! -f "$NMAP_LIB_SRC" ]; then
-            echo "::error::Nmap library file not found at '$NMAP_LIB_SRC'. Please check the output of the 'List files after checkout' step."
+            echo "::error::Nmap library file not found at '$PWD/$NMAP_LIB_SRC'."
             exit 1
           fi
 
@@ -61,6 +59,7 @@ jobs:
           echo "Copying Nmap script and library..."
           sudo mkdir -p "${NMAP_DATA_DIR}/scripts/"
           sudo mkdir -p "${NMAP_DATA_DIR}/nselib/"
+          # Use the corrected source paths
           sudo cp "$NMAP_SCRIPT_SRC" "${NMAP_DATA_DIR}/scripts/"
           sudo cp "$NMAP_LIB_SRC" "${NMAP_DATA_DIR}/nselib/"
           echo "Updating Nmap script database..."
@@ -76,15 +75,17 @@ jobs:
           echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
 
       - name: Make test script executable
-        # Assumes test_nmap.sh is inside nmap_dicom/
-        run: chmod +x nmap_dicom/test_nmap.sh
+        # Script is at the root level now
+        run: chmod +x test_nmap.sh # NO nmap_dicom/ prefix
 
       - name: Run DICOM Test Script
         id: test_script
-        working-directory: ./nmap_dicom # Run from within the nmap_dicom directory
+        # REMOVED working-directory line, run from repo root
         run: |
-          ./test_nmap.sh
+          # Execute script from repo root
+          bash ./test_nmap.sh # Use bash explicitly or ./
 
+      # --- Rest of the steps remain the same ---
       - name: Stop tcpdump capture
         if: always()
         run: |
@@ -101,7 +102,6 @@ jobs:
       - name: Print PCAP Info
         if: always()
         run: |
-          # PCAP file should be created in the root directory by the tcpdump step
           PCAP_FILE="dicom_capture_orthanc.pcap"
           if [[ -f "$PCAP_FILE" ]]; then
             echo "--- PCAP Info for $PCAP_FILE ---"
@@ -117,7 +117,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dicom-pcap-capture-orthanc
-          # Path relative to the repo root
           path: dicom_capture_orthanc.pcap
           if-no-files-found: ignore
 

@@ -37,34 +37,37 @@ jobs:
 
       - name: Copy custom Nmap files
         run: |
-          # --- CORRECTED PATHS based on ls output ---
-          # Paths relative to the repository root (which is $PWD)
-          NMAP_SCRIPT_SRC="scripts/dicom-ping.nse" # NO nmap_dicom/ prefix
-          NMAP_LIB_SRC="nselib/dicom.lua"        # NO nmap_dicom/ prefix
+            # --- Paths based on ls output ---
+            NMAP_SCRIPT_SRC="scripts/dicom-ping.nse"
+            NMAP_LIB_SRC="nselib/dicom.lua"
 
-          echo "Checking for Nmap script at: $PWD/$NMAP_SCRIPT_SRC"
-          if [ ! -f "$NMAP_SCRIPT_SRC" ]; then
+            echo "Checking for Nmap script at: $PWD/$NMAP_SCRIPT_SRC"
+            if [ ! -f "$NMAP_SCRIPT_SRC" ]; then
             echo "::error::Nmap script file not found at '$PWD/$NMAP_SCRIPT_SRC'."
             exit 1
-          fi
+            fi
 
-          echo "Checking for Nmap library at: $PWD/$NMAP_LIB_SRC"
-          if [ ! -f "$NMAP_LIB_SRC" ]; then
+            echo "Checking for Nmap library at: $PWD/$NMAP_LIB_SRC"
+            if [ ! -f "$NMAP_LIB_SRC" ]; then
             echo "::error::Nmap library file not found at '$PWD/$NMAP_LIB_SRC'."
             exit 1
-          fi
+            fi
 
-          NMAP_DATA_DIR=$(nmap --datadir)
-          echo "Nmap data directory: $NMAP_DATA_DIR"
-          echo "Copying Nmap script and library..."
-          sudo mkdir -p "${NMAP_DATA_DIR}/scripts/"
-          sudo mkdir -p "${NMAP_DATA_DIR}/nselib/"
-          # Use the corrected source paths
-          sudo cp "$NMAP_SCRIPT_SRC" "${NMAP_DATA_DIR}/scripts/"
-          sudo cp "$NMAP_LIB_SRC" "${NMAP_DATA_DIR}/nselib/"
-          echo "Updating Nmap script database..."
-          sudo nmap --script-updatedb
-          echo "Nmap script database updated."
+            # --- Use standard hardcoded Nmap path ---
+            NMAP_DEFAULT_PATH="/usr/share/nmap"
+            echo "Using standard Nmap path: $NMAP_DEFAULT_PATH"
+
+            echo "Copying Nmap script and library..."
+            # Use the standard path directly in commands
+            sudo mkdir -p "${NMAP_DEFAULT_PATH}/scripts/"
+            sudo mkdir -p "${NMAP_DEFAULT_PATH}/nselib/"
+            sudo cp "$NMAP_SCRIPT_SRC" "${NMAP_DEFAULT_PATH}/scripts/"
+            sudo cp "$NMAP_LIB_SRC" "${NMAP_DEFAULT_PATH}/nselib/"
+
+            echo "Updating Nmap script database..."
+            # This command should still work
+            sudo nmap --script-updatedb
+            echo "Nmap script database updated."
 
       - name: Start tcpdump capture
         id: start_tcpdump

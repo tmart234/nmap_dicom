@@ -230,8 +230,7 @@ function parse_implementation_version(data)
 
     -- First, check for fatal/showstopper conditions or completely unknown types
     if reserved_byte ~= 0x00 then
-        stdnse.debug1("Sub-item type 0x%02X at offset %d has non-zero reserved byte (0x%02X). Stopping User Info parse.", sub_type, offset, reserved_byte)
-        break -- Stop parsing completely if reserved byte is wrong
+      stdnse.debug1("Sub-item type 0x%02X at offset %d has non-zero reserved byte (0x%02X). Skipping header.", sub_type, offset, reserved_byte)
     elseif sub_type ~= 0x51 and sub_type ~= 0x52 and sub_type ~= 0x55 and sub_type ~= 0x53 and sub_type ~= 0x54 then
         stdnse.debug1("Unexpected or unhandled sub-item type 0x%02X encountered at offset %d. Skipping header.", sub_type, offset)
         -- Keep advance_offset = 4, skip further checks for this iteration

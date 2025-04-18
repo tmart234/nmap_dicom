@@ -560,11 +560,16 @@ function associate(host, port, calling_aet, called_aet)
 
   -- Check the status returned by pcall
   if not success then
-    -- An error occurred inside pcall. 'err' contains the error message/object.
-    stdnse.debug1("Error during association (pcall failed): %s", tostring(err))
-    return false, tostring(err) -- Return false and the error message
+    -- An error occurred inside pcall. 'err' might contain the error message/object.
+    -- Add a check to ensure 'err' is not nil before using tostring()
+    local err_msg = "Unknown error during association pcall"
+    if err ~= nil then
+      err_msg = tostring(err)
+    end
+    stdnse.debug1("Error during association (pcall failed): %s", err_msg)
+    return false, err_msg -- Return false and the safe error message
   else
-    -- pcall succeeded. 'err' contains the *return values* from the anonymous function.
+    -- pcall succeeded. 'err' now contains the *return values* from the anonymous function.
     -- Assign the captured return values back to the original variables.
     -- Note: The order must match the 'return' statement inside pcall's function
     clean_version = err[1] -- First return value was clean_version

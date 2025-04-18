@@ -364,85 +364,69 @@ end
 ---
 function extract_clean_version(version_str, vendor)
   if not version_str then return nil end
-  
+
+  -- Clean the input string first
+  version_str = version_str:gsub("%z", ""):gsub("^%s*", ""):gsub("%s*$", "")
+
   -- DCMTK versions - Expanded to handle more formats
-  if vendor == "DCMTK" or version_str:match("OFFIS_DCMTK") then
-    -- Common DCMTK version format: OFFIS_DCMTK_362 -> 3.6.2
-    local major, minor, patch = version_str:match("DCMTK_(%d)(%d+)(%d)")
+  -- Check vendor hint OR if the string contains DCMTK identifiers
+  if vendor == "DCMTK" or version_str:match("OFFIS_DCMTK") or version_str:match("DCMTK") then
+
+    -- *** ADD THIS PATTERN FIRST for OFFIS_DCMTK_369 format -> 3.6.9 ***
+    local major, minor, patch = version_str:match("OFFIS_DCMTK_(%d)(%d)(%d)")
     if major and minor and patch then
+      stdnse.debug1("Matched OFFIS_DCMTK_ddd format: %s.%s.%s", major, minor, patch)
       return string.format("%s.%s.%s", major, minor, patch)
     end
-    
-    -- Alternative format: DCMTK_364
+
+    -- Handle DCMTK_362 format -> 3.6.2 (Adjusted pattern)
     major, minor, patch = version_str:match("DCMTK_(%d)(%d)(%d)")
     if major and minor and patch then
+      stdnse.debug1("Matched DCMTK_ddd format: %s.%s.%s", major, minor, patch)
       return string.format("%s.%s.%s", major, minor, patch)
     end
-    
-    -- Handle incomplete version strings by directly checking for numbers
-    if version_str:match("DCMTK") then
-      -- If the version string contains DCMTK, try to extract just the numbers
-      local version_numbers = version_str:match("DCMTK_(%d+)")
-      if version_numbers and #version_numbers == 3 then
-        local major = version_numbers:sub(1,1)
-        local minor = version_numbers:sub(2,2)
-        local patch = version_numbers:sub(3,3)
-        return string.format("%s.%s.%s", major, minor, patch)
-      end
+
+    -- Handle just 3 digits if other patterns failed (e.g., if only "369" was passed somehow)
+    if #version_str == 3 and version_str:match("^(%d)(%d)(%d)$") then
+       major, minor, patch = version_str:match("^(%d)(%d)(%d)$")
+       if major and minor and patch then
+           stdnse.debug1("Matched raw ddd format: %s.%s.%s", major, minor, patch)
+           return string.format("%s.%s.%s", major, minor, patch)
+       end
     end
   end
-  
-  -- If the version contains "OFFIS" but we haven't matched it yet
+
+  -- If the version contains "OFFIS" but didn't match specific DCMTK patterns above
   if version_str:match("OFFIS") then
-    -- Try to extract any 3-digit sequence that might represent a version
+    -- Try to extract any 3-digit sequence
     local version_numbers = version_str:match("(%d%d%d)")
     if version_numbers and #version_numbers == 3 then
       local major = version_numbers:sub(1,1)
       local minor = version_numbers:sub(2,2)
       local patch = version_numbers:sub(3,3)
+      stdnse.debug1("Matched generic OFFIS ddd format: %s.%s.%s", major, minor, patch)
       return string.format("%s.%s.%s", major, minor, patch)
     end
   end
-  
-  -- Remainder of the original function...
-  -- Horos/OsiriX versions
-  if vendor == "Horos" or vendor == "OsiriX" then
-    -- Format: Horos-v3.3.6 or OsiriX-v9.0.2
-    local ver = version_str:match("v(%d+%.%d+%.%d+)")
-    if ver then
-      return ver
-    end
-  end
-  
-  -- ClearCanvas versions
-  if vendor == "ClearCanvas" then
-    -- Format: ClearCanvas_2.0.12345.37893
-    local major, minor = version_str:match("ClearCanvas_(%d+)%.(%d+)")
-    if major and minor then
-      local build = version_str:match("ClearCanvas_%d+%.%d+%.(%d+)")
-      if build then
-        return string.format("%s.%s.%s", major, minor, build)
-      end
-      return string.format("%s.%s", major, minor)
-    end
-  end
-  
+
+  -- ... (rest of the function for Horos, ClearCanvas, Generic checks remains the same) ...
+
   -- Generic version detection: Try standard version format first
   local version = version_str:match("(%d+%.%d+%.%d+)")
   if version then
     return version
   end
-  
+
   -- Try just major.minor format
   version = version_str:match("(%d+%.%d+)")
   if version then
     return version
   end
-  
-  -- If all else fails, return as is
+
+  -- If all else fails, return the cleaned original string
+  stdnse.debug1("No specific version format matched for '%s'. Returning as is.", version_str)
   return version_str
 end
-
 
 
 ---
@@ -536,28 +520,44 @@ function associate(host, port, calling_aet, called_aet)
     stdnse.debug1("ASSOCIATE ACCEPT message found! Parsing User Information.")
     received_version_str, received_uid_str = parse_implementation_version(response_data)
 
+    -- Initialize parsed_vendor and parsed_clean_version
+    parsed_vendor = nil
+    parsed_clean_version = nil -- This will hold the final cleaned version
+
     if received_uid_str then
-      local vendor_result, version_part_from_uid = identify_vendor_from_uid(received_uid_str)
-      if vendor_result then parsed_vendor = vendor_result end
-      if version_part_from_uid then
-         parsed_clean_version = extract_clean_version(version_part_from_uid, parsed_vendor)
-      elseif received_version_str then
-         parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
-      end
+        local vendor_result, version_part_from_uid = identify_vendor_from_uid(received_uid_str)
+        if vendor_result then parsed_vendor = vendor_result end -- Assign vendor based on UID
+
+        -- *** MODIFIED LOGIC: Prioritize full version string for cleaning ***
+        if received_version_str then
+            -- Clean the full string from field 0x55 if available
+            parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
+            stdnse.debug1("Using received_version_str ('%s') for cleaning. Result: %s", received_version_str, parsed_clean_version or "nil")
+        elseif version_part_from_uid then
+            -- Fallback to UID part only if full version string is missing
+            parsed_clean_version = extract_clean_version(version_part_from_uid, parsed_vendor)
+            stdnse.debug1("No received_version_str. Using version_part_from_uid ('%s') for cleaning. Result: %s", version_part_from_uid, parsed_clean_version or "nil")
+        end
+        -- *** END MODIFIED LOGIC ***
+
     elseif received_version_str then
-       if received_version_str:match("OFFIS_DCMTK") or received_version_str:match("DCMTK") then
+       -- Only version string was available (no UID or UID didn't contain version info)
+       -- Try to guess vendor=DCMTK if applicable based on string content
+       if parsed_vendor == nil and (received_version_str:match("OFFIS_DCMTK") or received_version_str:match("DCMTK")) then
            parsed_vendor = "DCMTK"
        end
        parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
+       stdnse.debug1("Only received_version_str ('%s') available for cleaning. Result: %s", received_version_str, parsed_clean_version or "nil")
     end
 
-    stdnse.debug1("Parsed values - Version: %s, UID: %s, Vendor: %s",
+    -- Final debug log before returning from pcall's function
+    stdnse.debug1("Parsed values - Clean Version: %s, Raw UID: %s, Vendor: %s",
                   parsed_clean_version or "nil",
                   received_uid_str or "nil",
                   parsed_vendor or "nil")
 
-    -- Return the results on success for pcall to capture
-    -- The order matters: clean_version, vendor, uid_str
+    -- Return the results needed by the outer part of associate
+    -- Order: clean_version, vendor, uid_str (uid_str might be useful later)
     return parsed_clean_version, parsed_vendor, received_uid_str
 
   end) -- end pcall

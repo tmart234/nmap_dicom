@@ -1,36 +1,94 @@
 version: '3.7'
+
 services:
+  # --- Orthanc Service (Unchanged) ---
   orthanc:
     image: orthancteam/orthanc:latest
+    container_name: orthanc_test # Optional: Give it a fixed name
     ports:
       - "11112:4242"  # DICOM port (Host:Container)
       - "8042:8042"   # Web UI (Host:Container)
     environment:
       - ORTHANC__NAME=ORTHANC_TEST
       - ORTHANC__DICOM_SERVER_ENABLED=true
-      - VERBOSE_ENABLED=true # Enable verbose logging in Orthanc
-      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_ECHO=true # always answer C-ECHO
+      - VERBOSE_ENABLED=true
+      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_ECHO=true
       - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_FIND=true
       - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_MOVE=true
       - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_STORE=true
-      - ORTHANC__DICOM_SERVER_VERIFY_CALLED_AET=false # No AE Title Validation
+      - ORTHANC__DICOM_SERVER_VERIFY_CALLED_AET=false
     volumes:
       - orthanc_db:/var/lib/orthanc/db
-    restart: unless-stopped # Optional: Keep container running if needed locally
+    restart: unless-stopped
 
-  dcm4chee:
-    image: jodogne/dcm4chee:latest # The image specified by the user
+  # --- DCM4CHEE Archive Stack ---
+  # Archive Application (replaces the old dcm4chee service)
+  arc:
+    image: dcm4che/dcm4chee-arc-psql:latest # Use the new image
+    container_name: dcm4chee_arc_test # Optional: Give it a fixed name
     ports:
-      - "11113:11112" # Map container DICOM port 11112 to UNIQUE host port 11113
-      - "8081:8080"   # Map container Web UI 8080 to UNIQUE host port 8081
-    # Add healthcheck (optional but recommended) - this is a basic TCP check
+      - "11113:11112" # Map container DICOM port 11112 to host 11113
+      - "8081:8080"   # Map container Web UI 8080 to host 8081
+    environment:
+      # Connect to the PostgreSQL DB service defined below
+      - POSTGRES_HOST=db
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=pacsdb
+      - POSTGRES_USER=pacs
+      - POSTGRES_PASSWORD=pacs
+      # Connect to the LDAP service defined below
+      - LDAP_URL=ldap://ldap:389
+      - LDAP_BASE_DN=dc=dcm4che,dc=org
+      - LDAP_ROOTPASS=secret
+      - WILDFLY_ADMIN_USER=admin # Default admin user/pass for Wildfly console
+      - WILDFLY_ADMIN_PASSWORD=admin
+      # Set lower memory limits for CI environment (adjust if needed)
+      - JAVA_OPTS=-Xms64m -Xmx512m -XX:MetaspaceSize=96m -XX:MaxMetaspaceSize=256m -Djava.net.preferIPv4Stack=true -Djboss.modules.system.pkgs=org.jboss.byteman -Djava.awt.headless=true
+    depends_on:
+      db:
+        condition: service_healthy # Wait for DB to be ready
+      ldap:
+        condition: service_healthy # Wait for LDAP to be ready
+    restart: unless-stopped
+
+  # PostgreSQL Database for Archive
+  db:
+    image: postgres:15-alpine # Use a specific version of postgres
+    container_name: dcm4chee_db_test # Optional
+    environment:
+      - POSTGRES_DB=pacsdb
+      - POSTGRES_USER=pacs
+      - POSTGRES_PASSWORD=pacs
+    volumes:
+      - postgres_db:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "11112"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    restart: unless-stopped # Optional
+      test: ["CMD-SHELL", "pg_isready -U pacs -d pacsdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # OpenLDAP for Archive Configuration
+  ldap:
+    image: dcm4che/slapd-dcm4chee:latest # Use the corresponding LDAP image
+    container_name: dcm4chee_ldap_test # Optional
+    environment:
+      - LDAP_ROOTPASS=secret
+      - LDAP_CONFIG_PASSWORD=secret # Usually needed as well
+    volumes:
+      - ldap_config:/etc/ldap/slapd.d
+      - ldap_data:/var/lib/ldap
+    healthcheck:
+      # Basic check: See if the LDAP port is responding
+      test: ["CMD", "ldapsearch", "-H", "ldap://localhost:389", "-x", "-b", ""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s # Give LDAP some time to start before checking
+    restart: unless-stopped
 
 volumes:
-  orthanc_db: # Keep volume for Orthanc persistence
-  # No volume needed for dcm4chee based on its description unless persistence is desired
+  orthanc_db:
+  postgres_db: # Volume for PostgreSQL data
+  ldap_config: # Volume for LDAP config
+  ldap_data:   # Volume for LDAP data

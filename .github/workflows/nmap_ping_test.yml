@@ -9,22 +9,21 @@ on:
 jobs:
   test-nmap-dicom:
     runs-on: ubuntu-latest
-    # Define the matrix strategy
     strategy:
-      fail-fast: false # Allow other jobs to complete even if one fails
+      fail-fast: false
       matrix:
         dicom_server:
-          # Define configuration for each server test
           - name: orthanc
             host_port: 11112
-            service_name: orthanc # Corresponds to service name in docker-compose.yml
-            # Optional: Add specific args if needed, e.g., for AE Titles
+            service_name: orthanc
+            compose_services: "orthanc" # Service(s) to start for this job
             # nmap_args: ""
-          - name: dcm4chee
+          - name: dcm4chee-arc # Updated name for clarity
             host_port: 11113
-            service_name: dcm4chee
-            # Example: AE Title args if needed for dcm4chee
-            # nmap_args: "--script-args dicom.called_aet=DCM4CHEE,dicom.calling_aet=ECHOSCU"
+            service_name: arc # Main service to test
+            compose_services: "ldap db arc" # Start all required services
+            # Default AE Title for dcm4chee-arc is often DCM4CHEE_ARC
+            nmap_args: "--script-args dicom.called_aet=DCM4CHEE_ARC,dicom.calling_aet=ECHOSCU"
 
     steps:
       - name: Checkout repository
@@ -39,11 +38,12 @@ jobs:
             tcpdump \
             tshark \
             docker-compose \
-            netcat-openbsd # For healthcheck testing (nc command)
+            netcat-openbsd \
+            ldap-utils # Needed for ldapsearch in healthcheck
 
       - name: Copy custom Nmap files
+        # (This step remains the same)
         run: |
-          # (This step remains the same as before)
           NMAP_SCRIPT_SRC="scripts/dicom-ping.nse"
           NMAP_LIB_SRC="nselib/dicom.lua"
           NMAP_DEFAULT_PATH="/usr/share/nmap"
@@ -60,44 +60,43 @@ jobs:
           sudo nmap --script-updatedb
           echo "Nmap script database updated."
 
-          - name: Start DICOM Server (${{ matrix.dicom_server.name }})
-          run: |
-            echo "Starting Docker service: ${{ matrix.dicom_server.service_name }}"
-            # Attempt to start the service
-            docker-compose up -d --remove-orphans ${{ matrix.dicom_server.service_name }}
-            UP_EXIT_CODE=$? # Capture exit code
-  
-            # Check if docker-compose up failed immediately
-            if [ $UP_EXIT_CODE -ne 0 ]; then
-              echo "::error::'docker-compose up' failed with exit code $UP_EXIT_CODE. Dumping logs:"
-              # Attempt to get logs even if compose up failed
-              docker-compose logs ${{ matrix.dicom_server.service_name }} || echo "Failed to get logs after compose up failure."
-              exit $UP_EXIT_CODE # Exit with the failure code
-            fi
-  
-            # If compose up seemed okay, proceed with wait and check
-            WAIT_TIME=60
-            echo "Waiting ${WAIT_TIME}s for ${{ matrix.dicom_server.service_name }} to initialize..."
-            sleep ${WAIT_TIME}
-  
-            echo "Checking if port ${{ matrix.dicom_server.host_port }} is listening..."
-            # Check if port is open using netcat
-            if ! nc -z -v localhost ${{ matrix.dicom_server.host_port }}; then
-              echo "::error::Port ${{ matrix.dicom_server.host_port }} is not open after wait. Dumping logs:"
-              docker-compose logs ${{ matrix.dicom_server.service_name }} || echo "Failed to get logs after port check failure."
-              # Also check docker ps status for more clues
-              echo "Docker container status:"
-              docker ps -a --filter "name=${{ matrix.dicom_server.service_name }}"
-              exit 1 # Exit with failure
-            else
-              echo "Port ${{ matrix.dicom_server.host_port }} is open. Proceeding with test."
-            fi
+      - name: Start DICOM Server Stack (${{ matrix.dicom_server.name }})
+        run: |
+          echo "Starting Docker services: ${{ matrix.dicom_server.compose_services }}"
+          # Use --wait if possible and healthchecks are reliable, otherwise increase sleep
+          # docker-compose up -d --remove-orphans --wait ${{ matrix.dicom_server.compose_services }}
+          # Falling back to sleep for broader compatibility
+          docker-compose up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}
+          UP_EXIT_CODE=$?
+
+          if [ $UP_EXIT_CODE -ne 0 ]; then
+            echo "::error::'docker-compose up' failed with exit code $UP_EXIT_CODE. Dumping logs:"
+            docker-compose logs || echo "Failed to get logs after compose up failure." # Log all services on failure
+            exit $UP_EXIT_CODE
+          fi
+
+          # Increased wait time as dcm4chee-arc stack takes time
+          WAIT_TIME=90
+          echo "Waiting ${WAIT_TIME}s for ${{ matrix.dicom_server.service_name }} stack to initialize..."
+          sleep ${WAIT_TIME}
+
+          echo "Checking if port ${{ matrix.dicom_server.host_port }} is listening..."
+          if ! nc -z -v localhost ${{ matrix.dicom_server.host_port }}; then
+            echo "::error::Port ${{ matrix.dicom_server.host_port }} is not open after wait. Dumping logs:"
+            docker-compose logs || echo "Failed to get logs after port check failure."
+            echo "Docker container status:"
+            docker ps -a
+            exit 1
+          else
+            echo "Port ${{ matrix.dicom_server.host_port }} is open. Proceeding with test."
+          fi
 
       - name: Start tcpdump capture (${{ matrix.dicom_server.name }})
+        # (This step remains the same)
         id: start_tcpdump
         run: |
           TARGET_PORT=${{ matrix.dicom_server.host_port }}
-          PCAP_FILE="dicom_capture_${{ matrix.dicom_server.name }}.pcap" # Unique pcap filename
+          PCAP_FILE="dicom_capture_${{ matrix.dicom_server.name }}.pcap"
           echo "Starting tcpdump capture for port $TARGET_PORT..."
           sudo tcpdump -i any -s 0 "port $TARGET_PORT" -w "$PCAP_FILE" &
           echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
@@ -105,11 +104,10 @@ jobs:
           echo "Tcpdump started (PID: $!), capturing to $PCAP_FILE"
 
       - name: Run Nmap Test (${{ matrix.dicom_server.name }})
-        id: test_script # Keep id for outcome check
+        # (This step remains the same - uses nmap_args from matrix)
+        id: test_script
         run: |
           echo "--- Testing ${{ matrix.dicom_server.name }} DICOM server on host port ${{ matrix.dicom_server.host_port }} ---"
-          # Use matrix variable for port and potentially for args
-          # Add error checking for the nmap command
           nmap -p ${{ matrix.dicom_server.host_port }} \
                -d \
                --script="dicom-ping.nse" \
@@ -117,20 +115,19 @@ jobs:
                --script-trace \
                localhost || { echo "::error::Nmap command failed for ${{ matrix.dicom_server.name }}"; exit 1; }
 
-
       - name: Show Server Logs (${{ matrix.dicom_server.name }})
-        if: always() # Run even if nmap fails
+        # (This step remains the same)
+        if: always()
         run: |
           echo "--- ${{ matrix.dicom_server.name }} server logs (Tail) ---"
           docker-compose logs --tail="50" ${{ matrix.dicom_server.service_name }} || echo "Failed to get logs for ${{ matrix.dicom_server.service_name }}."
           echo "--- ${{ matrix.dicom_server.name }} server logs (DICOM Filter) ---"
           docker-compose logs ${{ matrix.dicom_server.service_name }} | grep -A 5 -B 5 -E "DICOM|DIMSE|Association" || echo "No relevant mentions found in ${{ matrix.dicom_server.name }} logs."
 
-
       - name: Stop tcpdump capture (${{ matrix.dicom_server.name }})
+        # (This step remains the same)
         if: always()
         run: |
-          # (This step remains similar, just uses the specific PID for this job)
           TCPDUMP_PID="${{ steps.start_tcpdump.outputs.tcpdump_pid }}"
           echo "Attempting to stop tcpdump (PID: $TCPDUMP_PID) for ${{ matrix.dicom_server.name }}..."
           if [ -n "$TCPDUMP_PID" ]; then
@@ -143,9 +140,9 @@ jobs:
            sleep 2
 
       - name: Print PCAP Info (${{ matrix.dicom_server.name }})
+       # (This step remains the same)
         if: always()
         run: |
-          # (Uses the specific pcap_file for this job)
           PCAP_FILE="${{ steps.start_tcpdump.outputs.pcap_file }}"
           echo "Checking PCAP file: $PCAP_FILE"
           if [[ -f "$PCAP_FILE" && -s "$PCAP_FILE" ]]; then
@@ -160,17 +157,18 @@ jobs:
         continue-on-error: true
 
       - name: Upload pcap artifact (${{ matrix.dicom_server.name }})
+        # (This step remains the same)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dicom-pcap-${{ matrix.dicom_server.name }} # Unique artifact name
+          name: dicom-pcap-${{ matrix.dicom_server.name }}
           path: ${{ steps.start_tcpdump.outputs.pcap_file }}
           if-no-files-found: ignore
 
-      # Cleanup: Stop the specific container at the end of each matrix job
-      - name: Stop DICOM Server (${{ matrix.dicom_server.name }})
-        if: always() # Ensure cleanup runs even if steps fail
+      # Cleanup: Stop ALL services defined in the compose file at the end of each job
+      #          This is simpler than stopping only specific ones if state isn't needed.
+      - name: Stop DICOM Server Stack (${{ matrix.dicom_server.name }})
+        if: always()
         run: |
-          echo "Stopping docker service: ${{ matrix.dicom_server.service_name }}"
-          docker-compose stop ${{ matrix.dicom_server.service_name }}
-          # Optional: could use 'docker-compose down' if state doesn't need preserving between matrix jobs (unlikely)
+          echo "Stopping all docker services..."
+          docker-compose down --volumes --remove-orphans # Bring everything down cleanly

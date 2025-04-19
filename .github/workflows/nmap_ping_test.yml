@@ -75,23 +75,7 @@ jobs:
           echo "Updating Nmap script database..."
           sudo nmap --script-updatedb
           echo "Nmap script database updated."
-      # ------------------------------------------------------------ #
-      #  END OF CORRECTION                                           #
-      # ------------------------------------------------------------ #
 
-      - name: Modify docker-compose.yml for dcm4chee-arc (if applicable)
-        if: matrix.dicom_server.name == 'dcm4chee-arc'
-        run: |
-          COMPOSE_FILE="${{ matrix.dicom_server.compose_file_path }}"
-          echo "Applying modifications to ${COMPOSE_FILE} for dcm4chee-arc..."
-          [ -f "$COMPOSE_FILE" ] || { echo "::error::Docker compose file not found at '$PWD/$COMPOSE_FILE'."; exit 1; }
-          # Increase memory for arc service
-          sed -i '/^\s*arc:/,/^\s*environment:/ s/-Xmx[0-9]\+m/-Xmx1024m/' "$COMPOSE_FILE"
-          # Add healthcheck with start_period to arc service (insert after restart policy)
-          sed -i "/^\s*arc:/,/^\s*restart:/ s#^\(\s*restart:.*\)\$#\1\n\2healthcheck:\n\2  test: [\"CMD-SHELL\", \"wget --quiet --tries=1 --spider http://localhost:8080/dcm4chee-arc/ui2/ || exit 1\"]\n\2  interval: 20s\n\2  timeout: 10s\n\2  retries: 6\n\2  start_period: 120s#" "$COMPOSE_FILE"
-          echo "--- Modified ${COMPOSE_FILE} ---"
-          cat "$COMPOSE_FILE"
-          echo "--- End Modified ${COMPOSE_FILE} ---"
 
       - name: Start DICOM Server Stack (${{ matrix.dicom_server.name }})
         id: start_server

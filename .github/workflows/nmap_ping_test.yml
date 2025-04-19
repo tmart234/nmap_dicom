@@ -70,15 +70,25 @@ jobs:
           UP_EXIT_CODE=$?
 
           if [ $UP_EXIT_CODE -ne 0 ]; then
-            echo "::error::'docker-compose up' failed with exit code $UP_EXIT_CODE. Dumping logs:"
-            docker-compose logs || echo "Failed to get logs after compose up failure." # Log all services on failure
-            exit $UP_EXIT_CODE
+            echo "::error::'docker-compose up' command failed directly with exit code $UP_EXIT_CODE."
+            echo "::error::Container status BEFORE dumping logs:"
+            docker ps -a # Show status of all containers (running or stopped)
+            echo "::error::Dumping logs for potentially failed stack:"
+            # Use --no-color for cleaner logs in CI
+            docker-compose logs --no-color || echo "Failed to retrieve docker-compose logs."
+            exit $UP_EXIT_CODE # Exit with the original error code
           fi
 
-          # Increased wait time as dcm4chee-arc stack takes time
-          WAIT_TIME=90
-          echo "Waiting ${WAIT_TIME}s for ${{ matrix.dicom_server.service_name }} stack to initialize..."
-          sleep ${WAIT_TIME}
+          echo "Docker compose 'up' succeeded, now waiting for services to become healthy (max 180s)..."
+          if ! docker-compose wait --timeout 180 ${{ matrix.dicom_server.compose_services }}; then
+             echo "::error:: Services failed to become healthy within timeout after 'docker-compose up'."
+             echo "::error:: Container status:"
+             docker ps -a
+             echo "::error:: Dumping logs:"
+             docker-compose logs --no-color || echo "Failed to retrieve docker-compose logs."
+             exit 1
+           fi
+           echo "Services reported healthy/ready by 'docker-compose wait'."
 
           echo "Checking if port ${{ matrix.dicom_server.host_port }} is listening..."
           if ! nc -z -v localhost ${{ matrix.dicom_server.host_port }}; then

@@ -42,7 +42,7 @@ services:
       - LDAP_ROOTPASS=secret
       - WILDFLY_ADMIN_USER=admin
       - WILDFLY_ADMIN_PASSWORD=admin
-      - JAVA_OPTS=-Xms64m -Xmx512m -XX:MetaspaceSize=96m -XX:MaxMetaspaceSize=256m -Djava.net.preferIPv4Stack=true -Djboss.modules.system.pkgs=org.jboss.byteman -Djava.awt.headless=true -Dlogging.level.org.dcm4chee=DEBUG
+      - JAVA_OPTS=-Xms128m -Xmx1024m -XX:MetaspaceSize=128m -XX:MaxMetaspaceSize=384m -Djava.net.preferIPv4Stack=true -Djboss.modules.system.pkgs=org.jboss.byteman -Djava.awt.headless=true
     depends_on:
       db:
         condition: service_healthy

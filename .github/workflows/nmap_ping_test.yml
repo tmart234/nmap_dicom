@@ -16,23 +16,23 @@ jobs:
           - name: orthanc
             host_port: 11112
             service_name: orthanc
-            container_name_pattern: "orthanc_test" # Pattern to find the container
-            compose_services: "orthanc"
+            container_name_pattern: "orthanc_test"
             compose_file_path: "nmap_dicom/docker-compose.yml" # Path to compose file from repo root
+            compose_services: "orthanc"
             # nmap_args: ""
           - name: dcm4chee-arc
             host_port: 11113
-            service_name: arc # Main service to test
-            container_name_pattern: "dcm4chee_arc_test" # Pattern to find the container
-            compose_services: "ldap db arc"
+            service_name: arc
+            container_name_pattern: "dcm4chee_arc_test"
             compose_file_path: "nmap_dicom/docker-compose.yml" # Path to compose file from repo root
+            compose_services: "ldap db arc"
             nmap_args: "--script-args dicom.called_aet=DCM4CHEE_ARC,dicom.calling_aet=ECHOSCU"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetches all history for all tags and branches
+          fetch-depth: 0
 
       - name: List Files for Debugging
         run: |
@@ -50,18 +50,23 @@ jobs:
             netcat-openbsd \
             ldap-utils
 
-      # --------------------------------------------------- #
-      #  CORRECTED STEP: Fixed paths relative to repo root  #
-      # --------------------------------------------------- #
+      # ------------------------------------------------------------ #
+      #  CORRECTED STEP: Reverted paths to user's original version   #
+      # ------------------------------------------------------------ #
       - name: Copy custom Nmap files
         run: |
-          NMAP_SCRIPT_SRC="nmap_dicom/dicom-ping.nse" # Path relative to $PWD (repo root)
-          NMAP_LIB_SRC="nmap_dicom/nselib/dicom.lua"  # Path relative to $PWD (repo root)
+          NMAP_SCRIPT_SRC="scripts/dicom-ping.nse" # Reverted path
+          NMAP_LIB_SRC="nselib/dicom.lua"         # Reverted path
           NMAP_DEFAULT_PATH="/usr/share/nmap"
+
           echo "Checking for Nmap script at: $PWD/$NMAP_SCRIPT_SRC"
-          [ -f "$NMAP_SCRIPT_SRC" ] || { echo "::error::Nmap script file not found at '$PWD/$NMAP_SCRIPT_SRC'."; exit 1; }
+          # Use the variable directly in the check/copy, assumes path is relative to $PWD
+          [ -f "$NMAP_SCRIPT_SRC" ] || { echo "::error::Nmap script file not found at '$PWD/$NMAP_SCRIPT_SRC'. Check repository structure."; exit 1; }
+
           echo "Checking for Nmap library at: $PWD/$NMAP_LIB_SRC"
-          [ -f "$NMAP_LIB_SRC" ] || { echo "::error::Nmap library file not found at '$PWD/$NMAP_LIB_SRC'."; exit 1; }
+           # Use the variable directly in the check/copy
+          [ -f "$NMAP_LIB_SRC" ] || { echo "::error::Nmap library file not found at '$PWD/$NMAP_LIB_SRC'. Check repository structure."; exit 1; }
+
           echo "Using standard Nmap path: $NMAP_DEFAULT_PATH"
           echo "Copying Nmap script and library..."
           sudo mkdir -p "${NMAP_DEFAULT_PATH}/scripts/" "${NMAP_DEFAULT_PATH}/nselib/"
@@ -70,22 +75,20 @@ jobs:
           echo "Updating Nmap script database..."
           sudo nmap --script-updatedb
           echo "Nmap script database updated."
-      # --------------------------------------------------- #
-      #  END OF CORRECTION                                 #
-      # --------------------------------------------------- #
+      # ------------------------------------------------------------ #
+      #  END OF CORRECTION                                           #
+      # ------------------------------------------------------------ #
 
       - name: Modify docker-compose.yml for dcm4chee-arc (if applicable)
         if: matrix.dicom_server.name == 'dcm4chee-arc'
         run: |
           COMPOSE_FILE="${{ matrix.dicom_server.compose_file_path }}"
           echo "Applying modifications to ${COMPOSE_FILE} for dcm4chee-arc..."
-          # Check if file exists before modifying
           [ -f "$COMPOSE_FILE" ] || { echo "::error::Docker compose file not found at '$PWD/$COMPOSE_FILE'."; exit 1; }
           # Increase memory for arc service
           sed -i '/^\s*arc:/,/^\s*environment:/ s/-Xmx[0-9]\+m/-Xmx1024m/' "$COMPOSE_FILE"
           # Add healthcheck with start_period to arc service (insert after restart policy)
-          # Use a different delimiter for sed due to slashes in the healthcheck command
-          sed -i "/^\s*arc:/,/^\s*restart:/ s#^\(\s*restart:.*\)#\1\n\2healthcheck:\n\2  test: [\"CMD-SHELL\", \"wget --quiet --tries=1 --spider http://localhost:8080/dcm4chee-arc/ui2/ || exit 1\"] # Check UI readiness\n\2  interval: 20s\n\2  timeout: 10s\n\2  retries: 6\n\2  start_period: 120s#" "$COMPOSE_FILE"
+          sed -i "/^\s*arc:/,/^\s*restart:/ s#^\(\s*restart:.*\)\$#\1\n\2healthcheck:\n\2  test: [\"CMD-SHELL\", \"wget --quiet --tries=1 --spider http://localhost:8080/dcm4chee-arc/ui2/ || exit 1\"]\n\2  interval: 20s\n\2  timeout: 10s\n\2  retries: 6\n\2  start_period: 120s#" "$COMPOSE_FILE"
           echo "--- Modified ${COMPOSE_FILE} ---"
           cat "$COMPOSE_FILE"
           echo "--- End Modified ${COMPOSE_FILE} ---"
@@ -97,7 +100,7 @@ jobs:
           echo "Starting Docker services from ${COMPOSE_FILE}: ${{ matrix.dicom_server.compose_services }}"
           docker-compose -f "$COMPOSE_FILE" up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}
 
-          # Improved wait logic using docker ps check
+          # Improved wait logic
           MAX_WAIT=180
           CHECK_INTERVAL=10
           ELAPSED_TIME=0
@@ -108,7 +111,6 @@ jobs:
 
           while [ $ELAPSED_TIME -lt $MAX_WAIT ]; do
             CONTAINER_ID=$(docker ps -q --filter "name=${CONTAINER_NAME_PATTERN}")
-
             if [ -z "$CONTAINER_ID" ]; then
               echo "Container '${CONTAINER_NAME_PATTERN}' not found yet..."
             else
@@ -116,55 +118,28 @@ jobs:
               CONTAINER_HEALTH="N/A"
               if docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$CONTAINER_ID" > /dev/null 2>&1; then
                  HEALTH_STATUS_RAW=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$CONTAINER_ID")
-                 if [ -n "$HEALTH_STATUS_RAW" ]; then
-                    CONTAINER_HEALTH="$HEALTH_STATUS_RAW"
-                 fi
+                 if [ -n "$HEALTH_STATUS_RAW" ]; then CONTAINER_HEALTH="$HEALTH_STATUS_RAW"; fi
               fi
-
               echo "Container Status: ${CONTAINER_STATUS}, Health: ${CONTAINER_HEALTH}"
-
               PORT_LISTENING=false
-              if nc -z -v localhost ${TARGET_PORT} > /dev/null 2>&1; then
-                 PORT_LISTENING=true
-                 echo "Port ${TARGET_PORT} is listening."
-              else
-                 echo "Port ${TARGET_PORT} is not listening yet."
-              fi
+              if nc -z -v localhost ${TARGET_PORT} > /dev/null 2>&1; then PORT_LISTENING=true; echo "Port ${TARGET_PORT} is listening."; else echo "Port ${TARGET_PORT} is not listening yet."; fi
 
-              # Check conditions for success (Running + Port Listening + (Healthy OR No Health Check))
+              # Check conditions for success
               if [ "$CONTAINER_STATUS" = "running" ] && ${PORT_LISTENING}; then
-                 # Special case for dcm4chee: only succeed if HEALTHY if health check exists
                  if [ "${{ matrix.dicom_server.name }}" == "dcm4chee-arc" ] && [ "$CONTAINER_HEALTH" != "N/A" ]; then
-                    if [ "$CONTAINER_HEALTH" = "healthy" ]; then
-                        echo "dcm4chee-arc container is healthy. Proceeding."
-                        exit 0 # Success for dcm4chee
-                    else
-                        echo "dcm4chee-arc container health is '${CONTAINER_HEALTH}'. Waiting..."
-                    fi
-                 # General case (Orthanc or dcm4chee without health check yet)
+                    if [ "$CONTAINER_HEALTH" = "healthy" ]; then echo "dcm4chee-arc container is healthy. Proceeding."; exit 0; else echo "dcm4chee-arc container health is '${CONTAINER_HEALTH}'. Waiting..."; fi
                  elif [ "$CONTAINER_HEALTH" = "healthy" ] || [ "$CONTAINER_HEALTH" = "N/A" ]; then
-                    echo "Container '${CONTAINER_NAME_PATTERN}' is ready. Proceeding."
-                    exit 0 # Success
+                    echo "Container '${CONTAINER_NAME_PATTERN}' is ready. Proceeding."; exit 0;
                  fi
               fi
-            fi # End container ID check
-
-            sleep $CHECK_INTERVAL
-            ELAPSED_TIME=$((ELAPSED_TIME + CHECK_INTERVAL))
-            echo "Waited ${ELAPSED_TIME}s..."
-
-          done # End while loop
+            fi
+            sleep $CHECK_INTERVAL; ELAPSED_TIME=$((ELAPSED_TIME + CHECK_INTERVAL)); echo "Waited ${ELAPSED_TIME}s..."
+          done
 
           echo "::error::Container '${CONTAINER_NAME_PATTERN}' did not become ready within ${MAX_WAIT} seconds."
-          # Dump state before exiting
-          echo "--- Current Docker State ---"
-          docker ps -a
-          echo "--- Service Logs Before Exit ---"
-          docker-compose -f "$COMPOSE_FILE" logs --tail 50 ${{ matrix.dicom_server.service_name }} || echo "Could not get final logs for ${{ matrix.dicom_server.service_name }}"
-          if [ "${{ matrix.dicom_server.name }}" == "dcm4chee-arc" ]; then
-             docker-compose -f "$COMPOSE_FILE" logs --tail 50 db || true
-             docker-compose -f "$COMPOSE_FILE" logs --tail 50 ldap || true
-          fi
+          echo "--- Current Docker State ---"; docker ps -a
+          echo "--- Service Logs Before Exit ---"; docker-compose -f "$COMPOSE_FILE" logs --tail 50 ${{ matrix.dicom_server.service_name }} || echo "Could not get final logs for ${{ matrix.dicom_server.service_name }}"
+          if [ "${{ matrix.dicom_server.name }}" == "dcm4chee-arc" ]; then docker-compose -f "$COMPOSE_FILE" logs --tail 50 db || true; docker-compose -f "$COMPOSE_FILE" logs --tail 50 ldap || true; fi
           exit 1 # Failure
 
       - name: Dump Logs on Failure (${{ matrix.dicom_server.name }})

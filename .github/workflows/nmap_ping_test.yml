@@ -61,35 +61,30 @@ jobs:
           echo "Nmap script database updated."
 
       - name: Start DICOM Server Stack (${{ matrix.dicom_server.name }})
+        id: start_server # Give the step an id
         run: |
-          echo "Starting Docker services: ${{ matrix.dicom_server.compose_services }}"
-          # Use --wait if possible and healthchecks are reliable, otherwise increase sleep
-          # docker-compose up -d --remove-orphans --wait ${{ matrix.dicom_server.compose_services }}
-          # Falling back to sleep for broader compatibility
-          docker-compose up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}
-          UP_EXIT_CODE=$?
+            echo "Starting Docker services: ${{ matrix.dicom_server.compose_services }}"
+            # Run docker-compose up. Allow the step to fail if this command fails.
+            docker-compose up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}
 
-          if [ $UP_EXIT_CODE -ne 0 ]; then
-            echo "::error::'docker-compose up' failed with exit code $UP_EXIT_CODE. Dumping logs:"
-            docker-compose logs || echo "Failed to get logs after compose up failure." # Log all services on failure
-            exit $UP_EXIT_CODE
-          fi
+            # Increased wait time
+            WAIT_TIME=90
+            echo "Waiting ${WAIT_TIME}s for ${{ matrix.dicom_server.service_name }} stack to initialize..."
+            sleep ${WAIT_TIME}
 
-          # Increased wait time as dcm4chee-arc stack takes time
-          WAIT_TIME=90
-          echo "Waiting ${WAIT_TIME}s for ${{ matrix.dicom_server.service_name }} stack to initialize..."
-          sleep ${WAIT_TIME}
-
-          echo "Checking if port ${{ matrix.dicom_server.host_port }} is listening..."
-          if ! nc -z -v localhost ${{ matrix.dicom_server.host_port }}; then
-            echo "::error::Port ${{ matrix.dicom_server.host_port }} is not open after wait. Dumping logs:"
-            docker-compose logs || echo "Failed to get logs after port check failure."
-            echo "Docker container status:"
-            docker ps -a
-            exit 1
-          else
-            echo "Port ${{ matrix.dicom_server.host_port }} is open. Proceeding with test."
-          fi
+            echo "Checking if port ${{ matrix.dicom_server.host_port }} is listening..."
+            # Use nc check. Allow the step to fail if this command fails.
+            nc -z -v localhost ${{ matrix.dicom_server.host_port }}
+            echo "Port ${{ matrix.dicom_server.host_port }} check complete."
+            
+      - name: Dump Logs on Failure (${{ matrix.dicom_server.name }})
+        if: failure() # Only run this step if the 'Start DICOM Server Stack' step failed
+        run: |
+            echo "::error:: Server startup or port check failed for ${{ matrix.dicom_server.name }}. Dumping diagnostic information..."
+            echo "--- Docker Compose Logs ---"
+            docker-compose logs || echo "Failed to retrieve docker-compose logs."
+            echo "--- Docker Container Status ---"
+            docker ps -a || echo "Failed to retrieve docker ps status."
 
       - name: Start tcpdump capture (${{ matrix.dicom_server.name }})
         # (This step remains the same)
@@ -171,4 +166,4 @@ jobs:
         if: always()
         run: |
           echo "Stopping all docker services..."
-          docker-compose down --volumes --remove-orphans # Bring everything down cleanly
+          docker-compose down --volumes --remove-orphans --timeout 30 || echo "docker-compose down failed, continuing cleanup..."

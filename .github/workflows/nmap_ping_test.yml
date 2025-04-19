@@ -73,17 +73,15 @@ jobs:
       # Removed the step that modified docker-compose.yml
 
       # ---------------------------------------------------------------- #
-      #  CORRECTED STEP: Added working-directory, removed -f flag       #
+      #  CORRECTED STEP: Changed working-directory path                 #
       # ---------------------------------------------------------------- #
       - name: Start DICOM Server Stack (${{ matrix.dicom_server.name }})
         id: start_server
-        working-directory: ./nmap_dicom # Execute in the directory containing docker-compose.yml
+        working-directory: nmap_dicom # Correct relative path from repo root
         run: |
           echo "Starting Docker services: ${{ matrix.dicom_server.compose_services }}"
-          # docker-compose will find docker-compose.yml in the current directory
           docker-compose up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}
 
-          # Improved wait logic
           MAX_WAIT=180
           CHECK_INTERVAL=10
           ELAPSED_TIME=0
@@ -93,7 +91,6 @@ jobs:
           echo "Waiting up to ${MAX_WAIT}s for container matching '${CONTAINER_NAME_PATTERN}' to be running/healthy and port ${TARGET_PORT} to be listening..."
 
           while [ $ELAPSED_TIME -lt $MAX_WAIT ]; do
-            # Need to check docker status from outside the working-directory context, or ensure docker client can find containers
             CONTAINER_ID=$(docker ps -q --filter "name=${CONTAINER_NAME_PATTERN}")
             if [ -z "$CONTAINER_ID" ]; then
               echo "Container '${CONTAINER_NAME_PATTERN}' not found yet..."
@@ -106,7 +103,6 @@ jobs:
               fi
               echo "Container Status: ${CONTAINER_STATUS}, Health: ${CONTAINER_HEALTH}"
               PORT_LISTENING=false
-              # nc runs outside docker, check localhost port
               if nc -z -v localhost ${TARGET_PORT} > /dev/null 2>&1; then PORT_LISTENING=true; echo "Port ${TARGET_PORT} is listening."; else echo "Port ${TARGET_PORT} is not listening yet."; fi
 
               if [ "$CONTAINER_HEALTH" = "unhealthy" ]; then
@@ -125,7 +121,6 @@ jobs:
           echo "::error::Container '${CONTAINER_NAME_PATTERN}' did not become ready within ${MAX_WAIT} seconds."
           echo "--- Current Docker State ---"; docker ps -a
           echo "--- Service Logs Before Exit ---"
-          # Log command needs to run where compose file is
           docker-compose logs --tail 50 ${{ matrix.dicom_server.service_name }} || echo "Could not get final logs for ${{ matrix.dicom_server.service_name }}"
           if [ "${{ matrix.dicom_server.name }}" == "dcm4chee-arc" ]; then docker-compose logs --tail 50 db || true; docker-compose logs --tail 50 ldap || true; fi
           exit 1 # Failure
@@ -135,11 +130,10 @@ jobs:
 
       - name: Dump Logs on Failure (${{ matrix.dicom_server.name }})
         if: failure() && steps.start_server.outcome == 'failure'
-        working-directory: ./nmap_dicom # Run where compose file is
+        working-directory: nmap_dicom # Correct relative path
         run: |
           echo "::error:: Server startup or readiness check failed for ${{ matrix.dicom_server.name }}. Dumping diagnostic information..."
           echo "--- Docker Container Status ---"
-          # docker ps runs globally, doesn't need working-directory set here, but useful for context
           docker ps -a || echo "Failed to retrieve docker ps status."
           echo "--- Docker Compose Logs ---"
           if [ "${{ matrix.dicom_server.name }}" == "dcm4chee-arc" ]; then
@@ -149,22 +143,18 @@ jobs:
           fi
 
       - name: Start tcpdump capture (${{ matrix.dicom_server.name }})
-        # Runs in repo root
         if: success()
         id: start_tcpdump
         run: |
           TARGET_PORT=${{ matrix.dicom_server.host_port }}
           PCAP_FILE="dicom_capture_${{ matrix.dicom_server.name }}.pcap"
           echo "Starting tcpdump capture for port $TARGET_PORT..."
-          # tcpdump path is relative to $PWD (repo root where step runs)
           sudo tcpdump -i any -s 0 "port $TARGET_PORT" -w "$PWD/$PCAP_FILE" &
           echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
-          # Store relative path for artifact upload
           echo "pcap_file=$PCAP_FILE" >> $GITHUB_OUTPUT
           echo "Tcpdump started (PID: $!), capturing to $PWD/$PCAP_FILE"
 
       - name: Run Nmap Test (${{ matrix.dicom_server.name }})
-        # Runs in repo root
         if: success()
         id: test_script
         run: |
@@ -178,7 +168,7 @@ jobs:
 
       - name: Show Server Logs (${{ matrix.dicom_server.name }})
         if: always() && steps.start_server.outcome == 'success'
-        working-directory: ./nmap_dicom # Run where compose file is
+        working-directory: nmap_dicom # Correct relative path
         run: |
           echo "--- ${{ matrix.dicom_server.name }} server logs (Tail) ---"
           docker-compose logs --tail="50" ${{ matrix.dicom_server.service_name }} || echo "Failed to get logs for ${{ matrix.dicom_server.service_name }}."
@@ -186,7 +176,6 @@ jobs:
           docker-compose logs ${{ matrix.dicom_server.service_name }} | grep -A 5 -B 5 -E "DICOM|DIMSE|Association" || echo "No relevant mentions found in ${{ matrix.dicom_server.name }} logs."
 
       - name: Stop tcpdump capture (${{ matrix.dicom_server.name }})
-        # Runs in repo root
         if: always() && steps.start_tcpdump.conclusion == 'success'
         run: |
           TCPDUMP_PID="${{ steps.start_tcpdump.outputs.tcpdump_pid }}"
@@ -201,7 +190,6 @@ jobs:
             sleep 2
 
       - name: Print PCAP Info (${{ matrix.dicom_server.name }})
-        # Runs in repo root
         if: always() && steps.start_tcpdump.conclusion == 'success'
         run: |
           PCAP_FILE="${{ steps.start_tcpdump.outputs.pcap_file }}" # Relative path stored earlier
@@ -218,7 +206,6 @@ jobs:
         continue-on-error: true
 
       - name: Upload pcap artifact (${{ matrix.dicom_server.name }})
-        # Runs in repo root
         if: always() && steps.start_tcpdump.conclusion == 'success'
         uses: actions/upload-artifact@v4
         with:
@@ -228,9 +215,9 @@ jobs:
 
       - name: Stop DICOM Server Stack (${{ matrix.dicom_server.name }})
         if: always()
-        working-directory: ./nmap_dicom # Run where compose file is
+        working-directory: nmap_dicom # Correct relative path
         run: |
           echo "Stopping all docker services..."
-          # Check compose file exists before trying to use it (it should, but defensive)
+          # Check compose file exists before trying to use it
           [ -f "docker-compose.yml" ] || { echo "::warning::Docker compose file not found in $PWD during cleanup."; exit 0; }
           docker-compose down --volumes --remove-orphans --timeout 30 || echo "docker-compose down failed, continuing cleanup..."

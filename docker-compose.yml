@@ -42,7 +42,7 @@ services:
       - LDAP_ROOTPASS=secret
       - WILDFLY_ADMIN_USER=admin
       - WILDFLY_ADMIN_PASSWORD=admin
-      - JAVA_OPTS=-Xms64m -Xmx512m -XX:MetaspaceSize=96m -XX:MaxMetaspaceSize=256m -Djava.net.preferIPv4Stack=true -Djboss.modules.system.pkgs=org.jboss.byteman -Djava.awt.headless=true
+      - JAVA_OPTS=-Xms64m -Xmx512m -XX:MetaspaceSize=96m -XX:MaxMetaspaceSize=256m -Djava.net.preferIPv4Stack=true -Djboss.modules.system.pkgs=org.jboss.byteman -Djava.awt.headless=true -Dlogging.level.org.dcm4chee=DEBUG
     depends_on:
       db:
         condition: service_healthy
@@ -63,12 +63,13 @@ services:
       - POSTGRES_PASSWORD=pacs
     volumes:
       - postgres_db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pacs -d pacsdb"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
+  healthcheck:
+      test: ["CMD-SHELL", "curl -v --fail --connect-timeout 5 --max-time 10 http://localhost:8080/dcm4chee-arc/ui2/ > /dev/null 2>&1 || exit 1"]
+      interval: 20s
+      timeout: 15s 
+      retries: 6
+      start_period: 60s
+  restart: unless-stopped
 
   # OpenLDAP for Archive Configuration
   ldap:

@@ -61,45 +61,75 @@ jobs:
           echo "Nmap script database updated."
 
       - name: Start DICOM Server Stack (${{ matrix.dicom_server.name }})
+        id: start_stack # Give the step an ID
         run: |
-          echo "Starting Docker services: ${{ matrix.dicom_server.compose_services }}"
-          # Use --wait if possible and healthchecks are reliable, otherwise increase sleep
-          # docker-compose up -d --remove-orphans --wait ${{ matrix.dicom_server.compose_services }}
-          # Falling back to sleep for broader compatibility
-          docker-compose up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}
-          UP_EXIT_CODE=$?
+            echo "Starting Docker services: ${{ matrix.dicom_server.compose_services }}"
+            # Attempt to start services in detached mode using docker-compose (V1)
+            docker-compose up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}
+            UP_EXIT_CODE=$? # Capture exit code IMMEDIATELY
 
-          if [ $UP_EXIT_CODE -ne 0 ]; then
-            echo "::error::'docker-compose up' command failed directly with exit code $UP_EXIT_CODE."
-            echo "::error::Container status BEFORE dumping logs:"
-            docker ps -a # Show status of all containers (running or stopped)
-            echo "::error::Dumping logs for potentially failed stack:"
-            # Use --no-color for cleaner logs in CI
-            docker-compose logs --no-color || echo "Failed to retrieve docker-compose logs."
-            exit $UP_EXIT_CODE # Exit with the original error code
-          fi
+            # Check if the 'up' command itself failed (e.g., arc unhealthy immediately)
+            if [ $UP_EXIT_CODE -ne 0 ]; then
+                echo "::error::'docker-compose up' command failed directly with exit code $UP_EXIT_CODE."
+                echo "::error::Container status BEFORE dumping logs:"
+                docker ps -a # Show status of all containers
+                echo "::error::Dumping logs for potentially failed stack:"
+                docker-compose logs --no-color || echo "Failed to retrieve docker-compose logs."
+                # Set an output variable to indicate failure
+                echo "startup_success=false" >> $GITHUB_OUTPUT
+                exit $UP_EXIT_CODE # Exit with the original error code
+            fi
 
-          echo "Docker compose 'up' succeeded, now waiting for services to become healthy (max 180s)..."
-          if ! docker-compose wait --timeout 180 ${{ matrix.dicom_server.compose_services }}; then
-             echo "::error:: Services failed to become healthy within timeout after 'docker-compose up'."
-             echo "::error:: Container status:"
-             docker ps -a
-             echo "::error:: Dumping logs:"
-             docker-compose logs --no-color || echo "Failed to retrieve docker-compose logs."
-             exit 1
-           fi
-           echo "Services reported healthy/ready by 'docker-compose wait'."
+            # --- If 'up' command succeeded, use sleep to wait ---
+            # Determine wait time based on server type
+            if [ "${{ matrix.dicom_server.name }}" == "dcm4chee-arc" ]; then
+                WAIT_TIME=120 # Longer wait for dcm4chee stack
+            else
+                WAIT_TIME=30  # Shorter wait for orthanc
+            fi
+            echo "Docker compose 'up' succeeded. Waiting ${WAIT_TIME}s for stack initialization (${{ matrix.dicom_server.name }})..."
+            sleep ${WAIT_TIME}
 
-          echo "Checking if port ${{ matrix.dicom_server.host_port }} is listening..."
-          if ! nc -z -v localhost ${{ matrix.dicom_server.host_port }}; then
-            echo "::error::Port ${{ matrix.dicom_server.host_port }} is not open after wait. Dumping logs:"
-            docker-compose logs || echo "Failed to get logs after port check failure."
-            echo "Docker container status:"
-            docker ps -a
-            exit 1
-          else
-            echo "Port ${{ matrix.dicom_server.host_port }} is open. Proceeding with test."
-          fi
+            # Now check if the primary service container is still running after sleep
+            # Use the service name defined in the matrix
+            SERVICE_STATUS=$(docker-compose ps -q ${{ matrix.dicom_server.service_name }} | xargs docker inspect --format='{{.State.Status}}' 2>/dev/null || echo "notfound")
+
+            if [ "$SERVICE_STATUS" != "running" ]; then
+                echo "::error:: Service '${{ matrix.dicom_server.service_name }}' is not running after wait (Status: $SERVICE_STATUS)."
+                echo "::error:: Container status:"
+                docker ps -a
+                echo "::error:: Dumping logs:"
+                docker-compose logs --no-color || echo "Failed to retrieve docker-compose logs."
+                echo "startup_success=false" >> $GITHUB_OUTPUT
+                exit 1
+            fi
+
+            # Check if the host port is listening
+            echo "Checking if host port ${{ matrix.dicom_server.host_port }} is listening..."
+            PORT_OPEN=false
+            # Retry loop for port check
+            for i in {1..5}; do
+                if nc -z -v localhost ${{ matrix.dicom_server.host_port }}; then
+                echo "Port ${{ matrix.dicom_server.host_port }} is open."
+                PORT_OPEN=true
+                break
+                fi
+                echo "Port check failed, retrying in 5 seconds..."
+                sleep 5
+            done
+
+            if [ "$PORT_OPEN" != true ]; then
+                echo "::error::Host port ${{ matrix.dicom_server.host_port }} is not open after wait and retries."
+                echo "::error:: Container status:"
+                docker ps -a
+                echo "::error:: Dumping logs:"
+                docker-compose logs --no-color || echo "Failed to retrieve docker-compose logs."
+                echo "startup_success=false" >> $GITHUB_OUTPUT
+                exit 1
+            fi
+
+            echo "Service stack for ${{ matrix.dicom_server.name }} appears ready for testing."
+            echo "startup_success=true" >> $GITHUB_OUTPUT
 
       - name: Start tcpdump capture (${{ matrix.dicom_server.name }})
         # (This step remains the same)

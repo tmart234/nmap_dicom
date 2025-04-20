@@ -152,7 +152,7 @@ function pdu_header_encode(pdu_type, length)
     return false, "Length must be an unsigned integer."
   end
 
-  local header = string.pack("<B >B I4",
+  local header = string.pack(">B B I4",
                             pdu_type, -- PDU Type ( 1 byte - unsigned integer in Big Endian )
                             0,        -- Reserved section ( 1 byte that should be set to 0x0 )
                             length)   -- PDU Length ( 4 bytes - unsigned integer in Little Endian)
@@ -534,7 +534,7 @@ function associate(host, port, calling_aet, called_aet)
     else
         stdnse.debug1("DICOM Associate: send() call completed successfully inside pcall.")
     end
-    
+
     local receive_status, receive_data = receive(dcm)
     if receive_status == false then error(string.format("Couldn't read ASSOCIATE response:%s", receive_data)) end
     local response_data = receive_data

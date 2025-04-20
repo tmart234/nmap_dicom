@@ -55,6 +55,7 @@ local http = require "http"
 portrule = shortport.port_or_service({104, 2345, 2761, 2762, 4242, 11112}, "dicom", "tcp", "open")
 
 action = function(host, port)
+  stdnse.debug(1, "dicom-ping: ACTION function started for %s:%d", host.ip, port.number)
   local output = stdnse.output_table()
 
   -- Try association

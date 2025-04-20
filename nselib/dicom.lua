@@ -321,7 +321,6 @@ function parse_implementation_version(data)
   return version, uid
 end
 
-
 function identify_vendor_from_uid(uid)
   if not uid then return nil end
 
@@ -330,19 +329,31 @@ function identify_vendor_from_uid(uid)
 
   -- Check against patterns
   for _, pattern_info in ipairs(VENDOR_UID_PATTERNS) do
-    local pattern, vendor = pattern_info[1], pattern_info[2]
+    local pattern_regex, vendor = pattern_info[1], pattern_info[2]
 
-    -- Use string.find anchored at the beginning (position 1)
-    -- The 'true' argument disables pattern matching for the find itself,
-    -- treating the pattern string literally after we handle '^'.
-    -- We remove the '^' anchor as string.find handles the start position.
-    local plain_pattern = pattern:gsub("^%^", "") -- Remove leading ^ anchor if present
-
-    -- Check if the uid STARTS WITH the plain_pattern
-    if uid:find(plain_pattern, 1, true) == 1 then
-      stdnse.debug2("UID '%s' matched pattern prefix '%s' for vendor '%s'", uid, pattern, vendor)
+    --[[
+    -- OLD METHOD using string.match (Requires pattern to match whole string implicitly)
+    if uid:match(pattern_regex) then
+      stdnse.debug2("UID '%s' matched pattern '%s' for vendor '%s'", uid, pattern_regex, vendor)
       return vendor -- Return only the vendor name
     end
+    --]]
+
+    -- *** NEW METHOD using string.find to check prefix ***
+    -- Use string.find anchored at the beginning (position 1).
+    -- The 'true' argument disables pattern matching (magic characters) for the find itself,
+    -- treating the pattern string literally *after* we manually handle '^' and '%.'.
+    -- We remove the '^' anchor as string.find handles the start position.
+    -- We need to convert '%. 'back to '.' for the literal find.
+    local literal_prefix = pattern_regex:gsub("^%^", "") -- Remove leading ^ anchor
+    literal_prefix = literal_prefix:gsub("%%%.", ".")   -- Convert escaped %. back to literal .
+
+    -- Check if the uid STARTS WITH the literal_prefix
+    if uid:find(literal_prefix, 1, true) == 1 then
+      stdnse.debug2("UID '%s' matched pattern prefix '%s' (literal: '%s') for vendor '%s'", uid, pattern_regex, literal_prefix, vendor)
+      return vendor -- Return only the vendor name
+    end
+    -- *** END NEW METHOD ***
   end
 
   stdnse.debug2("UID '%s' did not match any known vendor patterns.", uid)
@@ -365,7 +376,6 @@ function extract_clean_version(version_str, vendor)
   -- DCMTK versions - Expanded to handle more formats
   -- Check vendor hint OR if the string contains DCMTK identifiers
   if vendor == "DCMTK" or version_str:match("OFFIS_DCMTK") or version_str:match("DCMTK") then
-
     -- Handle OFFIS_DCMTK_369 format -> 3.6.9
     local major, minor, patch = version_str:match("OFFIS_DCMTK_(%d)(%d)(%d)")
     if major and minor and patch then
@@ -381,18 +391,17 @@ function extract_clean_version(version_str, vendor)
     end
 
     -- Handle just 3 digits if other patterns failed (e.g., if only "369" was passed somehow)
-    -- This might catch cases where only the numeric part from the UID was passed.
     if #version_str == 3 and version_str:match("^(%d)(%d)(%d)$") then
-       major, minor, patch = version_str:match("^(%d)(%d)(%d)$")
-       if major and minor and patch then
-           stdnse.debug1("Matched raw ddd format: %s.%s.%s", major, minor, patch)
-           return string.format("%s.%s.%s", major, minor, patch)
-       end
+        major, minor, patch = version_str:match("^(%d)(%d)(%d)$")
+        if major and minor and patch then
+            stdnse.debug1("Matched raw ddd format: %s.%s.%s", major, minor, patch)
+            return string.format("%s.%s.%s", major, minor, patch)
+        end
     end
   end
 
   -- If the version contains "OFFIS" but didn't match specific DCMTK patterns above
-  if version_str:match("OFFIS") then
+  if vendor == "DCMTK" and version_str:match("OFFIS") then -- Added vendor check for safety
     -- Try to extract any 3-digit sequence
     local version_numbers = version_str:match("(%d%d%d)")
     if version_numbers and #version_numbers == 3 then
@@ -409,15 +418,15 @@ function extract_clean_version(version_str, vendor)
     -- Format: Horos-v3.3.6 or OsiriX-v9.0.2
     local ver = version_str:match("[vV](%d+%.%d+%.%d+)") -- Allow V or v
     if ver then
-       stdnse.debug1("Matched Horos/OsiriX format: %s", ver)
-       return ver
+        stdnse.debug1("Matched Horos/OsiriX format: %s", ver)
+        return ver
     end
-     -- Try matching without 'v' prefix as well
-     ver = version_str:match("(%d+%.%d+%.%d+)")
-     if ver then
+      -- Try matching without 'v' prefix as well
+      ver = version_str:match("(%d+%.%d+%.%d+)")
+      if ver then
         stdnse.debug1("Matched Horos/OsiriX numeric format: %s", ver)
         return ver
-     end
+      end
   end
 
   -- ClearCanvas versions
@@ -435,18 +444,21 @@ function extract_clean_version(version_str, vendor)
     end
   end
 
+  -- *** MODIFIED pynetdicom block ***
   if vendor == "pynetdicom" then
+    -- *** ADDED BLOCK for PYNETDICOM_ddd format (e.g., PYNETDICOM_210) ***
     local digits = version_str:match("PYNETDICOM_(%d%d%d)$")
     if digits and #digits == 3 then
-       local major = digits:sub(1,1)
-       local minor = digits:sub(2,2)
-       local patch = digits:sub(3,3)
-       stdnse.debug1("Matched PYNETDICOM_ddd format: %s.%s.%s", major, minor, patch)
-       return string.format("%s.%s.%s", major, minor, patch)
+        local major = digits:sub(1,1)
+        local minor = digits:sub(2,2)
+        local patch = digits:sub(3,3)
+        stdnse.debug1("Matched PYNETDICOM_ddd format: %s.%s.%s", major, minor, patch)
+        return string.format("%s.%s.%s", major, minor, patch)
     end
-  
+    -- *** END ADDED BLOCK ***
+
     -- Keep existing checks as fallbacks if needed, or remove if _ddd is the only format
-    -- Format: PYNETDICOM_XYZ -> X.Y.Z (Original check - might be redundant now)
+    -- Format: PYNETDICOM_X.Y.Z (Original check - might be redundant now)
     local major, minor, patch = version_str:match("PYNETDICOM_(%d)%.(%d)%.(%d)") -- Assuming dots if not _ddd
     if major and minor and patch then
       stdnse.debug1("Matched PYNETDICOM_X.Y.Z format: %s.%s.%s", major, minor, patch)
@@ -458,8 +470,8 @@ function extract_clean_version(version_str, vendor)
       stdnse.debug1("Matched PYNETDICOM_X.Y format: %s.%s", major, minor)
       return string.format("%s.%s", major, minor)
     end
-  
   end
+  -- *** END MODIFIED pynetdicom block ***
 
   -- Generic version detection: Try standard X.Y.Z format first
   local version = version_str:match("(%d+%.%d+%.%d+)")

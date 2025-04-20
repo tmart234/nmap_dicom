@@ -61,9 +61,8 @@ local VENDOR_UID_PATTERNS = {
   {"^1%.2%.276%.0%.7230010%.3%.0",           "DCMTK"},          -- General DCMTK base
   {"^1%.4%.3%.6%.1%.4%.1%.78293%.3%.1",       "Orthanc"},        -- Orthanc base
   {"^1%.3%.46%.670589%.50%.1%.4",           "Conquest"},       -- Conquest PACS base
-  {"^1%.2%.40%.0%.13%.1%.1",               "DCM4CHE"}, 
+  {"^1%.2%.40%.0%.13%.1%.3",               "DCM4CHE"}, 
   {"^1%.2%.826%.0%.1%.3680043%.9%.3811",    "pynetdicom"},       -- dcm4chee base
-  {"^1%.2%.826%.0%.1%.3680043%.9%.3",       "DICOM Standard"}, -- Or maybe generic UK NHS software?
   {"^1%.2%.840%.113619%.2%.55",           "GE Healthcare"},  -- GE Healthcare base
   {"^1%.2%.840%.113619%.6%.96",           "GE Healthcare"},  -- GE base
   {"^1%.2%.840%.113619%.6%.105",          "GE Healthcare"},  -- GE base
@@ -76,7 +75,8 @@ local VENDOR_UID_PATTERNS = {
   {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.1%.2", "OsiriX"},       -- OsiriX base prefix
   {"^1%.2%.392%.200036%.9%.1%.1%.1",       "FujiFilm"},       -- FujiFilm base
   {"^1%.2%.840%.114340%.2%.1",            "Agfa"},           -- Agfa base
-  {"^1%.2%.840%.113704%.7%.1%.1%.1%.1%.1", "Carestream"},     -- Carestream base     -- pynetdicom base prefix
+  {"^1%.2%.840%.113704%.7%.1%.1%.1%.1%.1", "Carestream"},     -- Carestream base
+  {"^1%.2%.826%.0%.1%.3680043%.9%.3",       "DICOM Standard"}, -- Or maybe generic UK NHS software?
   {"^1%.3%.6%.1%.4%.1%.19376",             "Mayo Clinic"}    -- Mayo Clinic base
 }
 
@@ -444,7 +444,6 @@ function extract_clean_version(version_str, vendor)
     end
   end
 
-  -- *** MODIFIED pynetdicom block ***
   if vendor == "pynetdicom" then
     -- *** ADDED BLOCK for PYNETDICOM_ddd format (e.g., PYNETDICOM_210) ***
     local digits = version_str:match("PYNETDICOM_(%d%d%d)$")
@@ -455,23 +454,26 @@ function extract_clean_version(version_str, vendor)
         stdnse.debug1("Matched PYNETDICOM_ddd format: %s.%s.%s", major, minor, patch)
         return string.format("%s.%s.%s", major, minor, patch)
     end
-    -- *** END ADDED BLOCK ***
 
-    -- Keep existing checks as fallbacks if needed, or remove if _ddd is the only format
-    -- Format: PYNETDICOM_X.Y.Z (Original check - might be redundant now)
     local major, minor, patch = version_str:match("PYNETDICOM_(%d)%.(%d)%.(%d)") -- Assuming dots if not _ddd
     if major and minor and patch then
       stdnse.debug1("Matched PYNETDICOM_X.Y.Z format: %s.%s.%s", major, minor, patch)
       return string.format("%s.%s.%s", major, minor, patch)
     end
-    -- Format: PYNETDICOM_XY -> X.Y (Original check - might be redundant now)
     major, minor = version_str:match("PYNETDICOM_(%d)%.(%d)") -- Assuming dots if not _ddd
     if major and minor then
       stdnse.debug1("Matched PYNETDICOM_X.Y format: %s.%s", major, minor)
       return string.format("%s.%s", major, minor)
     end
   end
-  -- *** END MODIFIED pynetdicom block ***
+
+  if vendor == "DCM4CHE" then
+    local version = version_str:match("dcm4che%-(%d+%.%d+%.%d+)")
+    if version then
+        stdnse.debug1("Matched dcm4che-X.Y.Z format: %s", version)
+        return version
+    end
+  end
 
   -- Generic version detection: Try standard X.Y.Z format first
   local version = version_str:match("(%d+%.%d+%.%d+)")

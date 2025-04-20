@@ -144,8 +144,11 @@ action = function(host, port)
   nmap.set_port_version(host, port) -- Update port info in Nmap
 
   output.dicom = "DICOM Service Provider discovered!"
-  output.config = "Any AET is accepted (Insecure)" -- AET check is not enabled
-
+  if not called_aet_arg or called_aet_arg == "ANY-SCP" then
+    output.config = "Any AET is accepted (Insecure)"
+  else
+      stdnse.debug1("Specific Called AET ('%s') used successfully.", called_aet_arg)
+  end
   -- Add version information if available
   if version then
     stdnse.debug1("Detected DICOM version string: %s", version)

@@ -13,22 +13,21 @@ jobs:
         fail-fast: false
         matrix:
           dicom_server:
-            - name: orthanc
+            - name: orthanc # Port 11112 is in standard portrule check
               host_port: 11112
               service_name: orthanc
               compose_services: "orthanc"
-              # No extra args needed if 11112 is in standard check
               nmap_args: ""
-            - name: pynetdicom-scp
+            - name: pynetdicom-scp # Port 11114 needs explicit allowance via portrule arg
               host_port: 11114
               service_name: pynetdicom-scp
               compose_services: "pynetdicom-scp"
-              nmap_args: "dicom.calling_aet=ECHOSCU,dicom-ping.ports=11114"
-            - name: dcm4che-scp
+              nmap_args: "--script-args dicom-ping.ports=11114" # Keep this!
+            - name: dcm4che-scp # Port 11115 needs explicit allowance via portrule arg
               host_port: 11115
               service_name: dcm4che-scp
               compose_services: "dcm4che-scp"
-              nmap_args: "dicom.calling_aet=ECHOSCU,dicom-ping.ports=11115"
+              nmap_args: "--script-args dicom-ping.ports=11115" # Keep this!
   
     steps:
       - name: Checkout repository

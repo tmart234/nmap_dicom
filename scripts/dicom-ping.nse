@@ -5,6 +5,8 @@ Attempts to discover DICOM servers (DICOM Service Provider) through a partial C-
 The script responds with the message "Called AET check enabled" when the association request
  is rejected due configuration. This value can be bruteforced using dicom-brute.
 
+The UID tells you who made it (Vendor), the dedicated Version Name field tells you which version it is.
+
 C-ECHO requests are commonly known as DICOM ping as they are used to test connectivity.
 Normally, a 'DICOM ping' is formed as follows:
 * Client -> A-ASSOCIATE request -> Server
@@ -104,7 +106,6 @@ portrule = function(host, port)
     return true
   end
 
-  -- If none of the rules above matched:
   stdnse.debug(1, "dicom-ping: portrule returning false for port %d", port.number)
   return false
 end
@@ -128,11 +129,6 @@ action = function(host, port)
 
       output.dicom = "DICOM Service Provider discovered!"
       output.config = "Called AET check enabled" -- Indicate AET is required
-      -- Note: Original script had an "auth" field here, keeping it commented if not desired
-      -- output.auth = "Cannot test User Identity Negotiation (AET required)"
-    -- else handle other potential errors if needed, e.g., connection refused, timeout
-    -- else
-    --   output.error = "Association failed: " .. (err or "Unknown error")
     end
     stdnse.debug1("Final output table contents (on failure):\n%s", stdnse.format_output(true, output))
     return output -- Return output table even on failure

@@ -56,28 +56,28 @@ for i, v in pairs(PDU_CODES) do
   PDU_NAMES[v] = i
 end
 
--- Define vendor UIDs lookup table with patterns and version indicators
+-- Define vendor UIDs lookup table with patterns (matching base prefixes only)
 local VENDOR_UID_PATTERNS = {
-  {"^1%.2%.276%.0%.7230010%.3%.0",               "DCMTK"},          -- General DCMTK
-  {"^1%.4%.3%.6%.1%.4%.1%.78293%.3%.1",          "Orthanc"},        -- Orthanc
-  {"^1%.3%.46%.670589%.50%.1%.4",                "Conquest"},       -- Conquest PACS
-  {"^1%.2%.40%.0%.13%.1%.1",                     "DCM4CHE"},        -- dcm4chee
-  {"^1%.2%.826%.0%.1%.3680043%.9%.3",            "DICOM Standard"}, -- DICOM Standard
-  {"^1%.2%.840%.113619%.2%.55",                  "GE Healthcare"},  -- GE Healthcare
-  {"^1%.2%.840%.113619%.6%.96",                  "GE Healthcare"},  -- GE
-  {"^1%.2%.840%.113619%.6%.105",                 "GE Healthcare"},  -- GE   
-  {"^1%.3%.12%.2%.1107%.5%.99",                  "Siemens Syngo"},  -- Siemens
-  {"^1%.3%.12%.2%.1107%.5%.8",                   "Siemens"},        -- Other Siemens
-  {"^1%.2%.840%.10008%.5%.1%.4",                 "DICOM Standard"}, -- DICOM Standard
-  {"^1%.2%.124%.113532%.3%.1",                   "Merge Healthcare"},-- Merge PACS
-  {"^1%.2%.826%.0%.1%.3680043%.9%.3%.9%.1",      "ClearCanvas"},    -- ClearCanvas
-  {"^1%.2%.840%.114257%.1%.15",                  "Horos"},          -- Horos
-  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.1%.2%.%d+%.%d+$", "OsiriX"},-- OsiriX
-  {"^1%.2%.392%.200036%.9%.1%.1%.1",             "FujiFilm"},       -- FujiFilm
-  {"^1%.2%.840%.114340%.2%.1",                   "Agfa"},           -- Agfa
-  {"^1%.2%.840%.113704%.7%.1%.1%.1%.1%.1",       "Carestream"},     -- Carestream
-  {"^1%.2%.826%.0%.1%.3680043%.9%.3811%.2%.1%.0", "pynetdicom"},     -- pynetdicom
-  {"^1%.3%.6%.1%.4%.1%.19376",                    "Mayo Clinic"}     -- Mayo Clinic
+  {"^1%.2%.276%.0%.7230010%.3%.0",           "DCMTK"},          -- General DCMTK base
+  {"^1%.4%.3%.6%.1%.4%.1%.78293%.3%.1",       "Orthanc"},        -- Orthanc base
+  {"^1%.3%.46%.670589%.50%.1%.4",           "Conquest"},       -- Conquest PACS base
+  {"^1%.2%.40%.0%.13%.1%.1",               "DCM4CHE"},        -- dcm4chee base
+  {"^1%.2%.826%.0%.1%.3680043%.9%.3",       "DICOM Standard"}, -- Or maybe generic UK NHS software?
+  {"^1%.2%.840%.113619%.2%.55",           "GE Healthcare"},  -- GE Healthcare base
+  {"^1%.2%.840%.113619%.6%.96",           "GE Healthcare"},  -- GE base
+  {"^1%.2%.840%.113619%.6%.105",          "GE Healthcare"},  -- GE base
+  {"^1%.3%.12%.2%.1107%.5%.99",           "Siemens Syngo"},  -- Siemens Syngo base
+  {"^1%.3%.12%.2%.1107%.5%.8",            "Siemens"},        -- Other Siemens base
+  {"^1%.2%.840%.10008%.5%.1%.4",          "DICOM Standard"}, -- DICOM Standard base (SOP Class related)
+  {"^1%.2%.124%.113532%.3%.1",            "Merge Healthcare"},-- Merge PACS base
+  {"^1%.2%.826%.0%.1%.3680043%.9%.3%.9%.1", "ClearCanvas"},    -- ClearCanvas base
+  {"^1%.2%.840%.114257%.1%.15",           "Horos"},          -- Horos base
+  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.1%.2", "OsiriX"},       -- OsiriX base prefix
+  {"^1%.2%.392%.200036%.9%.1%.1%.1",       "FujiFilm"},       -- FujiFilm base
+  {"^1%.2%.840%.114340%.2%.1",            "Agfa"},           -- Agfa base
+  {"^1%.2%.840%.113704%.7%.1%.1%.1%.1%.1", "Carestream"},     -- Carestream base
+  {"^1%.2%.826%.0%.1%.3680043%.9%.3811",    "pynetdicom"},     -- pynetdicom base prefix
+  {"^1%.3%.6%.1%.4%.1%.19376",             "Mayo Clinic"}    -- Mayo Clinic base
 }
 
 ---
@@ -321,41 +321,32 @@ function parse_implementation_version(data)
   return version, uid
 end
 
----
--- identify_vendor_from_uid(uid) Gets vendor name and version from the UID using pattern matching
---
--- @param uid Implementation UID string
--- @return vendor Vendor name or nil if unknown
--- @return version_part Optional version part extracted from the UID
----
+
 function identify_vendor_from_uid(uid)
-  if not uid then return nil, nil end
-  
-  -- Clean up UID string
-  uid = uid:gsub("%z", ""):gsub("^%s+", ""):gsub("%s+$", "")
-  
-  -- Special case for short UIDs that might be truncated
-  if #uid < 5 and uid:match("^1%.2") then
-    -- This is likely a truncated DICOM UID, assume it's DCMTK
-    return "DCMTK", nil
-  end
-  
+  if not uid then return nil end
+
+  -- Clean up UID string (remove null bytes, trim whitespace)
+  uid = uid:gsub("%z", ""):gsub("^%s*", ""):gsub("%s*$", "")
+
   -- Check against patterns
   for _, pattern_info in ipairs(VENDOR_UID_PATTERNS) do
-    local pattern, vendor, extract_version = pattern_info[1], pattern_info[2], pattern_info[3]    
-    -- Check if UID matches this pattern
-    local match = {uid:match(pattern)}
-    if #match > 0 then
-      -- If this pattern contains version extraction
-      if extract_version and match[1] then
-        local version_part = match[1]
-        return vendor, version_part
-      end
-      return vendor, nil
+    local pattern, vendor = pattern_info[1], pattern_info[2]
+
+    -- Use string.find anchored at the beginning (position 1)
+    -- The 'true' argument disables pattern matching for the find itself,
+    -- treating the pattern string literally after we handle '^'.
+    -- We remove the '^' anchor as string.find handles the start position.
+    local plain_pattern = pattern:gsub("^%^", "") -- Remove leading ^ anchor if present
+
+    -- Check if the uid STARTS WITH the plain_pattern
+    if uid:find(plain_pattern, 1, true) == 1 then
+      stdnse.debug2("UID '%s' matched pattern prefix '%s' for vendor '%s'", uid, pattern, vendor)
+      return vendor -- Return only the vendor name
     end
   end
-  
-  return nil, nil
+
+  stdnse.debug2("UID '%s' did not match any known vendor patterns.", uid)
+  return nil -- No match found
 end
 
 ---
@@ -445,18 +436,29 @@ function extract_clean_version(version_str, vendor)
   end
 
   if vendor == "pynetdicom" then
-    -- Format: PYNETDICOM_XYZ -> X.Y.Z
-    local major, minor, patch = version_str:match("PYNETDICOM_(%d)(%d)(%d)")
+    local digits = version_str:match("PYNETDICOM_(%d%d%d)$")
+    if digits and #digits == 3 then
+       local major = digits:sub(1,1)
+       local minor = digits:sub(2,2)
+       local patch = digits:sub(3,3)
+       stdnse.debug1("Matched PYNETDICOM_ddd format: %s.%s.%s", major, minor, patch)
+       return string.format("%s.%s.%s", major, minor, patch)
+    end
+  
+    -- Keep existing checks as fallbacks if needed, or remove if _ddd is the only format
+    -- Format: PYNETDICOM_XYZ -> X.Y.Z (Original check - might be redundant now)
+    local major, minor, patch = version_str:match("PYNETDICOM_(%d)%.(%d)%.(%d)") -- Assuming dots if not _ddd
     if major and minor and patch then
-      stdnse.debug1("Matched PYNETDICOM_XYZ format: %s.%s.%s", major, minor, patch)
+      stdnse.debug1("Matched PYNETDICOM_X.Y.Z format: %s.%s.%s", major, minor, patch)
       return string.format("%s.%s.%s", major, minor, patch)
     end
-    -- Fallback: Try PYNETDICOM_XY -> X.Y
-    major, minor = version_str:match("PYNETDICOM_(%d)(%d)")
-     if major and minor then
-      stdnse.debug1("Matched PYNETDICOM_XY format: %s.%s", major, minor)
+    -- Format: PYNETDICOM_XY -> X.Y (Original check - might be redundant now)
+    major, minor = version_str:match("PYNETDICOM_(%d)%.(%d)") -- Assuming dots if not _ddd
+    if major and minor then
+      stdnse.debug1("Matched PYNETDICOM_X.Y format: %s.%s", major, minor)
       return string.format("%s.%s", major, minor)
     end
+  
   end
 
   -- Generic version detection: Try standard X.Y.Z format first

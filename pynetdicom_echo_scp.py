@@ -1,7 +1,5 @@
 import sys
 from pynetdicom import AE, evt
-# Removed incorrect imports: AllStoragePresentationContexts, VerificationPresentationContexts
-# Removed incorrect import: VerificationSOPClass
 
 # Define the UID for the Verification SOP Class
 VERIFICATION_SOP_CLASS_UID = '1.2.840.10008.1.1'
@@ -13,20 +11,22 @@ def handle_echo(event):
     # Return a 'Success' status
     return 0x0000
 
-# Define the Application Entity (AE) (remains the same)
-ae = AE(ae_title=b'PYNETDICOM') # Use bytes for AE Title
+# Define the Application Entity (AE)
+# Use standard string now, pynetdicom handles encoding internally if needed
+ae = AE(ae_title='PYNETDICOM') # Standard string is fine here
 
-# --- CORRECTED WAY TO ADD CONTEXT ---
 # Add supported presentation context for Verification SOP Class using its UID
 ae.add_supported_context(VERIFICATION_SOP_CLASS_UID)
-# ------------------------------------
 
 # Define the handlers for specific events (remains the same)
 handlers = [(evt.EVT_C_ECHO, handle_echo)]
 
-# Start listening for associations (remains the same)
+# Start listening for associations
 port = 11114 # Choose an internal port
-print(f"Starting pynetdicom Echo SCP on port {port} with AE Title {ae.ae_title.decode()}")
+# --- CORRECTED PRINT STATEMENT ---
+# Removed .decode() from ae.ae_title as it's already a string
+print(f"Starting pynetdicom Echo SCP on port {port} with AE Title {ae.ae_title}")
+# ---------------------------------
 try:
     # Blocking call until killed
     ae.start_server(('', port), block=True, evt_handlers=handlers)

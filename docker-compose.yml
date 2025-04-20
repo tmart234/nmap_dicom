@@ -51,10 +51,10 @@ services:
 
 # --- dcm4che-tools Echo SCP ---
   dcm4che-scp:
-    image: dcm4che/dcm4che-tools:5.33.1 # Use the official tools image
+    image: dcm4che/dcm4che-tools:latest
     container_name: dcm4che_scp_test
-    # CORRECTED Command: Use the full path to dcmrcv within the container
-    command: /opt/dcm4che/bin/dcmrcv -b DCM4CHETOOLS:11115 --accept-unknown
+    # CORRECTED Command (Attempt 2): Try using storescp script, assuming it handles C-ECHO
+    command: /opt/dcm4che/bin/storescp -b DCM4CHETOOLS:11115 --accept-unknown
     ports:
       - "11115:11115" # Host Port : Container Port (must match port in command)
     restart: unless-stopped
@@ -63,8 +63,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s # Give JVM a bit more time to start dcmrcv
-      
+      start_period: 10s # Give JVM a bit more time
+
 # Only define volumes needed by the services above
 volumes:
   orthanc_db:

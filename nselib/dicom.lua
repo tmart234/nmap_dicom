@@ -58,13 +58,14 @@ end
 
 -- Define vendor UIDs lookup table with patterns and version indicators
 local VENDOR_UID_PATTERNS = {
-  {"^1%.2%.276%.0%.7230010%.3%.0%.3%.6%.(%d+)", "DCMTK", true},    -- DCMTK with version extraction
-  {"^1%.2%.276%.0%.7230010%.3%.0%.3%.6",         "DCMTK"},          -- General DCMTK
+  {"^1%.2%.276%.0%.7230010%.3%.0",               "DCMTK"},          -- General DCMTK
   {"^1%.4%.3%.6%.1%.4%.1%.78293%.3%.1",          "Orthanc"},        -- Orthanc
   {"^1%.3%.46%.670589%.50%.1%.4",                "Conquest"},       -- Conquest PACS
   {"^1%.2%.40%.0%.13%.1%.1",                     "DCM4CHE"},        -- dcm4chee
+  {"^1%.2%.826%.0%.1%.3680043%.9%.3",            "DICOM Standard"}, -- DICOM Standard
+  {"^1%.2%.840%.113619%.2%.55",                  "GE Healthcare"},  -- GE Healthcare
   {"^1%.2%.840%.113619%.6%.96",                  "GE Healthcare"},  -- GE
-  {"^1%.2%.840%.113619%.6%.105",                 "Philips"},        -- Philips
+  {"^1%.2%.840%.113619%.6%.105",                 "GE Healthcare"},  -- GE   
   {"^1%.3%.12%.2%.1107%.5%.99",                  "Siemens Syngo"},  -- Siemens
   {"^1%.3%.12%.2%.1107%.5%.8",                   "Siemens"},        -- Other Siemens
   {"^1%.2%.840%.10008%.5%.1%.4",                 "DICOM Standard"}, -- DICOM Standard
@@ -74,7 +75,9 @@ local VENDOR_UID_PATTERNS = {
   {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.1%.2%.%d+%.%d+$", "OsiriX"},-- OsiriX
   {"^1%.2%.392%.200036%.9%.1%.1%.1",             "FujiFilm"},       -- FujiFilm
   {"^1%.2%.840%.114340%.2%.1",                   "Agfa"},           -- Agfa
-  {"^1%.2%.840%.113704%.7%.1%.1%.1%.1%.1",       "Carestream"}      -- Carestream
+  {"^1%.2%.840%.113704%.7%.1%.1%.1%.1%.1",       "Carestream"},     -- Carestream
+  {"^1%.2%.826%.0%.1%.3680043%.9%.3811%.2%.1%.0", "pynetdicom"},     -- pynetdicom
+  {"^1%.3%.6%.1%.4%.1%.19376",                    "Mayo Clinic"}     -- Mayo Clinic
 }
 
 ---
@@ -437,6 +440,21 @@ function extract_clean_version(version_str, vendor)
         return string.format("%s.%s.%s", major, minor, build)
       end
       stdnse.debug1("Matched ClearCanvas format (Major.Minor): %s.%s", major, minor)
+      return string.format("%s.%s", major, minor)
+    end
+  end
+
+  if vendor == "pynetdicom" then
+    -- Format: PYNETDICOM_XYZ -> X.Y.Z
+    local major, minor, patch = version_str:match("PYNETDICOM_(%d)(%d)(%d)")
+    if major and minor and patch then
+      stdnse.debug1("Matched PYNETDICOM_XYZ format: %s.%s.%s", major, minor, patch)
+      return string.format("%s.%s.%s", major, minor, patch)
+    end
+    -- Fallback: Try PYNETDICOM_XY -> X.Y
+    major, minor = version_str:match("PYNETDICOM_(%d)(%d)")
+     if major and minor then
+      stdnse.debug1("Matched PYNETDICOM_XY format: %s.%s", major, minor)
       return string.format("%s.%s", major, minor)
     end
   end

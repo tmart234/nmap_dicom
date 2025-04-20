@@ -18,12 +18,16 @@ jobs:
             service_name: orthanc
             compose_services: "orthanc" # Service(s) to start for this job
             # nmap_args: ""
-          - name: dcm4chee-arc # Updated name for clarity
-            host_port: 11113
-            service_name: arc # Main service to test
-            compose_services: "ldap db arc" # Start all required services
-            # Default AE Title for dcm4chee-arc is often DCM4CHEE_ARC
-            nmap_args: "--script-args dicom.called_aet=DCM4CHEE_ARC,dicom.calling_aet=ECHOSCU"
+          - name: pynetdicom-scp
+            host_port: 11114
+            service_name: pynetdicom-scp
+            compose_services: "pynetdicom-scp"
+            nmap_args: "--script-args dicom.called_aet=PYNETDICOM,dicom.calling_aet=ECHOSCU" # Match AE Title in script
+          - name: dcm4che-scp
+            host_port: 11115
+            service_name: dcm4che-scp
+            compose_services: "dcm4che-scp"
+            nmap_args: "--script-args dicom.called_aet=DCM4CHETOOLS,dicom.calling_aet=ECHOSCU" # Match AE Title in command
 
     steps:
       - name: Checkout repository
@@ -38,8 +42,7 @@ jobs:
             tcpdump \
             tshark \
             docker-compose \
-            netcat-openbsd \
-            ldap-utils # Needed for ldapsearch in healthcheck
+            netcat-openbsd 
 
       - name: Copy custom Nmap files
         # (This step remains the same)
@@ -59,6 +62,15 @@ jobs:
           echo "Updating Nmap script database..."
           sudo nmap --script-updatedb
           echo "Nmap script database updated."
+
+      - name: Build pynetdicom SCP image
+        if: matrix.dicom_server.name == 'pynetdicom-scp'
+        run: |
+            echo "Building pynetdicom SCP image..."
+            # Assumes Dockerfile.pynetdicom and pynetdicom_echo_scp.py are in the repo root
+            # Adjust path to Dockerfile (-f) and context (.) if they are elsewhere
+            docker build -t my-pynetdicom-scp:latest -f Dockerfile.pynetdicom .
+            echo "Image build complete."
 
       - name: Start DICOM Server Stack (${{ matrix.dicom_server.name }})
         id: start_stack # Give the step an ID
@@ -146,6 +158,7 @@ jobs:
       - name: Run Nmap Test (${{ matrix.dicom_server.name }})
         # (This step remains the same - uses nmap_args from matrix)
         id: test_script
+        if: steps.start_stack.outputs.startup_success == 'true'
         run: |
           echo "--- Testing ${{ matrix.dicom_server.name }} DICOM server on host port ${{ matrix.dicom_server.host_port }} ---"
           nmap -p ${{ matrix.dicom_server.host_port }} \

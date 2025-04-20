@@ -1,97 +1,73 @@
 version: '3.7'
 
 services:
-  # --- Orthanc Service (Unchanged) ---
+  # --- Orthanc Service ---
+  # Runs the standard Orthanc server.
   orthanc:
     image: orthancteam/orthanc:latest
-    container_name: orthanc_test # Optional: Give it a fixed name
+    container_name: orthanc_test
     ports:
       - "11112:4242"  # DICOM port (Host:Container)
       - "8042:8042"   # Web UI (Host:Container)
     environment:
-      - ORTHANC__NAME=ORTHANC_TEST
+      - ORTHANC__NAME=ORTHANC_TEST # This defines its AE Title
       - ORTHANC__DICOM_SERVER_ENABLED=true
       - VERBOSE_ENABLED=true
-      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_ECHO=true
+      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_ECHO=true # Allow C-ECHO easily
+      # Disable AE Title verification for simplicity in testing C-ECHO
+      - ORTHANC__DICOM_SERVER_VERIFY_CALLED_AET=false
+      # The following are likely not needed just for C-ECHO but don't hurt
       - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_FIND=true
       - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_MOVE=true
       - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_STORE=true
-      - ORTHANC__DICOM_SERVER_VERIFY_CALLED_AET=false
     volumes:
       - orthanc_db:/var/lib/orthanc/db
     restart: unless-stopped
-
-  # --- DCM4CHEE Archive Stack ---
-  # Archive Application (replaces the old dcm4chee service)
-  # --- Indent this block ---
-  arc: # <<< Correctly indented
-    image: dcm4che/dcm4chee-arc-psql:5.33.1 # Use the specific tag
-    container_name: dcm4chee_arc_test
-    ports:
-      - "11113:11112"
-      - "8081:8080"
-    environment:
-      - WILDFLY_WAIT_FOR=ldap:389 db:5432 # Tells arc to wait for ldap and db ports
-      - POSTGRES_HOST=db
-      - POSTGRES_PORT=5432
-      - POSTGRES_DB=pacsdb
-      - POSTGRES_USER=pacs
-      - POSTGRES_PASSWORD=pacs
-      - LDAP_URL=ldap://ldap:389
-      - LDAP_BASE_DN=dc=dcm4che,dc=org
-      - LDAP_ROOTPASS=secret
-      - WILDFLY_ADMIN_USER=admin
-      - WILDFLY_ADMIN_PASSWORD=admin
-      - JAVA_OPTS=-Xms128m -Xmx1024m -XX:MetaspaceSize=128m -XX:MaxMetaspaceSize=384m -Djava.net.preferIPv4Stack=true -Djboss.modules.system.pkgs=org.jboss.byteman -Djava.awt.headless=true
-    depends_on:
-      db:
-        condition: service_healthy
-      ldap:
-        condition: service_healthy
-    restart: unless-stopped
-    # NOTE: The 'arc' image itself doesn't have a simple TCP healthcheck defined here,
-    #       it relies on internal Wildfly status. Docker compose reports it unhealthy if startup fails.
-  # --- End of indented arc block ---
-
-  # PostgreSQL Database for Archive
-  db:
-    image: postgres:15-alpine # Use a specific version of postgres
-    container_name: dcm4chee_db_test # Optional
-    environment:
-      - POSTGRES_DB=pacsdb
-      - POSTGRES_USER=pacs
-      - POSTGRES_PASSWORD=pacs
-    volumes:
-      - postgres_db:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD", "ldapsearch", "-H", "ldap://localhost:389", "-x", "-b", "", "-s", "base"]
-      interval: 15s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
-    restart: unless-stopped
-
-  # OpenLDAP for Archive Configuration
-  ldap:
-    image: dcm4che/slapd-dcm4chee:2.6.7-33.1 # Use specific tag found previously
-    container_name: dcm4chee_ldap_test # Optional
-    environment:
-      - LDAP_ROOTPASS=secret
-      - LDAP_CONFIG_PASSWORD=secret # Usually needed as well
-    volumes:
-      - ldap_config:/etc/ldap/slapd.d
-      - ldap_data:/var/lib/ldap
-    healthcheck:
-      # Basic check: See if the LDAP port is responding
-      test: ["CMD", "ldapsearch", "-H", "ldap://localhost:389", "-x", "-b", ""]
+    healthcheck: # Optional: Check if web UI is up
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8042/app/explorer.html"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 10s # Give LDAP some time to start before checking
-    restart: unless-stopped
+      start_period: 10s
 
+  # --- pynetdicom Echo SCP ---
+  # Runs a minimal Python SCP using pynetdicom, handles C-ECHO.
+  pynetdicom-scp:
+    # IMPORTANT: Replace with the actual image you build/host
+    # e.g., ghcr.io/your-user/my-pynetdicom-scp:latest OR build locally in workflow
+    image: my-pynetdicom-scp:latest
+    container_name: pynetdicom_scp_test
+    ports:
+      # Host Port : Container Port (must match port in pynetdicom_echo_scp.py)
+      - "11114:11114"
+    restart: unless-stopped
+    # AE Title is defined inside the pynetdicom_echo_scp.py script (e.g., PYNETDICOM)
+    healthcheck: # Simple check if the port is open inside the container
+      test: ["CMD-SHELL", "nc -z localhost 11114 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s # Python script should start fast
+
+  # --- dcm4che-tools Echo SCP ---
+  # Runs the dcmrcv tool from dcm4che-tools to act as a basic SCP handling C-ECHO.
+  dcm4che-scp:
+    image: dcm4che/dcm4che-tools:5.33.1 # Use the official tools image
+    container_name: dcm4che_scp_test
+    # Command runs dcmrcv, binding to AE Title DCM4CHETOOLS on internal port 11115,
+    # and accepts connections from any Calling AE Title.
+    command: dcmrcv -b DCM4CHETOOLS:11115 --accept-unknown
+    ports:
+      # Host Port : Container Port (must match port in command)
+      - "11115:11115"
+    restart: unless-stopped
+    healthcheck: # Simple check if the port is open inside the container
+      test: ["CMD-SHELL", "nc -z localhost 11115 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s # Give JVM a bit more time to start dcmrcv
+
+# Only define volumes needed by the services above
 volumes:
   orthanc_db:
-  postgres_db: # Volume for PostgreSQL data
-  ldap_config: # Volume for LDAP config
-  ldap_data:   # Volume for LDAP data

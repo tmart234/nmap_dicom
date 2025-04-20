@@ -114,9 +114,8 @@ action = function(host, port)
   stdnse.debug(1, "dicom-ping: ACTION function started for %s:%d", host.ip, port.number)
   local output = stdnse.output_table()
 
-  -- Try association using defaults (ECHOSCU -> ANY-SCP) or script args if provided
-  stdnse.debug(1, "dicom-ping: Calling dicom.associate for %s:%d...", host.ip, port.number)
-  local dcm_status, err, version, vendor = dicom.associate(host, port) -- No explicit AETs passed here
+  local called_aet_arg = stdnse.get_script_args("dicom.called_aet")
+  local dcm_status, err, version, vendor = dicom.associate(host, port, nil, called_aet_arg) -- Pass nil for calling_aet override unless needed
 
   -- Handle association rejection
   if dcm_status == false then
@@ -128,10 +127,14 @@ action = function(host, port)
       nmap.set_port_version(host, port)
 
       output.dicom = "DICOM Service Provider discovered!"
-      output.config = "Called AET check enabled" -- Indicate AET is required
+      if not called_aet_arg or called_aet_arg == "ANY-SCP" then
+        output.config = "Called AET check enabled (Rejected ANY-SCP)"
+      else
+        output.config = string.format("Association Rejected (Tried AET: %s)", called_aet_arg)
+      end   
     end
     stdnse.debug1("Final output table contents (on failure):\n%s", stdnse.format_output(true, output))
-    return output -- Return output table even on failure
+    if output.dicom then return output else return nil end
   end
 
   -- Association was successful

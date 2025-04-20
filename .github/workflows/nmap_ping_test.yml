@@ -27,7 +27,7 @@ jobs:
               host_port: 11115
               service_name: dcm4che-scp
               compose_services: "dcm4che-scp"
-              nmap_args: "--script-args dicom-ping.ports=11115 dicom.called_aet=DCM4CHETOOLS" # Keep this!
+              nmap_args: "--script-args dicom-ping.ports=11115,dicom.called_aet=DCM4CHETOOLS" # Keep this!
   
     steps:
       - name: Checkout repository

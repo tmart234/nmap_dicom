@@ -61,7 +61,8 @@ local VENDOR_UID_PATTERNS = {
   {"^1%.2%.276%.0%.7230010%.3%.0",           "DCMTK"},          -- General DCMTK base
   {"^1%.4%.3%.6%.1%.4%.1%.78293%.3%.1",       "Orthanc"},        -- Orthanc base
   {"^1%.3%.46%.670589%.50%.1%.4",           "Conquest"},       -- Conquest PACS base
-  {"^1%.2%.40%.0%.13%.1%.1",               "DCM4CHE"},        -- dcm4chee base
+  {"^1%.2%.40%.0%.13%.1%.1",               "DCM4CHE"}, 
+  {"^1%.2%.826%.0%.1%.3680043%.9%.3811",    "pynetdicom"},       -- dcm4chee base
   {"^1%.2%.826%.0%.1%.3680043%.9%.3",       "DICOM Standard"}, -- Or maybe generic UK NHS software?
   {"^1%.2%.840%.113619%.2%.55",           "GE Healthcare"},  -- GE Healthcare base
   {"^1%.2%.840%.113619%.6%.96",           "GE Healthcare"},  -- GE base
@@ -75,8 +76,7 @@ local VENDOR_UID_PATTERNS = {
   {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.1%.2", "OsiriX"},       -- OsiriX base prefix
   {"^1%.2%.392%.200036%.9%.1%.1%.1",       "FujiFilm"},       -- FujiFilm base
   {"^1%.2%.840%.114340%.2%.1",            "Agfa"},           -- Agfa base
-  {"^1%.2%.840%.113704%.7%.1%.1%.1%.1%.1", "Carestream"},     -- Carestream base
-  {"^1%.2%.826%.0%.1%.3680043%.9%.3811",    "pynetdicom"},     -- pynetdicom base prefix
+  {"^1%.2%.840%.113704%.7%.1%.1%.1%.1%.1", "Carestream"},     -- Carestream base     -- pynetdicom base prefix
   {"^1%.3%.6%.1%.4%.1%.19376",             "Mayo Clinic"}    -- Mayo Clinic base
 }
 

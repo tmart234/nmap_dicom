@@ -49,17 +49,14 @@ services:
       retries: 5
       start_period: 5s # Python script should start fast
 
-  # --- dcm4che-tools Echo SCP ---
-  # Runs the dcmrcv tool from dcm4che-tools to act as a basic SCP handling C-ECHO.
+# --- dcm4che-tools Echo SCP ---
   dcm4che-scp:
     image: dcm4che/dcm4che-tools:5.33.1 # Use the official tools image
     container_name: dcm4che_scp_test
-    # Command runs dcmrcv, binding to AE Title DCM4CHETOOLS on internal port 11115,
-    # and accepts connections from any Calling AE Title.
-    command: dcmrcv -b DCM4CHETOOLS:11115 --accept-unknown
+    # CORRECTED Command: Use the full path to dcmrcv within the container
+    command: /opt/dcm4che/bin/dcmrcv -b DCM4CHETOOLS:11115 --accept-unknown
     ports:
-      # Host Port : Container Port (must match port in command)
-      - "11115:11115"
+      - "11115:11115" # Host Port : Container Port (must match port in command)
     restart: unless-stopped
     healthcheck: # Simple check if the port is open inside the container
       test: ["CMD-SHELL", "nc -z localhost 11115 || exit 1"]
@@ -67,7 +64,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s # Give JVM a bit more time to start dcmrcv
-
+      
 # Only define volumes needed by the services above
 volumes:
   orthanc_db:

@@ -528,8 +528,13 @@ function associate(host, port, calling_aet, called_aet)
     end
 
     local send_status, send_err = send(dcm, assoc_request)
-    if send_status == false then error(string.format("Couldn't send ASSOCIATE request:%s", send_err)) end
-
+    if send_status == false then
+      stdnse.debug1("DICOM Associate: send() failed immediately inside pcall. Error: %s", tostring(send_err))
+      error(string.format("Couldn't send ASSOCIATE request:%s", send_err)) -- Re-throw error
+    else
+        stdnse.debug1("DICOM Associate: send() call completed successfully inside pcall.")
+    end
+    
     local receive_status, receive_data = receive(dcm)
     if receive_status == false then error(string.format("Couldn't read ASSOCIATE response:%s", receive_data)) end
     local response_data = receive_data

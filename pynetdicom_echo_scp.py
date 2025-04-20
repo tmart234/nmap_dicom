@@ -23,8 +23,6 @@ handlers = [(evt.EVT_C_ECHO, handle_echo)]
 
 # Start listening for associations
 port = 11114 # Choose an internal port
-# --- CORRECTED PRINT STATEMENT ---
-# Removed .decode() from ae.ae_title as it's already a string
 print(f"Starting pynetdicom Echo SCP on port {port} with AE Title {ae.ae_title}")
 # ---------------------------------
 try:

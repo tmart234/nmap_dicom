@@ -162,7 +162,7 @@ jobs:
         run: |
           echo "--- Testing ${{ matrix.dicom_server.name }} DICOM server on host port ${{ matrix.dicom_server.host_port }} ---"
           nmap -p ${{ matrix.dicom_server.host_port }} \
-               -d \
+               -dd \
                --script="dicom-ping.nse" \
                ${{ matrix.dicom_server.nmap_args || '' }} \
                --script-trace \

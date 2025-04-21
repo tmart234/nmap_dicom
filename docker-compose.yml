@@ -65,6 +65,21 @@ services:
       retries: 5
       start_period: 10s # Give JVM a bit more time
 
+  conquest:
+    image: wavedrift/docker-conquest:latest
+    container_name: conquest_dicom_test
+    ports:
+      - "5678:5678" # Host Port : Container Port (DICOM)
+      # - "80:80" # Optional: Expose web interface if needed for debugging
+    restart: unless-stopped
+    healthcheck:
+      # Check if the DICOM port is listening inside the container
+      test: ["CMD-SHELL", "netstat -ltn | grep ':5678' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s # Give it some time to start up
+
 # Only define volumes needed by the services above
 volumes:
   orthanc_db:

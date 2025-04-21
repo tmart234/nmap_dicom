@@ -1,15 +1,14 @@
-# Stage 1: Builder based on a slightly older but stable build environment
-# Using 20.04 as 14.04 is EOL and 22.04 might introduce too many changes at once
+# Stage 1: Builder based on Ubuntu 20.04
 FROM ubuntu:20.04 AS builder
 
 ARG CONQUEST_GIT_REPO=https://github.com/marcelvanherk/Conquest-DICOM-Server.git
 ARG CONQUEST_SRC_DIR=/build/Conquest-DICOM-Server
 
 # Install build dependencies for Ubuntu 20.04
-# Check prebuild/Dockerfile for hints, adjust package names as needed
-# lua5.1-dev includes headers needed for linking usually
+# *** MODIFIED: Added ca-certificates and combined update/install/clean ***
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+    ca-certificates \
     git \
     make \
     g++ \
@@ -17,27 +16,28 @@ RUN apt-get update && \
     liblua5.1-0-dev \
     gettext-base \
     && rm -rf /var/lib/apt/lists/*
+# *** END MODIFICATION ***
 
-# Clone source code
+# Clone source code (This should work now)
 RUN git clone ${CONQUEST_GIT_REPO} ${CONQUEST_SRC_DIR}
 WORKDIR ${CONQUEST_SRC_DIR}
 
-# Make scripts executable (adjust paths/scripts based on actual repo structure if needed)
+# Make scripts executable
 RUN chmod +x linux/* src/servertask/make.sh install/maklinux install/makemak
 
-# Compile dgate and servertask (using precompiled libs approach from official repo)
-# Ensure the paths inside maklinux_precompiled are correct relative to WORKDIR
+# Compile dgate and servertask
 RUN linux/maklinux_precompiled
 RUN cd src/servertask && ./make.sh
 
-# Stage 2: Runtime image based on a modern Ubuntu
+# Stage 2: Runtime image (remains the same as previous example)
 FROM ubuntu:20.04
 
-# Install runtime dependencies (likely just liblua)
+# Install runtime dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     liblua5.1-0 \
-    # Add any other runtime libs identified via ldd if needed
+    # Add ca-certificates here too if dgate makes HTTPS calls? Unlikely but safe.
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Create directories
@@ -47,11 +47,13 @@ RUN mkdir -p /opt/conquest/data /opt/conquest/config
 COPY --from=builder /build/Conquest-DICOM-Server/dgate /usr/local/bin/dgate
 COPY --from=builder /build/Conquest-DICOM-Server/src/servertask/servertask /usr/local/bin/servertask
 
-# Copy default configuration files (adjust source paths if needed)
-# It's better to mount config via volumes in compose, but copy defaults
+# Copy default configuration files
 COPY --from=builder /build/Conquest-DICOM-Server/dicom.ini /opt/conquest/config/dicom.ini.default
 COPY --from=builder /build/Conquest-DICOM-Server/acrnema.map /opt/conquest/config/acrnema.map.default
-# You might need other files like dgatesop.lst depending on config
+# Add other necessary config files like dgatesop.lst, dicom.sql if needed by default operation
+COPY --from=builder /build/Conquest-DICOM-Server/dgatesop.lst /opt/conquest/config/dgatesop.lst.default
+COPY --from=builder /build/Conquest-DICOM-Server/dicom.sql /opt/conquest/config/dicom.sql.default
+
 
 # Set workdir
 WORKDIR /opt/conquest/data
@@ -60,7 +62,4 @@ WORKDIR /opt/conquest/data
 EXPOSE 5678
 
 # Default command to run dgate
-# -c points to the directory containing dicom.ini
-# -v for verbose logging
-# Mount /opt/conquest/config and /opt/conquest/data as volumes in docker-compose
 CMD ["/usr/local/bin/dgate", "-c", "/opt/conquest/config", "-v"]

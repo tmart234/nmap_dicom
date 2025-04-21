@@ -66,28 +66,28 @@ services:
       start_period: 10s # Give JVM a bit more time
 
   conquest:
-    # Use the community image instead of building
-    image: rzinkstok/docker-conquest:latest
+    build:
+      context: ./docker/conquest # Directory containing the new Dockerfile
     container_name: conquest_dicom_test
     ports:
-      - "5678:5678" # Default port used in that image's examples/compose file
-    # Add volumes if needed based on rzinkstok documentation (for config, data, logs)
-    # volumes:
-    #  - ./path/to/conquest_data:/opt/conquest/data
-    #  - ./path/to/conquest_config:/opt/conquest/config
-    #  - ./path/to/conquest_logs:/opt/conquest/logs
+      - "5678:5678"
+    volumes:
+      # Mount volumes for persistent config/data/logs
+      # Create these directories locally first if needed
+      - ./conquest_test_data/config:/opt/conquest/config
+      - ./conquest_test_data/data:/opt/conquest/data
+      # - ./conquest_test_data/logs:/opt/conquest/logs # If logs go elsewhere
     restart: unless-stopped
-    environment:
-      # That image uses env variables to configure dicom.ini on the fly
-      - AETITLE=CONQUESTSRV1 # Set the desired AE Title
-      - PORT=5678          # Set the desired Port
+    # Environment variables likely NOT needed now, config is via mounted dicom.ini
+    # environment:
+    #   - AETITLE=CONQUESTSRV1
+    #   - PORT=5678
     healthcheck:
-      # Use netstat inside container, adjust path if needed based on image OS
       test: ["CMD-SHELL", "netstat -ltn | grep ':5678' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 15s
+      start_period: 45s # Allow more time for first build + startup
 
 # Only define volumes needed by the services above
 volumes:

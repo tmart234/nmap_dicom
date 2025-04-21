@@ -4,8 +4,7 @@ FROM ubuntu:20.04 AS builder
 ARG CONQUEST_GIT_REPO=https://github.com/marcelvanherk/Conquest-DICOM-Server.git
 ARG CONQUEST_SRC_DIR=/build/Conquest-DICOM-Server
 
-# Install build dependencies for Ubuntu 20.04
-# *** MODIFIED: Added ca-certificates and combined update/install/clean ***
+# Install build dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -16,14 +15,14 @@ RUN apt-get update && \
     liblua5.1-0-dev \
     gettext-base \
     && rm -rf /var/lib/apt/lists/*
-# *** END MODIFICATION ***
 
-# Clone source code (This should work now)
+# Clone source code
 RUN git clone ${CONQUEST_GIT_REPO} ${CONQUEST_SRC_DIR}
 WORKDIR ${CONQUEST_SRC_DIR}
 
-# Make scripts executable
-RUN chmod +x linux/* src/servertask/make.sh install/maklinux install/makemak
+RUN chmod +x linux/maklinux_precompiled src/servertask/make.sh
+# Optional: If other scripts in linux/ are needed by maklinux_precompiled, add linux/*
+# RUN chmod +x linux/* src/servertask/make.sh
 
 # Compile dgate and servertask
 RUN linux/maklinux_precompiled

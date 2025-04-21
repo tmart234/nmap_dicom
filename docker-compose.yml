@@ -66,19 +66,28 @@ services:
       start_period: 10s # Give JVM a bit more time
 
   conquest:
-    image: wavedrift/docker-conquest:latest
+    # Use the community image instead of building
+    image: rzinkstok/docker-conquest:latest
     container_name: conquest_dicom_test
     ports:
-      - "5678:5678" # Host Port : Container Port (DICOM)
-      # - "80:80" # Optional: Expose web interface if needed for debugging
+      - "5678:5678" # Default port used in that image's examples/compose file
+    # Add volumes if needed based on rzinkstok documentation (for config, data, logs)
+    # volumes:
+    #  - ./path/to/conquest_data:/opt/conquest/data
+    #  - ./path/to/conquest_config:/opt/conquest/config
+    #  - ./path/to/conquest_logs:/opt/conquest/logs
     restart: unless-stopped
+    environment:
+      # That image uses env variables to configure dicom.ini on the fly
+      - AETITLE=CONQUESTSRV1 # Set the desired AE Title
+      - PORT=5678          # Set the desired Port
     healthcheck:
-      # Check if the DICOM port is listening inside the container
+      # Use netstat inside container, adjust path if needed based on image OS
       test: ["CMD-SHELL", "netstat -ltn | grep ':5678' || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 15s # Give it some time to start up
+      start_period: 15s
 
 # Only define volumes needed by the services above
 volumes:

@@ -2,11 +2,11 @@
 FROM ubuntu:20.04 AS builder
 
 ARG CONQUEST_GIT_REPO=https://github.com/marcelvanherk/Conquest-DICOM-Server.git
-ARG CONQUEST_GIT_BRANCH=main # You can change this to a specific tag like v1.5.0e if preferred
+ARG CONQUEST_GIT_BRANCH=master # <-- CORRECTED: Changed from main to master
 ARG CONQUEST_SRC_DIR=/build/Conquest-DICOM-Server
 ARG TEMP_CONFIG_DIR=/tmp_conquest_configs
 
-# Install build dependencies (added curl)
+# Install build dependencies (git is needed for source, curl for config files)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -19,7 +19,7 @@ RUN apt-get update && \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone source code for building binaries (dgate, servertask)
+# Clone source code for building binaries
 RUN echo "Cloning Conquest DICOM Server binaries' source from ${CONQUEST_GIT_REPO} branch ${CONQUEST_GIT_BRANCH} into ${CONQUEST_SRC_DIR}"
 RUN git clone --depth 1 --branch ${CONQUEST_GIT_BRANCH} ${CONQUEST_GIT_REPO} ${CONQUEST_SRC_DIR}
 WORKDIR ${CONQUEST_SRC_DIR}
@@ -38,13 +38,13 @@ ARG DGATESOP_LST=dgatesop.lst
 ARG DICOM_SQL=dicom.sql
 
 RUN curl -sfL "${CONQUEST_GIT_REPO}/raw/${CONQUEST_GIT_BRANCH}/${DICOM_INI}" -o "${TEMP_CONFIG_DIR}/${DICOM_INI}.default" \
-    || (echo "ERROR: Failed to download ${DICOM_INI}" && exit 1)
+    || (echo "ERROR: Failed to download ${DICOM_INI} from branch ${CONQUEST_GIT_BRANCH}" && exit 1)
 RUN curl -sfL "${CONQUEST_GIT_REPO}/raw/${CONQUEST_GIT_BRANCH}/${ACRNEMA_MAP}" -o "${TEMP_CONFIG_DIR}/${ACRNEMA_MAP}.default" \
-    || (echo "ERROR: Failed to download ${ACRNEMA_MAP}" && exit 1)
+    || (echo "ERROR: Failed to download ${ACRNEMA_MAP} from branch ${CONQUEST_GIT_BRANCH}" && exit 1)
 RUN curl -sfL "${CONQUEST_GIT_REPO}/raw/${CONQUEST_GIT_BRANCH}/${DGATESOP_LST}" -o "${TEMP_CONFIG_DIR}/${DGATESOP_LST}.default" \
-    || (echo "ERROR: Failed to download ${DGATESOP_LST}" && exit 1)
+    || (echo "ERROR: Failed to download ${DGATESOP_LST} from branch ${CONQUEST_GIT_BRANCH}" && exit 1)
 RUN curl -sfL "${CONQUEST_GIT_REPO}/raw/${CONQUEST_GIT_BRANCH}/${DICOM_SQL}" -o "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default" \
-    || (echo "ERROR: Failed to download ${DICOM_SQL}" && exit 1)
+    || (echo "ERROR: Failed to download ${DICOM_SQL} from branch ${CONQUEST_GIT_BRANCH}" && exit 1)
 
 RUN echo "--- Listing contents of ${TEMP_CONFIG_DIR} after direct fetch ---" && ls -lA ${TEMP_CONFIG_DIR}
 RUN echo "Checking for ${TEMP_CONFIG_DIR}/${DICOM_INI}.default: $(if [ -f ${TEMP_CONFIG_DIR}/${DICOM_INI}.default ]; then echo 'Found'; else echo 'NOT FOUND'; fi)"
@@ -64,11 +64,11 @@ RUN echo "Checking for dgate executable: $(if [ -f dgate ]; then echo 'Found'; e
 RUN echo "Checking for servertask executable: $(if [ -f src/servertask/servertask ]; then echo 'Found'; else echo 'NOT FOUND'; fi)"
 
 
-# Stage 2: Runtime image (This part remains mostly the same)
+# Stage 2: Runtime image
 FROM ubuntu:20.04
 
-ARG CONQUEST_SRC_DIR=/build/Conquest-DICOM-Server 
-ARG TEMP_CONFIG_DIR=/tmp_conquest_configs
+ARG CONQUEST_SRC_DIR=/build/Conquest-DICOM-Server # Path in builder
+ARG TEMP_CONFIG_DIR=/tmp_conquest_configs # Path in builder
 
 # Install runtime dependencies
 RUN apt-get update && \

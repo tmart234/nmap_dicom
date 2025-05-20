@@ -74,7 +74,7 @@ jobs:
             echo "Building pynetdicom SCP image..."
             # Assumes Dockerfile.pynetdicom and pynetdicom_echo_scp.py are in the repo root
             # Adjust path to Dockerfile (-f) and context (.) if they are elsewhere
-            docker build -t my-pynetdicom-scp:latest -f Dockerfile.pynetdicom .
+            docker build -t my-pynetdicom-scp:latest -f pynetdicom/Dockerfile .
             echo "Image build complete."
 
       - name: Start DICOM Server Stack (${{ matrix.dicom_server.name }})

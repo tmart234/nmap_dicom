@@ -1,12 +1,14 @@
 # Stage 1: Builder based on Ubuntu 20.04
 FROM ubuntu:20.04 AS builder
 
-ARG CONQUEST_GIT_REPO=https://github.com/marcelvanherk/Conquest-DICOM-Server.git
-ARG CONQUEST_GIT_BRANCH=master # <-- CORRECTED: Changed from main to master
+ARG CONQUEST_GIT_USER=marcelvanherk
+ARG CONQUEST_GIT_PROJECT_NAME=Conquest-DICOM-Server
+ARG CONQUEST_GIT_REPO_URL=https://github.com/${CONQUEST_GIT_USER}/${CONQUEST_GIT_PROJECT_NAME}.git # Used for git clone
+ARG CONQUEST_GIT_BRANCH=master
 ARG CONQUEST_SRC_DIR=/build/Conquest-DICOM-Server
 ARG TEMP_CONFIG_DIR=/tmp_conquest_configs
 
-# Install build dependencies (git is needed for source, curl for config files)
+# Install build dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -19,12 +21,13 @@ RUN apt-get update && \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone source code for building binaries
-RUN echo "Cloning Conquest DICOM Server binaries' source from ${CONQUEST_GIT_REPO} branch ${CONQUEST_GIT_BRANCH} into ${CONQUEST_SRC_DIR}"
-RUN git clone --depth 1 --branch ${CONQUEST_GIT_BRANCH} ${CONQUEST_GIT_REPO} ${CONQUEST_SRC_DIR}
+# Clone source code for building binaries (dgate, servertask)
+# This step seems to get the necessary src/ and linux/ directories for compilation
+RUN echo "Cloning Conquest DICOM Server's source from ${CONQUEST_GIT_REPO_URL} branch ${CONQUEST_GIT_BRANCH} into ${CONQUEST_SRC_DIR}"
+RUN git clone --depth 1 --branch ${CONQUEST_GIT_BRANCH} ${CONQUEST_GIT_REPO_URL} ${CONQUEST_SRC_DIR}
 WORKDIR ${CONQUEST_SRC_DIR}
 
-# --- Diagnostic: List files immediately after clone (for src, linux dirs mainly now) ---
+# --- Diagnostic: List files immediately after clone ---
 RUN echo "--- Listing contents of ${CONQUEST_SRC_DIR} (root) immediately after git clone ---" && ls -lA ./
 
 # --- Fetch config files directly using curl to TEMP_CONFIG_DIR ---
@@ -37,14 +40,24 @@ ARG ACRNEMA_MAP=acrnema.map
 ARG DGATESOP_LST=dgatesop.lst
 ARG DICOM_SQL=dicom.sql
 
-RUN curl -sfL "${CONQUEST_GIT_REPO}/raw/${CONQUEST_GIT_BRANCH}/${DICOM_INI}" -o "${TEMP_CONFIG_DIR}/${DICOM_INI}.default" \
-    || (echo "ERROR: Failed to download ${DICOM_INI} from branch ${CONQUEST_GIT_BRANCH}" && exit 1)
-RUN curl -sfL "${CONQUEST_GIT_REPO}/raw/${CONQUEST_GIT_BRANCH}/${ACRNEMA_MAP}" -o "${TEMP_CONFIG_DIR}/${ACRNEMA_MAP}.default" \
-    || (echo "ERROR: Failed to download ${ACRNEMA_MAP} from branch ${CONQUEST_GIT_BRANCH}" && exit 1)
-RUN curl -sfL "${CONQUEST_GIT_REPO}/raw/${CONQUEST_GIT_BRANCH}/${DGATESOP_LST}" -o "${TEMP_CONFIG_DIR}/${DGATESOP_LST}.default" \
-    || (echo "ERROR: Failed to download ${DGATESOP_LST} from branch ${CONQUEST_GIT_BRANCH}" && exit 1)
-RUN curl -sfL "${CONQUEST_GIT_REPO}/raw/${CONQUEST_GIT_BRANCH}/${DICOM_SQL}" -o "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default" \
-    || (echo "ERROR: Failed to download ${DICOM_SQL} from branch ${CONQUEST_GIT_BRANCH}" && exit 1)
+# Construct the base URL for raw content using raw.githubusercontent.com
+ARG RAW_CONTENT_BASE_URL=https://raw.githubusercontent.com/${CONQUEST_GIT_USER}/${CONQUEST_GIT_PROJECT_NAME}/${CONQUEST_GIT_BRANCH}
+
+RUN echo "Attempting to download ${DICOM_INI} from ${RAW_CONTENT_BASE_URL}/${DICOM_INI}"
+RUN curl -sfL "${RAW_CONTENT_BASE_URL}/${DICOM_INI}" -o "${TEMP_CONFIG_DIR}/${DICOM_INI}.default" \
+    || (echo "ERROR: Failed to download ${DICOM_INI} from branch ${CONQUEST_GIT_BRANCH}. URL: ${RAW_CONTENT_BASE_URL}/${DICOM_INI}" && exit 1)
+
+RUN echo "Attempting to download ${ACRNEMA_MAP} from ${RAW_CONTENT_BASE_URL}/${ACRNEMA_MAP}"
+RUN curl -sfL "${RAW_CONTENT_BASE_URL}/${ACRNEMA_MAP}" -o "${TEMP_CONFIG_DIR}/${ACRNEMA_MAP}.default" \
+    || (echo "ERROR: Failed to download ${ACRNEMA_MAP} from branch ${CONQUEST_GIT_BRANCH}. URL: ${RAW_CONTENT_BASE_URL}/${ACRNEMA_MAP}" && exit 1)
+
+RUN echo "Attempting to download ${DGATESOP_LST} from ${RAW_CONTENT_BASE_URL}/${DGATESOP_LST}"
+RUN curl -sfL "${RAW_CONTENT_BASE_URL}/${DGATESOP_LST}" -o "${TEMP_CONFIG_DIR}/${DGATESOP_LST}.default" \
+    || (echo "ERROR: Failed to download ${DGATESOP_LST} from branch ${CONQUEST_GIT_BRANCH}. URL: ${RAW_CONTENT_BASE_URL}/${DGATESOP_LST}" && exit 1)
+
+RUN echo "Attempting to download ${DICOM_SQL} from ${RAW_CONTENT_BASE_URL}/${DICOM_SQL}"
+RUN curl -sfL "${RAW_CONTENT_BASE_URL}/${DICOM_SQL}" -o "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default" \
+    || (echo "ERROR: Failed to download ${DICOM_SQL} from branch ${CONQUEST_GIT_BRANCH}. URL: ${RAW_CONTENT_BASE_URL}/${DICOM_SQL}" && exit 1)
 
 RUN echo "--- Listing contents of ${TEMP_CONFIG_DIR} after direct fetch ---" && ls -lA ${TEMP_CONFIG_DIR}
 RUN echo "Checking for ${TEMP_CONFIG_DIR}/${DICOM_INI}.default: $(if [ -f ${TEMP_CONFIG_DIR}/${DICOM_INI}.default ]; then echo 'Found'; else echo 'NOT FOUND'; fi)"

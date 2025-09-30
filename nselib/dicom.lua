@@ -56,25 +56,30 @@ for i, v in pairs(PDU_CODES) do
   PDU_NAMES[v] = i
 end
 
--- Define vendor UIDs lookup table with patterns (matching base prefixes only)
+-- Most-specific FIRST. Only org roots known to be used as Implementation Class UIDs.
 local VENDOR_UID_PATTERNS = {
-  -- DCMTK / OFFIS (org root: 1.2.276.0.7230010)
+  -- Projects under UK NHS OID tree
+  {"^1%.2%.826%.0%.1%.3680043%.9%.3%.9%.1%.", "ClearCanvas"},
+  {"^1%.2%.826%.0%.1%.3680043%.9%.3811%.",    "pynetdicom"},
+  {"^1%.2%.826%.0%.1%.3680043%.8%.641%.",     "Orthanc"},
+  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.",    "OsiriX"},
+
+  -- DCMTK / OFFIS
   {"^1%.2%.276%.0%.7230010%.",                "DCMTK"},
-  {"^1%.2%.826%.0%.1%.3680043%.8%.641%.",     "Orthanc"},       -- Orthanc branch
-  {"^1%.4%.3%.6%.1%.4%.1%.78293%.",       "Orthanc"},        -- Orthanc base
-  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.",    "OsiriX"},        -- OsiriX branch
-  {"^1%.3%.46%.670589%.",                    "Conquest PACS"},       -- Conquest PACS base
-  {"^1%.2%.40%.0%.13%.1%.3%.",               "dcm4che"}, 
-  {"^1%.2%.826%.0%.1%.3680043%.9%.3811",    "pynetdicom"},       -- dcm4chee base
-  {"^1%.2%.840%.113619%.",                  "GE Healthcare"},-- GE base
-  {"^1%.3%.12%.2%.1107%.",                "Siemens"},        -- Other Siemens base
-  {"^1%.2%.124%.113532%.",            "Merge Healthcare"},-- Merge PACS base
-  {"^1%.2%.826%.0%.1%.3680043%.",       "ClearCanvas"},    -- ClearCanvas base
-  {"^1%.2%.840%.114257%.",              "Horos"},          -- Horos base
-  {"^1%.2%.826%.0%.1%.3680043%",          "OsiriX"},       -- OsiriX base prefix
-  {"^1%.2%.392%.200036%.",                   "Fujifilm"},      -- FujiFilm base
-  {"^1%.2%.840%.114257%.",                   "Agfa"},           -- Agfa base
-  {"^1%.2%.840%.113704%.",               "Carestream"},     -- Carestream base
+
+  -- dcm4che / dcm4chee
+  {"^1%.2%.40%.0%.13%.1%.3%.",                "dcm4che"},
+
+  -- Major vendors (org roots)
+  {"^1%.2%.840%.113619%.",                    "GE Healthcare"},
+  {"^1%.3%.12%.2%.1107%.",                    "Siemens"},
+  {"^1%.2%.840%.114257%.",                    "Agfa"},
+  {"^1%.2%.840%.113704%.",                    "Carestream"},
+  {"^1%.2%.392%.200036%.",                    "Fujifilm"},
+  {"^1%.2%.124%.113532%.",                    "Merge Healthcare"},
+
+  -- Community PACS
+  {"^1%.3%.46%.670589%.",                     "Conquest PACS"},
 }
 
 ---
@@ -338,42 +343,18 @@ end
 
 function identify_vendor_from_uid(uid)
   if not uid then return nil end
-
-  -- Clean up UID string (remove null bytes, trim whitespace)
-  uid = uid:gsub("%z", ""):gsub("^%s*", ""):gsub("%s*$", "")
-
-  -- Check against patterns
-  for _, pattern_info in ipairs(VENDOR_UID_PATTERNS) do
-    local pattern_regex, vendor = pattern_info[1], pattern_info[2]
-
-    --[[
-    -- OLD METHOD using string.match (Requires pattern to match whole string implicitly)
-    if uid:match(pattern_regex) then
-      stdnse.debug2("UID '%s' matched pattern '%s' for vendor '%s'", uid, pattern_regex, vendor)
-      return vendor -- Return only the vendor name
+  uid = uid:gsub("%z", ""):match("^%s*(.-)%s*$")  -- trim
+  for _, entry in ipairs(VENDOR_UID_PATTERNS) do
+    local pat, vendor = entry[1], entry[2]
+    if uid:match(pat) then
+      stdnse.debug2("UID '%s' matched '%s' -> '%s'", uid, pat, vendor)
+      return vendor
     end
-    --]]
-
-    -- *** NEW METHOD using string.find to check prefix ***
-    -- Use string.find anchored at the beginning (position 1).
-    -- The 'true' argument disables pattern matching (magic characters) for the find itself,
-    -- treating the pattern string literally *after* we manually handle '^' and '%.'.
-    -- We remove the '^' anchor as string.find handles the start position.
-    -- We need to convert '%. 'back to '.' for the literal find.
-    local literal_prefix = pattern_regex:gsub("^%^", "") -- Remove leading ^ anchor
-    literal_prefix = literal_prefix:gsub("%%%.", ".")   -- Convert escaped %. back to literal .
-
-    -- Check if the uid STARTS WITH the literal_prefix
-    if uid:find(literal_prefix, 1, true) == 1 then
-      stdnse.debug2("UID '%s' matched pattern prefix '%s' (literal: '%s') for vendor '%s'", uid, pattern_regex, literal_prefix, vendor)
-      return vendor -- Return only the vendor name
-    end
-    -- *** END NEW METHOD ***
   end
-
   stdnse.debug2("UID '%s' did not match any known vendor patterns.", uid)
-  return nil -- No match found
+  return nil
 end
+
 
 ---
 -- extract_clean_version(version_str, vendor) Standardizes version strings based on vendor formats
@@ -651,27 +632,20 @@ function associate(host, port, calling_aet, called_aet)
     dcm['socket']:close()
   end
 
-  -- Check the status returned by pcall
   if not success then
-    -- An error occurred inside pcall. pcall_ret1 contains the error message/object.
-    local err_msg = "Unknown error during association pcall"
-    if pcall_ret1 ~= nil then
-      err_msg = tostring(pcall_ret1)
-    end
+    local err_msg = pcall_ret1 and tostring(pcall_ret1) or "Unknown error during association pcall"
     stdnse.debug1("Error during association (pcall failed): %s", err_msg)
-    return false, err_msg -- Return false and the safe error message
+    return false, err_msg
   else
-    -- pcall succeeded. Assign the results returned by the function.
-    clean_version = pcall_ret1 -- First value returned was clean_version
-    vendor = pcall_ret2        -- Second value returned was vendor
-    uid_str = pcall_ret3       -- Third value returned was uid_str
+    -- pcall returned: clean_version, vendor, uid_str  (keep original NSE signature)
+    local clean_version = pcall_ret1
+    local vendor        = pcall_ret2
+    -- local uid_str    = pcall_ret3  -- keep if you later want to expose it
 
     stdnse.debug1("Association successful. Final Version: %s, Vendor: %s",
                   clean_version or "nil", vendor or "nil")
 
-    -- Return true and the extracted info, matching the expected format:
-    -- (status, dcm_or_error, version, vendor)
-    return true, nil, received_version_str, received_uid_str, parsed_vendor, parsed_clean_version
+    return true, nil, clean_version, vendor
   end
 end
 

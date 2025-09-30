@@ -68,7 +68,7 @@ local VENDOR_UID_PATTERNS = {
   {"^1%.2%.276%.0%.7230010%.",                "DCMTK"},
 
   -- dcm4che / dcm4chee
-  {"^1%.2%.40%.0%.13%.1%.3%.",                "dcm4che"},
+  {"^1%.2%.40%.0%.13%.1%.3$",                "dcm4che"},
 
   -- Major vendors (org roots)
   {"^1%.2%.840%.113619%.",                    "GE Healthcare"},
@@ -605,14 +605,20 @@ function associate(host, port, calling_aet, called_aet)
         -- *** END MODIFIED LOGIC ***
 
     elseif received_version_str then
-       -- Only version string was available (no UID or UID didn't contain version info)
-       -- Try to guess vendor=DCMTK if applicable based on string content
-       if parsed_vendor == nil and (received_version_str:match("OFFIS_DCMTK") or received_version_str:match("DCMTK")) then
-           parsed_vendor = "DCMTK"
-       end
-       parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
-       stdnse.debug1("Only received_version_str ('%s') available for cleaning. Result: %s", received_version_str, parsed_clean_version or "nil")
+      -- No (useful) UID vendor — try the version string
+      if vendor == nil then
+        local v = (received_version_str or ""):lower()
+        if     v:find("dcm4che",   1, true) then vendor = "dcm4che"
+        elseif v:find("dcmtk",     1, true) then vendor = "DCMTK"
+        elseif v:find("pynetdicom",1, true) then vendor = "pynetdicom"
+        elseif v:find("orthanc",   1, true) then vendor = "Orthanc"
+        end
+      end
+      parsed_clean_version = extract_clean_version(received_version_str, vendor)
+      stdnse.debug1("Only received_version_str ('%s') available for cleaning. Result: %s",
+                    received_version_str, parsed_clean_version or "nil")
     end
+
 
     -- Final debug log before returning from pcall's function
     stdnse.debug1("Parsed values - Clean Version: %s, Raw UID: %s, Vendor: %s",

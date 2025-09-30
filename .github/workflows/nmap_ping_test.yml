@@ -161,17 +161,40 @@ jobs:
           echo "Tcpdump started (PID: $!), capturing to $PCAP_FILE"
 
       - name: Run Nmap Test (${{ matrix.dicom_server.name }})
-        # (This step remains the same - uses nmap_args from matrix)
         id: test_script
         if: steps.start_stack.outputs.startup_success == 'true'
         run: |
           echo "--- Testing ${{ matrix.dicom_server.name }} DICOM server on host port ${{ matrix.dicom_server.host_port }} ---"
+          OUT="nmap_${{ matrix.dicom_server.name }}.out"
+          # Save output so we can assert and also debug later if needed
           nmap -p ${{ matrix.dicom_server.host_port }} \
                -dd \
                --script="dicom-ping.nse" \
                ${{ matrix.dicom_server.nmap_args || '' }} \
                --script-trace \
-               localhost || { echo "::error::Nmap command failed for ${{ matrix.dicom_server.name }}"; exit 1; }
+               localhost | tee "$OUT"
+          echo "nmap_out=$OUT" >> $GITHUB_OUTPUT
+
+      - name: Assert vendor and version are present (${{ matrix.dicom_server.name }})
+        if: steps.start_stack.outputs.startup_success == 'true'
+        run: |
+          OUT="${{ steps.test_script.outputs.nmap_out }}"
+          # Be strict: both must appear, or fail the job
+          if ! grep -E '^[|]_?\s*vendor:\s*\S' "$OUT" && ! grep -E '^[|]\s+vendor:\s*\S' "$OUT"; then
+            echo "::error::Missing 'vendor:' in Nmap output for ${{ matrix.dicom_server.name }}."
+            echo "---- Nmap output (tail) ----"; tail -n 200 "$OUT" || true; echo "-----------------------------"
+            exit 1
+          fi
+          if ! grep -E '^[|]_?\s*version:\s*\S' "$OUT" && ! grep -E '^[|]\s+version:\s*\S' "$OUT"; then
+            echo "::error::Missing 'version:' in Nmap output for ${{ matrix.dicom_server.name }}."
+            echo "---- Nmap output (tail) ----"; tail -n 200 "$OUT" || true; echo "-----------------------------"
+            exit 1
+          fi
+          # Optional: sanity check the version has at least a digit (e.g., 1.2 or 3.6.9)
+          if ! grep -E '^[|]_?\s*version:\s*.*[0-9]' "$OUT" && ! grep -E '^[|]\s+version:\s*.*[0-9]' "$OUT"; then
+            echo "::error::'version:' line found but does not contain digits for ${{ matrix.dicom_server.name }}."
+            exit 1
+          fi
 
       - name: Show Server Logs (${{ matrix.dicom_server.name }})
         # (This step remains the same)

@@ -127,7 +127,8 @@ RUN printf '%s\n' \
 '[ -f "$CFG/acrnema.map" ]   || cp "$DEF/acrnema.map.default"    "$CFG/acrnema.map"' \
 '[ -f "$CFG/dgatesop.lst" ]  || cp "$DEF/dgatesop.lst.default"   "$CFG/dgatesop.lst"' \
 '[ -f "$CFG/dicom.sql" ]     || cp "$DEF/dicom.sql.default"      "$CFG/dicom.sql"' \
-'exec /usr/local/bin/dgate -c "$CFG" -v' \
+'echo "Using config dir: $CFG"; ls -l "$CFG" || true' \
+'exec /usr/local/bin/dgate -v "-c$CFG/dicom.ini"' \
 > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 WORKDIR /opt/conquest/data

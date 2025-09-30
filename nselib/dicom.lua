@@ -58,7 +58,9 @@ end
 
 -- Define vendor UIDs lookup table with patterns (matching base prefixes only)
 local VENDOR_UID_PATTERNS = {
-  {"^1%.2%.276%.0%.7230010%.3%.0",           "DCMTK"},          -- General DCMTK base
+  -- DCMTK / OFFIS (org root: 1.2.276.0.7230010)
+  {"^1%.2%.276%.0%.7230010(%.)", "DCMTK"},
+  {"^1%.2%.826%.0%.1%.3680043%.8%.641(%.)", "Orthanc"},
   {"^1%.4%.3%.6%.1%.4%.1%.78293%.3%.1",       "Orthanc"},        -- Orthanc base
   {"^1%.3%.46%.670589%.50%.1%.4",           "Conquest"},       -- Conquest PACS base
   {"^1%.2%.40%.0%.13%.1%.3",               "DCM4CHE"}, 
@@ -130,13 +132,23 @@ end
 -- @return (status, data) Returns data if status true, otherwise data is the error message.
 ---
 function receive(dcm)
-  local status, data = dcm['socket']:receive()
-  if status == false then
-    return false, data
-  end
-  stdnse.debug1("DICOM: receive() read %d bytes", #data)
-  return true, data
+  local sock = dcm['socket']
+  if not sock then return false, "No socket" end
+
+  -- Read fixed 6-byte PDU header
+  local status, header = sock:receive_bytes(6)
+  if status == false then return false, header end
+  if #header < 6 then return false, "Short PDU header" end
+
+  local pdu_type, _, pdu_length = string.unpack(">B B I4", header)
+  -- Now read body exactly pdu_length bytes
+  local status2, body = sock:receive_bytes(pdu_length)
+  if status2 == false then return false, body end
+  if #body < pdu_length then return false, "Short PDU body" end
+
+  return true, header .. body
 end
+
 
 ---
 -- pdu_header_encode(pdu_type, length) encodes the DICOM PDU header
@@ -184,7 +196,7 @@ function parse_implementation_version(data)
 
   -- *** Find User Information item (Type 0x50, Reserved 0x00) ***
   local userinfo_marker = string.char(0x50, 0x00)
-  local userinfo_start = data:find(userinfo_marker, 65, true)
+  local userinfo_start = data:find(string.char(0x50, 0x00), 7, true)
 
   if not userinfo_start then
       stdnse.debug1("User Information item (0x50 0x00) marker not found.")

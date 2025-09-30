@@ -64,7 +64,7 @@ RUN set -e; \
     : > "${TEMP_CONFIG_DIR}/${DGATESOP_LST}.default"; \
   fi; \
   if [ ! -f "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default" ]; then \
-    printf '%s\n' '-- placeholder' > "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default"; \
+    : > "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default"; \
   fi; \
   echo "--- Contents of ${TEMP_CONFIG_DIR} ---"; \
   ls -lA "${TEMP_CONFIG_DIR}"
@@ -101,24 +101,29 @@ COPY --from=builder ${TEMP_CONFIG_DIR}/dgatesop.lst.default       /opt/conquest/
 COPY --from=builder ${TEMP_CONFIG_DIR}/dicom.sql.default          /opt/conquest/defaults/dicom.sql.default
 COPY --from=builder ${CONQUEST_SRC_DIR}/dgate.dic                 /opt/conquest/defaults/dgate.dic
 
-# Entrypoint (no heredocs)
+# Entrypoint (no heredocs; careful with line continuations)
 RUN printf '%s\n' \
 '#!/bin/sh' \
 'set -e' \
 'CFG=/opt/conquest/config' \
 'DEF=/opt/conquest/defaults' \
-'mkdir -p "$CFG" /opt/conquest/data' \ 
+'mkdir -p "$CFG" /opt/conquest/data' \
+'chmod 0777 /opt/conquest/data' \
 '[ -f "$CFG/dgate.dic" ]     || cp "$DEF/dgate.dic"            "$CFG/dgate.dic"' \
 '[ -f "$CFG/dicom.ini" ]     || cp "$DEF/dicom.ini.default"    "$CFG/dicom.ini"' \
 '[ -f "$CFG/acrnema.map" ]   || cp "$DEF/acrnema.map.default"  "$CFG/acrnema.map"' \
 '[ -f "$CFG/dgatesop.lst" ]  || cp "$DEF/dgatesop.lst.default" "$CFG/dgatesop.lst"' \
 '[ -f "$CFG/dicom.sql" ]     || cp "$DEF/dicom.sql.default"    "$CFG/dicom.sql"' \
-'grep -qi "^MAG0" "$CFG/dicom.ini" || printf "\\nMAG0 = /opt/conquest/data/\\n" >> "$CFG/dicom.ini"' \
+'grep -qi "^MAG0" "$CFG/dicom.ini" || printf "\nMAG0 = /opt/conquest/data/\n" >> "$CFG/dicom.ini"' \
+'# Disable any kFactorFile setting to avoid parsing errors in CI' \
+'sed -i -E "s/^[[:space:]]*k[fF]actor[fF]ile.*/; kFactorFile disabled for CI/" "$CFG/dicom.ini"' \
+'# Ensure dicom.sql is empty/valid (no "--" lines)' \
+': > "$CFG/dicom.sql"' \
 'ln -sf "$CFG/dicom.ini"  /usr/local/bin/dicom.ini' \
 'ln -sf "$CFG/dgate.dic"  /usr/local/bin/dgate.dic' \
 'ln -sf "$CFG/dicom.sql"  /usr/local/bin/dicom.sql' \
 'echo "Config prepared in $CFG:"; ls -l "$CFG" || true' \
-'exec /usr/local/bin/dgate -v -c "$CFG/dicom.ini"' \
+'exec /usr/local/bin/dgate -v -c"$CFG/dicom.ini"' \
 > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 WORKDIR /opt/conquest/data

@@ -314,8 +314,8 @@ function parse_implementation_version(data)
                   end
               elseif sub_type == 0x51 then -- Maximum Length Received
                    if sub_length == 4 then
-                       local _, max_len = string.unpack(">I4", value_raw)
-                       stdnse.debug1("Extracted Max PDU Length Received (0x51): %d", max_len)
+                      local max_len = string.unpack(">I4", value_raw)
+                      stdnse.debug1("Extracted Max PDU Length Received (0x51): %d", max_len)
                    else
                        stdnse.debug1("Incorrect length (%d) for Max PDU Length sub-item (0x51). Expected 4.", sub_length)
                    end

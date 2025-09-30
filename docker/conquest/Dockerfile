@@ -1,4 +1,4 @@
-# Stage 1: Builder
+# ---------- Stage 1: Builder ----------
 FROM ubuntu:20.04 AS builder
 
 ARG CONQUEST_GIT_USER=marcelvanherk
@@ -20,7 +20,7 @@ RUN git clone --depth 1 --branch ${CONQUEST_GIT_BRANCH} ${CONQUEST_GIT_REPO_URL}
 WORKDIR ${CONQUEST_SRC_DIR}
 RUN echo "--- Listing ${CONQUEST_SRC_DIR} after clone ---" && ls -lA .
 
-# Stage default configs
+# Stage default configs (no heredocs; use printf)
 ARG DICOM_INI=dicom.ini
 ARG ACRNEMA_MAP=acrnema.map
 ARG DGATESOP_LST=dgatesop.lst
@@ -40,40 +40,36 @@ RUN set -e; \
     done; \
     [ -n "$found" ] || echo "Will synthesize ${f}"; \
   done; \
-  # Minimal, Linux-friendly dicom.ini
   if [ ! -f "${TEMP_CONFIG_DIR}/${DICOM_INI}.default" ]; then \
-    cat > "${TEMP_CONFIG_DIR}/${DICOM_INI}.default" <<'EOF'
-[sscscp]
-MicroPACS                = sscscp
-TCPPort                  = 5678
-MyACRNema                = CONQUESTSRV1
-PACSName                 = CONQUESTSRV1
-HostComputer             = linux
-Dictionary               = dgate.dic
-MAG0                     = /opt/conquest/data/
-FileNameSyntax           = 4
-# Minimal config for bring-up and C-ECHO. Mount your own dicom.ini for DB use.
-EOF
+    printf '%s\n' \
+      '[sscscp]' \
+      'MicroPACS                = sscscp' \
+      'TCPPort                  = 5678' \
+      'MyACRNema                = CONQUESTSRV1' \
+      'PACSName                 = CONQUESTSRV1' \
+      'HostComputer             = linux' \
+      'Dictionary               = dgate.dic' \
+      'MAG0                     = /opt/conquest/data/' \
+      'FileNameSyntax           = 4' \
+      '# Minimal config for bring-up and C-ECHO. Mount your own dicom.ini for DB use.' \
+      > "${TEMP_CONFIG_DIR}/${DICOM_INI}.default"; \
   fi; \
-  # Minimal acrnema.map (expand as needed)
   if [ ! -f "${TEMP_CONFIG_DIR}/${ACRNEMA_MAP}.default" ]; then \
-    cat > "${TEMP_CONFIG_DIR}/${ACRNEMA_MAP}.default" <<'EOF'
-# AE           IP           Port  Compress
-CONQUESTSRV1  127.0.0.1    5678  un
-EOF
+    printf '%s\n' \
+      '# AE           IP           Port  Compress' \
+      'CONQUESTSRV1  127.0.0.1    5678  un' \
+      > "${TEMP_CONFIG_DIR}/${ACRNEMA_MAP}.default"; \
   fi; \
-  # If not present, an empty SOP list is OK to start
   if [ ! -f "${TEMP_CONFIG_DIR}/${DGATESOP_LST}.default" ]; then \
     : > "${TEMP_CONFIG_DIR}/${DGATESOP_LST}.default"; \
   fi; \
-  # Placeholder SQL file (Conquest just wants it to exist for some code paths)
   if [ ! -f "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default" ]; then \
-    echo "-- placeholder" > "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default"; \
+    printf '%s\n' '-- placeholder' > "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default"; \
   fi; \
   echo "--- Contents of ${TEMP_CONFIG_DIR} ---"; \
   ls -lA "${TEMP_CONFIG_DIR}"
 
-# Build
+# Build Conquest
 RUN chmod +x linux/maklinux_precompiled src/servertask/make.sh
 RUN echo "Running linux/maklinux_precompiled..." && linux/maklinux_precompiled
 RUN echo "Running src/servertask/make.sh..." && cd src/servertask && ./make.sh
@@ -81,7 +77,7 @@ RUN echo "--- Listing after build ---" && ls -lA .
 RUN echo "dgate present? $(if [ -f dgate ]; then echo yes; else echo no; fi)"
 RUN echo "servertask present? $(if [ -f src/servertask/servertask ]; then echo yes; else echo no; fi)"
 
-# Stage 2: Runtime
+# ---------- Stage 2: Runtime ----------
 FROM ubuntu:20.04
 
 ARG CONQUEST_SRC_DIR=/build/Conquest-DICOM-Server
@@ -92,35 +88,32 @@ RUN apt-get update && \
       liblua5.1-0 ca-certificates iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Layout
 RUN mkdir -p /opt/conquest/data /opt/conquest/config /opt/conquest/defaults
 
 # Binaries
-COPY --from=builder ${CONQUEST_SRC_DIR}/dgate                          /usr/local/bin/dgate
-COPY --from=builder ${CONQUEST_SRC_DIR}/src/servertask/servertask      /usr/local/bin/servertask
+COPY --from=builder ${CONQUEST_SRC_DIR}/dgate                     /usr/local/bin/dgate
+COPY --from=builder ${CONQUEST_SRC_DIR}/src/servertask/servertask /usr/local/bin/servertask
 
-# Defaults
-COPY --from=builder ${TEMP_CONFIG_DIR}/dicom.ini.default               /opt/conquest/defaults/dicom.ini.default
-COPY --from=builder ${TEMP_CONFIG_DIR}/acrnema.map.default             /opt/conquest/defaults/acrnema.map.default
-COPY --from=builder ${TEMP_CONFIG_DIR}/dgatesop.lst.default            /opt/conquest/defaults/dgatesop.lst.default
-COPY --from=builder ${TEMP_CONFIG_DIR}/dicom.sql.default               /opt/conquest/defaults/dicom.sql.default
-COPY --from=builder ${CONQUEST_SRC_DIR}/dgate.dic                      /opt/conquest/defaults/dgate.dic
+# Default configs
+COPY --from=builder ${TEMP_CONFIG_DIR}/dicom.ini.default          /opt/conquest/defaults/dicom.ini.default
+COPY --from=builder ${TEMP_CONFIG_DIR}/acrnema.map.default        /opt/conquest/defaults/acrnema.map.default
+COPY --from=builder ${TEMP_CONFIG_DIR}/dgatesop.lst.default       /opt/conquest/defaults/dgatesop.lst.default
+COPY --from=builder ${TEMP_CONFIG_DIR}/dicom.sql.default          /opt/conquest/defaults/dicom.sql.default
+COPY --from=builder ${CONQUEST_SRC_DIR}/dgate.dic                 /opt/conquest/defaults/dgate.dic
 
-# Entrypoint: ensure config exists, wire symlinks, start dgate
+# Entrypoint (no heredocs)
 RUN printf '%s\n' \
 '#!/bin/sh' \
 'set -e' \
 'CFG=/opt/conquest/config' \
 'DEF=/opt/conquest/defaults' \
-'mkdir -p "$CFG" /opt/conquest/data' \
-'[ -f "$CFG/dgate.dic" ]     || cp "$DEF/dgate.dic"           "$CFG/dgate.dic"' \
-'[ -f "$CFG/dicom.ini" ]     || cp "$DEF/dicom.ini.default"   "$CFG/dicom.ini"' \
-'[ -f "$CFG/acrnema.map" ]   || cp "$DEF/acrnema.map.default" "$CFG/acrnema.map"' \
+'mkdir -p "$CFG" /opt/conquest/data"' \
+'[ -f "$CFG/dgate.dic" ]     || cp "$DEF/dgate.dic"            "$CFG/dgate.dic"' \
+'[ -f "$CFG/dicom.ini" ]     || cp "$DEF/dicom.ini.default"    "$CFG/dicom.ini"' \
+'[ -f "$CFG/acrnema.map" ]   || cp "$DEF/acrnema.map.default"  "$CFG/acrnema.map"' \
 '[ -f "$CFG/dgatesop.lst" ]  || cp "$DEF/dgatesop.lst.default" "$CFG/dgatesop.lst"' \
-'[ -f "$CFG/dicom.sql" ]     || cp "$DEF/dicom.sql.default"   "$CFG/dicom.sql"' \
-'# Make sure MAG0 is set to a writable path' \
+'[ -f "$CFG/dicom.sql" ]     || cp "$DEF/dicom.sql.default"    "$CFG/dicom.sql"' \
 'grep -qi "^MAG0" "$CFG/dicom.ini" || printf "\\nMAG0 = /opt/conquest/data/\\n" >> "$CFG/dicom.ini"' \
-'# Conquest sometimes looks next to the binary; provide symlinks as fallback' \
 'ln -sf "$CFG/dicom.ini"  /usr/local/bin/dicom.ini' \
 'ln -sf "$CFG/dgate.dic"  /usr/local/bin/dgate.dic' \
 'ln -sf "$CFG/dicom.sql"  /usr/local/bin/dicom.sql' \

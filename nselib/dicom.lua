@@ -60,26 +60,22 @@ end
 local VENDOR_UID_PATTERNS = {
   -- DCMTK / OFFIS (org root: 1.2.276.0.7230010)
   {"^1%.2%.276%.0%.7230010(%.)", "DCMTK"},
-  {"^1%.2%.826%.0%.1%.3680043%.8%.641(%.)", "Orthanc"},
+  {"^1%.2%.826%.0%.1%.3680043%.8%.641%.",     "Orthanc"},       -- Orthanc branch
   {"^1%.4%.3%.6%.1%.4%.1%.78293%.3%.1",       "Orthanc"},        -- Orthanc base
-  {"^1%.3%.46%.670589%.50%.1%.4",           "Conquest"},       -- Conquest PACS base
-  {"^1%.2%.40%.0%.13%.1%.3",               "DCM4CHE"}, 
+  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.",    "OsiriX"},        -- OsiriX branch
+  {"^1%.3%.46%.670589%.",                    "Conquest PACS"},       -- Conquest PACS base
+  {"^1%.2%.40%.0%.13%.1%.3%.",               "dcm4che"}, 
   {"^1%.2%.826%.0%.1%.3680043%.9%.3811",    "pynetdicom"},       -- dcm4chee base
-  {"^1%.2%.840%.113619%.2%.55",           "GE Healthcare"},  -- GE Healthcare base
-  {"^1%.2%.840%.113619%.6%.96",           "GE Healthcare"},  -- GE base
-  {"^1%.2%.840%.113619%.6%.105",          "GE Healthcare"},  -- GE base
+  {"^1%.2%.840%.113619%.",                  "GE Healthcare"},-- GE base
   {"^1%.3%.12%.2%.1107%.5%.99",           "Siemens Syngo"},  -- Siemens Syngo base
-  {"^1%.3%.12%.2%.1107%.5%.8",            "Siemens"},        -- Other Siemens base
-  {"^1%.2%.840%.10008%.5%.1%.4",          "DICOM Standard"}, -- DICOM Standard base (SOP Class related)
-  {"^1%.2%.124%.113532%.3%.1",            "Merge Healthcare"},-- Merge PACS base
-  {"^1%.2%.826%.0%.1%.3680043%.9%.3%.9%.1", "ClearCanvas"},    -- ClearCanvas base
-  {"^1%.2%.840%.114257%.1%.15",           "Horos"},          -- Horos base
-  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.1%.2", "OsiriX"},       -- OsiriX base prefix
-  {"^1%.2%.392%.200036%.9%.1%.1%.1",       "FujiFilm"},       -- FujiFilm base
-  {"^1%.2%.840%.114340%.2%.1",            "Agfa"},           -- Agfa base
-  {"^1%.2%.840%.113704%.7%.1%.1%.1%.1%.1", "Carestream"},     -- Carestream base
-  {"^1%.2%.826%.0%.1%.3680043%.9%.3",       "DICOM Standard"}, -- Or maybe generic UK NHS software?
-  {"^1%.3%.6%.1%.4%.1%.19376",             "Mayo Clinic"}    -- Mayo Clinic base
+  {"^1%.3%.12%.2%.1107%.",                "Siemens"},        -- Other Siemens base
+  {"^1%.2%.124%.113532%.",            "Merge Healthcare"},-- Merge PACS base
+  {"^1%.2%.826%.0%.1%.3680043%.",       "ClearCanvas"},    -- ClearCanvas base
+  {"^1%.2%.840%.114257%.",              "Horos"},          -- Horos base
+  {"^1%.2%.826%.0%.1%.3680043%",          "OsiriX"},       -- OsiriX base prefix
+  {"^1%.2%.392%.200036%.",                   "Fujifilm"},      -- FujiFilm base
+  {"^1%.2%.840%.114257%.",                   "Agfa"},           -- Agfa base
+  {"^1%.2%.840%.113704%.",               "Carestream"},     -- Carestream base
 }
 
 ---
@@ -135,17 +131,25 @@ function receive(dcm)
   local sock = dcm['socket']
   if not sock then return false, "No socket" end
 
-  -- Read fixed 6-byte PDU header
-  local status, header = sock:receive_bytes(6)
-  if status == false then return false, header end
-  if #header < 6 then return false, "Short PDU header" end
+  -- Read at least 6 bytes (header). Nsock may return more.
+  local ok1, chunk = sock:receive_bytes(6)
+  if ok1 == false then return false, chunk end
+  if #chunk < 6 then return false, "Short PDU header" end
 
+  local header = chunk:sub(1, 6)
   local pdu_type, _, pdu_length = string.unpack(">B B I4", header)
-  -- Now read body exactly pdu_length bytes
-  local status2, body = sock:receive_bytes(pdu_length)
-  if status2 == false then return false, body end
-  if #body < pdu_length then return false, "Short PDU body" end
 
+  -- Anything past the first 6 bytes is already part of the body
+  local body = chunk:sub(7)
+  local need = pdu_length - #body
+  while need > 0 do
+    local ok2, more = sock:receive_bytes(need)
+    if ok2 == false then return false, more end
+    body = body .. more
+    need = pdu_length - #body
+  end
+
+  stdnse.debug1("DICOM: receive() read %d bytes", 6 + #body)
   return true, header .. body
 end
 
@@ -170,7 +174,7 @@ function pdu_header_encode(pdu_type, length)
   local header = string.pack(">B B I4",
                             pdu_type, -- PDU Type ( 1 byte - unsigned integer in Big Endian )
                             0,        -- Reserved section ( 1 byte that should be set to 0x0 )
-                            length)   -- PDU Length ( 4 bytes - unsigned integer in Little Endian)
+                            length)   -- PDU Length (4 bytes - unsigned integer in Big Endian, network order)
   if #header < MIN_HEADER_LEN then
     return false, "Header must be at least 6 bytes. Something went wrong."
   end
@@ -609,8 +613,6 @@ function associate(host, port, calling_aet, called_aet)
     if received_uid_str then
         local vendor_result, version_part_from_uid = identify_vendor_from_uid(received_uid_str)
         if vendor_result then parsed_vendor = vendor_result end -- Assign vendor based on UID
-
-        -- *** MODIFIED LOGIC: Prioritize full version string for cleaning ***
         if received_version_str then
             -- Clean the full string from field 0x55 if available
             parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
@@ -670,7 +672,7 @@ function associate(host, port, calling_aet, called_aet)
 
     -- Return true and the extracted info, matching the expected format:
     -- (status, dcm_or_error, version, vendor)
-    return true, nil, clean_version, vendor
+    return true, nil, received_version_str, received_uid_str, parsed_vendor, parsed_clean_version
   end
 end
 

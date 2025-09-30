@@ -148,15 +148,16 @@ function receive(dcm)
   local header = chunk:sub(1, 6)
   local pdu_type, reserved, pdu_length = string.unpack(">B B I4", header)
 
-  -- DICOM UL requires this reserved byte to be 0x00
+  -- Soft checks (warn, don't fail)
   if reserved ~= 0x00 then
-    return false, ("Not a DICOM UL header (reserved=%d)"):format(reserved)
+    stdnse.debug1("DICOM: reserved header byte is %d (expected 0); continuing anyway", reserved)
   end
 
-  -- Be tolerant but not infinite: use your MAX_SIZE_PDU ceiling
+  -- Be tolerant but bounded
   if pdu_length < 0 or pdu_length > MAX_SIZE_PDU then
     return false, ("Unreasonable PDU length: %d"):format(pdu_length)
   end
+
   -- Anything past the first 6 bytes is already part of the body
   local body = chunk:sub(7)
   local need = pdu_length - #body
@@ -169,6 +170,7 @@ function receive(dcm)
 
   stdnse.debug1("DICOM: receive() read %d bytes", 6 + #body)
   return true, header .. body
+
 end
 
 

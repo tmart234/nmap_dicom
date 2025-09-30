@@ -104,7 +104,7 @@ COPY --from=builder ${CONQUEST_SRC_DIR}/dgate.dic                 /opt/conquest/
 # Entrypoint (no heredocs; careful with line continuations)
 RUN printf '%s\n' \
 '#!/bin/sh' \
-'set -e' \
+'set -eu' \
 'CFG=/opt/conquest/config' \
 'DEF=/opt/conquest/defaults' \
 'mkdir -p "$CFG" /opt/conquest/data' \
@@ -114,10 +114,24 @@ RUN printf '%s\n' \
 '[ -f "$CFG/acrnema.map" ]   || cp "$DEF/acrnema.map.default"  "$CFG/acrnema.map"' \
 '[ -f "$CFG/dgatesop.lst" ]  || cp "$DEF/dgatesop.lst.default" "$CFG/dgatesop.lst"' \
 '[ -f "$CFG/dicom.sql" ]     || cp "$DEF/dicom.sql.default"    "$CFG/dicom.sql"' \
+'# Ensure core [sscscp] settings match our test harness' \
+'normalize_kv() {' \
+'  key="$1"; val="$2"; file="$3";' \
+'  if grep -qi "^[[:space:]]*$key[[:space:]]*=" "$file"; then' \
+'    sed -i -E "s|^([[:space:]]*$key[[:space:]]*=).*|\\1 $val|I" "$file"' \
+'  else' \
+'    printf "%s = %s\n" "$key" "$val" >> "$file"' \
+'  fi' \
+'}' \
+'normalize_kv "MicroPACS"   "sscscp"            "$CFG/dicom.ini"' \
+'normalize_kv "TCPPort"     "5678"              "$CFG/dicom.ini"' \
+'normalize_kv "MyACRNema"   "CONQUESTSRV1"      "$CFG/dicom.ini"' \
+'normalize_kv "PACSName"    "CONQUESTSRV1"      "$CFG/dicom.ini"' \
+'normalize_kv "Dictionary"  "dgate.dic"         "$CFG/dicom.ini"' \
 'grep -qi "^MAG0" "$CFG/dicom.ini" || printf "\nMAG0 = /opt/conquest/data/\n" >> "$CFG/dicom.ini"' \
 '# Disable any kFactorFile setting to avoid parsing errors in CI' \
 'sed -i -E "s/^[[:space:]]*k[fF]actor[fF]ile.*/; kFactorFile disabled for CI/" "$CFG/dicom.ini"' \
-'# Ensure dicom.sql is empty/valid (no "--" lines)' \
+'# Ensure dicom.sql is empty/valid (no \"--\" lines)' \
 ': > "$CFG/dicom.sql"' \
 '# Helpful defaults for visibility' \
 'grep -qi "^DebugLevel" "$CFG/dicom.ini" || printf "DebugLevel = 4\n" >> "$CFG/dicom.ini"' \
@@ -126,7 +140,7 @@ RUN printf '%s\n' \
 'echo "Config prepared in $CFG:"' \
 'ls -l "$CFG" || true' \
 'echo "--- dicom.ini ---"' \
-'sed -n "1,120p" "$CFG/dicom.ini" || true' \
+'sed -n "1,200p" "$CFG/dicom.ini" || true' \
 '# Symlinks for legacy default lookup' \
 'ln -sf "$CFG/dicom.ini"  /usr/local/bin/dicom.ini' \
 'ln -sf "$CFG/dgate.dic"  /usr/local/bin/dgate.dic' \
@@ -134,7 +148,6 @@ RUN printf '%s\n' \
 'echo "Starting dgate..."' \
 'exec /usr/local/bin/dgate -v -c "$CFG/dicom.ini"' \
 > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
-
 WORKDIR /opt/conquest/data
 EXPOSE 5678
 CMD ["/usr/local/bin/entrypoint.sh"]

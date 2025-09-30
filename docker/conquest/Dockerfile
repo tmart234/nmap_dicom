@@ -3,7 +3,7 @@ FROM ubuntu:20.04 AS builder
 
 ARG CONQUEST_GIT_USER=marcelvanherk
 ARG CONQUEST_GIT_PROJECT_NAME=Conquest-DICOM-Server
-ARG CONQUEST_GIT_REPO_URL=https://github.com/${CONQUEST_GIT_USER}/${CONQUEST_GIT_PROJECT_NAME}.git # Used for git clone
+ARG CONQUEST_GIT_REPO_URL=https://github.com/${CONQUEST_GIT_USER}/${CONQUEST_GIT_PROJECT_NAME}.git
 ARG CONQUEST_GIT_BRANCH=master
 ARG CONQUEST_SRC_DIR=/build/Conquest-DICOM-Server
 ARG TEMP_CONFIG_DIR=/tmp_conquest_configs
@@ -11,28 +11,23 @@ ARG TEMP_CONFIG_DIR=/tmp_conquest_configs
 # Install build dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    ca-certificates \
-    git \
-    make \
-    g++ \
-    lua5.1 \
-    liblua5.1-0-dev \
-    gettext-base \
-    curl \
+      ca-certificates \
+      git \
+      make \
+      g++ \
+      lua5.1 \
+      liblua5.1-0-dev \
+      gettext-base \
+      curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone source code for building binaries (dgate, servertask)
-# This step seems to get the necessary src/ and linux/ directories for compilation
-RUN echo "Cloning Conquest DICOM Server's source from ${CONQUEST_GIT_REPO_URL} branch ${CONQUEST_GIT_BRANCH} into ${CONQUEST_SRC_DIR}"
+# Clone source code (contains linux build scripts)
+RUN echo "Cloning Conquest from ${CONQUEST_GIT_REPO_URL} (${CONQUEST_GIT_BRANCH}) -> ${CONQUEST_SRC_DIR}"
 RUN git clone --depth 1 --branch ${CONQUEST_GIT_BRANCH} ${CONQUEST_GIT_REPO_URL} ${CONQUEST_SRC_DIR}
 WORKDIR ${CONQUEST_SRC_DIR}
 
-# --- Diagnostic: List files immediately after clone ---
-RUN echo "--- Listing contents of ${CONQUEST_SRC_DIR} (root) immediately after git clone ---" && ls -lA ./
-
-# --- Fetch config files directly using curl to TEMP_CONFIG_DIR ---
-RUN echo "Creating temporary config directory: ${TEMP_CONFIG_DIR}" && mkdir -p ${TEMP_CONFIG_DIR}
-RUN echo "Fetching config files directly to ${TEMP_CONFIG_DIR} using curl from branch ${CONQUEST_GIT_BRANCH}"
+# Quick listing
+RUN echo "--- Listing ${CONQUEST_SRC_DIR} after clone ---" && ls -lA .
 
 # Define config files we want to stage as defaults
 ARG DICOM_INI=dicom.ini
@@ -40,60 +35,105 @@ ARG ACRNEMA_MAP=acrnema.map
 ARG DGATESOP_LST=dgatesop.lst
 ARG DICOM_SQL=dicom.sql
 
-# Copy defaults directly from the cloned repo instead of raw.githubusercontent.com
-RUN echo "Staging default configs from ${CONQUEST_SRC_DIR} into ${TEMP_CONFIG_DIR}" && \
-    cp -v "${CONQUEST_SRC_DIR}/${DICOM_INI}"    "${TEMP_CONFIG_DIR}/${DICOM_INI}.default"    || true && \
-    cp -v "${CONQUEST_SRC_DIR}/${ACRNEMA_MAP}"  "${TEMP_CONFIG_DIR}/${ACRNEMA_MAP}.default" || true && \
-    cp -v "${CONQUEST_SRC_DIR}/${DGATESOP_LST}" "${TEMP_CONFIG_DIR}/${DGATESOP_LST}.default"|| true && \
-    cp -v "${CONQUEST_SRC_DIR}/${DICOM_SQL}"    "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default"    || true && \
-    echo "--- Listing contents of ${TEMP_CONFIG_DIR} ---" && ls -lA "${TEMP_CONFIG_DIR}" && \
-    if [ -f "${TEMP_CONFIG_DIR}/${DICOM_INI}.default" ]; then echo "dicom.ini.default: Found"; else echo "dicom.ini.default: NOT FOUND"; fi
+# Stage defaults from repo if present; otherwise synthesize minimal files
+RUN set -e; \
+  echo "Creating ${TEMP_CONFIG_DIR} and staging defaults"; \
+  mkdir -p "${TEMP_CONFIG_DIR}"; \
+  for f in "${DICOM_INI}" "${ACRNEMA_MAP}" "${DGATESOP_LST}" "${DICOM_SQL}"; do \
+    found=""; \
+    for p in "." "install" "install64" "install32" "linux" "docker"; do \
+      if [ -f "${p}/${f}" ]; then \
+        echo "Found ${p}/${f} -> ${TEMP_CONFIG_DIR}/${f}.default"; \
+        cp -v "${p}/${f}" "${TEMP_CONFIG_DIR}/${f}.default"; \
+        found="yes"; \
+        break; \
+      fi; \
+    done; \
+    [ -n "$found" ] || echo "Will synthesize ${f}"; \
+  done; \
+  \
+  # dicom.ini
+  if [ ! -f "${TEMP_CONFIG_DIR}/${DICOM_INI}.default" ]; then \
+    printf '%s\n' \
+      "[sscscp]" \
+      "MicroPACS                = sscscp" \
+      "TCPPort                  = 5678" \
+      "MyACRNema                = CONQUESTSRV1" \
+      "PACSName                 = CONQUESTSRV1" \
+      "HostComputer             = linux" \
+      "Dictionary               = dgate.dic" \
+      "# Minimal config for echo testing; mount a full dicom.ini for DB, etc." \
+      > "${TEMP_CONFIG_DIR}/${DICOM_INI}.default"; \
+  fi; \
+  \
+  # acrnema.map
+  if [ ! -f "${TEMP_CONFIG_DIR}/${ACRNEMA_MAP}.default" ]; then \
+    printf '%s\n' \
+      "# AE        IP           Port  Compress" \
+      "CONQUESTSRV1 127.0.0.1   5678  un" \
+      > "${TEMP_CONFIG_DIR}/${ACRNEMA_MAP}.default"; \
+  fi; \
+  \
+  # dgatesop.lst
+  if [ ! -f "${TEMP_CONFIG_DIR}/${DGATESOP_LST}.default" ]; then \
+    : > "${TEMP_CONFIG_DIR}/${DGATESOP_LST}.default"; \
+  fi; \
+  \
+  # dicom.sql (placeholder)
+  if [ ! -f "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default" ]; then \
+    printf '%s\n' \
+      "-- Placeholder schema for basic container startup; mount a real dicom.sql for DB-backed use." \
+      > "${TEMP_CONFIG_DIR}/${DICOM_SQL}.default"; \
+  fi; \
+  \
+  echo "--- Contents of ${TEMP_CONFIG_DIR} ---"; \
+  ls -lA "${TEMP_CONFIG_DIR}"
 
-# Make build scripts executable (these should be from the git clone)
+# Make build scripts executable
 RUN chmod +x linux/maklinux_precompiled src/servertask/make.sh
 
-# Compile dgate and servertask
-RUN echo "Running linux/maklinux_precompiled..."
-RUN linux/maklinux_precompiled
-RUN echo "Running make.sh in src/servertask..."
-RUN cd src/servertask && ./make.sh
+# Build dgate and servertask
+RUN echo "Running linux/maklinux_precompiled..." && linux/maklinux_precompiled
+RUN echo "Running src/servertask/make.sh..." && cd src/servertask && ./make.sh
 
-# --- Diagnostic: List files AFTER build scripts (in cloned directory) ---
-RUN echo "--- Listing contents of ${CONQUEST_SRC_DIR} (root) AFTER build scripts ---" && ls -lA ./
-RUN echo "Checking for dgate executable: $(if [ -f dgate ]; then echo 'Found'; else echo 'NOT FOUND'; fi)"
-RUN echo "Checking for servertask executable: $(if [ -f src/servertask/servertask ]; then echo 'Found'; else echo 'NOT FOUND'; fi)"
+# Verify build artifacts
+RUN echo "--- Listing after build ---" && ls -lA .
+RUN echo "dgate present? $(if [ -f dgate ]; then echo yes; else echo no; fi)"
+RUN echo "servertask present? $(if [ -f src/servertask/servertask ]; then echo yes; else echo no; fi)"
 
-
+# ----------------------------
 # Stage 2: Runtime image
+# ----------------------------
 FROM ubuntu:20.04
 
 ARG CONQUEST_SRC_DIR=/build/Conquest-DICOM-Server
 ARG TEMP_CONFIG_DIR=/tmp_conquest_configs
 
-# Install runtime dependencies
+# Runtime deps; include iproute2 so 'ss' works for healthchecks
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    liblua5.1-0 \
-    ca-certificates \
+      liblua5.1-0 \
+      ca-certificates \
+      iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Create directories for Conquest
+# Create directories
 RUN mkdir -p /opt/conquest/data /opt/conquest/config
 
-# Copy compiled binaries from builder stage
+# Binaries
 COPY --from=builder ${CONQUEST_SRC_DIR}/dgate /usr/local/bin/dgate
 COPY --from=builder ${CONQUEST_SRC_DIR}/src/servertask/servertask /usr/local/bin/servertask
 
-# Copy default configuration files staged in the builder
+# Default configs (from builder)
 COPY --from=builder ${TEMP_CONFIG_DIR}/dicom.ini.default     /opt/conquest/config/dicom.ini.default
 COPY --from=builder ${TEMP_CONFIG_DIR}/acrnema.map.default   /opt/conquest/config/acrnema.map.default
 COPY --from=builder ${TEMP_CONFIG_DIR}/dgatesop.lst.default  /opt/conquest/config/dgatesop.lst.default
 COPY --from=builder ${TEMP_CONFIG_DIR}/dicom.sql.default     /opt/conquest/config/dicom.sql.default
 
-# Dictionary needed by Conquest
+# Dictionary required by Conquest
 COPY --from=builder ${CONQUEST_SRC_DIR}/dgate.dic /opt/conquest/config/dgate.dic
 
-# Bootstrap entrypoint: populate missing configs then exec dgate
+# Bootstrap entrypoint: copy defaults if missing, then exec dgate
 RUN printf '%s\n' \
 '#!/bin/sh' \
 'set -e' \
@@ -106,8 +146,7 @@ RUN printf '%s\n' \
 > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 WORKDIR /opt/conquest/data
-
 EXPOSE 5678
 
-# Only ONE CMD in this stage
+# Single CMD
 CMD ["/usr/local/bin/entrypoint.sh"]

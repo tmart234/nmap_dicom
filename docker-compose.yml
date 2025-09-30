@@ -67,23 +67,15 @@ services:
 
   conquest:
     build:
-      context: ./docker/conquest # Directory containing the new Dockerfile
+      context: ./docker/conquest
     container_name: conquest_dicom_test
     ports:
       - "5678:5678"
     volumes:
-      # Mount volumes for persistent config/data/logs
-      # Create these directories locally first if needed
       - ./conquest_test_data/config:/opt/conquest/config
       - ./conquest_test_data/data:/opt/conquest/data
-      # - ./conquest_test_data/logs:/opt/conquest/logs # If logs go elsewhere
     restart: unless-stopped
-    # Environment variables likely NOT needed now, config is via mounted dicom.ini
-    # environment:
-    #   - AETITLE=CONQUESTSRV1
-    #   - PORT=5678
     healthcheck:
-      # netstat may not exist; use ss (iproute2) instead
       test: ["CMD-SHELL", "ss -ltn | grep ':5678' || exit 1"]
       interval: 10s
       timeout: 5s

@@ -79,7 +79,8 @@ local VENDOR_UID_PATTERNS = {
   {"^1%.2%.124%.113532%.",                    "Merge Healthcare"},
 
   -- Community PACS
-  {"^1%.3%.46%.670589%.",                     "Conquest PACS"},
+  {"^1%.2%.826%.0%.1%.3680043%.",             "ConQuest"},
+  {"^1%.3%.46%.670589%.",                     "Phillips"},
 }
 
 ---
@@ -138,7 +139,6 @@ function receive(dcm)
   -- Read at least 6 bytes (header). Nsock may return more.
   local ok1, chunk = sock:receive_bytes(6)
   if ok1 == false then
-    -- Preserve original nsock error string, but make it clearer
     return false, ("No response / header read failed: %s"):format(chunk or "EOF/timeout")
   end
   if #chunk < 6 then
@@ -146,25 +146,17 @@ function receive(dcm)
   end
 
   local header = chunk:sub(1, 6)
-  local pdu_type, _, pdu_length = string.unpack(">B B I4", header)
+  local pdu_type, reserved, pdu_length = string.unpack(">B B I4", header)
 
-  -- First: ensure this looks like an association-related PDU we expect
-  -- (AC=0x02, RJ=0x03, ABORT=0x07, DATA=0x04 is unexpected here but tolerate)
-  local known = PDU_NAMES[pdu_type] ~= nil
-  if not known then
-    -- Some servers just close without sending anything; if we got junk,
-    -- return a clearer error instead of a scary length message.
-    return false, ("Unexpected/unknown PDU type: %d"):format(pdu_type)
+  -- DICOM UL requires this reserved byte to be 0x00
+  if reserved ~= 0x00 then
+    return false, ("Not a DICOM UL header (reserved=%d)"):format(reserved)
   end
 
-  -- Then: sanity on declared body length.
-  -- Be tolerant here—some stacks lie or split—but still guard absurd values.
-  -- Raise ceiling to 1 MiB to avoid false positives on partial reads.
-  local MAX_REASONABLE_PDU = 1024 * 1024
-  if pdu_length < 0 or pdu_length > MAX_REASONABLE_PDU then
+  -- Be tolerant but not infinite: use your MAX_SIZE_PDU ceiling
+  if pdu_length < 0 or pdu_length > MAX_SIZE_PDU then
     return false, ("Unreasonable PDU length: %d"):format(pdu_length)
   end
-
   -- Anything past the first 6 bytes is already part of the body
   local body = chunk:sub(7)
   local need = pdu_length - #body
@@ -622,21 +614,20 @@ function associate(host, port, calling_aet, called_aet)
     parsed_clean_version = nil -- This will hold the final cleaned version
 
     if received_uid_str then
-        local vendor_result = identify_vendor_from_uid(received_uid_str)
-        if vendor_result then parsed_vendor = vendor_result end -- Assign vendor based on UID
-        if received_version_str then
-            -- Clean the full string from field 0x55 if available
-            parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
-            stdnse.debug1("Using received_version_str ('%s') for cleaning. Result: %s", received_version_str, parsed_clean_version or "nil")
-        end
+      local vendor_result = identify_vendor_from_uid(received_uid_str)
+      if vendor_result then parsed_vendor = vendor_result end
+      if received_version_str then
+        parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
+        stdnse.debug1("Using received_version_str ('%s') for cleaning. Result: %s",
+                      received_version_str, parsed_clean_version or "nil")
+      end
     elseif received_version_str then
-      -- No (useful) UID vendor — try the version string
       if vendor == nil then
-        local v = (received_version_str or ""):lower()
-        if     v:find("dcm4che",   1, true) then vendor = "dcm4che"
-        elseif v:find("dcmtk",     1, true) then vendor = "DCMTK"
-        elseif v:find("pynetdicom",1, true) then vendor = "pynetdicom"
-        elseif v:find("orthanc",   1, true) then vendor = "Orthanc"
+        local vv = (received_version_str or ""):lower()
+        if     vv:find("dcm4che",   1, true) then vendor = "dcm4che"
+        elseif vv:find("dcmtk",     1, true) then vendor = "DCMTK"
+        elseif vv:find("pynetdicom",1, true) then vendor = "pynetdicom"
+        elseif vv:find("orthanc",   1, true) then vendor = "Orthanc"
         end
       end
       parsed_clean_version = extract_clean_version(received_version_str, vendor)

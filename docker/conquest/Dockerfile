@@ -119,11 +119,20 @@ RUN printf '%s\n' \
 'sed -i -E "s/^[[:space:]]*k[fF]actor[fF]ile.*/; kFactorFile disabled for CI/" "$CFG/dicom.ini"' \
 '# Ensure dicom.sql is empty/valid (no "--" lines)' \
 ': > "$CFG/dicom.sql"' \
+'# Helpful defaults for visibility' \
+'grep -qi "^DebugLevel" "$CFG/dicom.ini" || printf "DebugLevel = 4\n" >> "$CFG/dicom.ini"' \
+'grep -qi "^MaxAssociations" "$CFG/dicom.ini" || printf "MaxAssociations = 32\n" >> "$CFG/dicom.ini"' \
+'# Sanity dump' \
+'echo "Config prepared in $CFG:"' \
+'ls -l "$CFG" || true' \
+'echo "--- dicom.ini ---"' \
+'sed -n "1,120p" "$CFG/dicom.ini" || true' \
+'# Symlinks for legacy default lookup' \
 'ln -sf "$CFG/dicom.ini"  /usr/local/bin/dicom.ini' \
 'ln -sf "$CFG/dgate.dic"  /usr/local/bin/dgate.dic' \
 'ln -sf "$CFG/dicom.sql"  /usr/local/bin/dicom.sql' \
-'echo "Config prepared in $CFG:"; ls -l "$CFG" || true' \
-'exec /usr/local/bin/dgate -v -c"$CFG/dicom.ini"' \
+'echo "Starting dgate..."' \
+'exec /usr/local/bin/dgate -v -c "$CFG/dicom.ini"' \
 > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 WORKDIR /opt/conquest/data

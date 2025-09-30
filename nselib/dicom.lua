@@ -142,6 +142,13 @@ function receive(dcm)
 
   local header = chunk:sub(1, 6)
   local pdu_type, _, pdu_length = string.unpack(">B B I4", header)
+  -- sanity on PDU type and length
+  if pdu_length < 0 or pdu_length > MAX_SIZE_PDU then
+    return false, ("Unreasonable PDU length: %d"):format(pdu_length)
+  end
+  if not PDU_NAMES[pdu_type] then
+    return false, ("Unknown PDU type: %d"):format(pdu_type)
+  end
 
   -- Anything past the first 6 bytes is already part of the body
   local body = chunk:sub(7)
@@ -168,12 +175,13 @@ end
 ---
 function pdu_header_encode(pdu_type, length)
   -- Some simple sanity checks, we do not check ranges to allow users to create malformed packets.
-  if not(type(pdu_type)) == "number" then
+  if type(pdu_type) ~= "number" then
     return false, "PDU Type must be an unsigned integer. Range:0-7"
   end
-  if not(type(length)) == "number" then
+  if type(length) ~= "number" then
     return false, "Length must be an unsigned integer."
   end
+
 
   local header = string.pack(">B B I4",
                             pdu_type, -- PDU Type ( 1 byte - unsigned integer in Big Endian )
@@ -367,128 +375,122 @@ function extract_clean_version(version_str, vendor)
   if not version_str then return nil end
 
   -- Clean the input string first (remove null bytes, trim whitespace)
-  version_str = version_str:gsub("%z", ""):gsub("^%s*", ""):gsub("%s*$", "")
+  local s = version_str:gsub("%z", ""):match("^%s*(.-)%s*$")
+  if s == "" then return nil end
 
-  -- DCMTK versions - Expanded to handle more formats
-  -- Check vendor hint OR if the string contains DCMTK identifiers
-  if vendor == "DCMTK" or version_str:match("OFFIS_DCMTK") or version_str:match("DCMTK") then
-    -- Handle OFFIS_DCMTK_369 format -> 3.6.9
-    local major, minor, patch = version_str:match("OFFIS_DCMTK_(%d)(%d)(%d)")
-    if major and minor and patch then
-      stdnse.debug1("Matched OFFIS_DCMTK_ddd format: %s.%s.%s", major, minor, patch)
-      return string.format("%s.%s.%s", major, minor, patch)
-    end
+  -- Normalize vendor casing for matching
+  local v = vendor and vendor:lower() or nil
 
-    -- Handle DCMTK_362 format -> 3.6.2 (Adjusted pattern)
-    major, minor, patch = version_str:match("DCMTK_(%d)(%d)(%d)") -- Removed '+' from middle digit group
-    if major and minor and patch then
-      stdnse.debug1("Matched DCMTK_ddd format: %s.%s.%s", major, minor, patch)
-      return string.format("%s.%s.%s", major, minor, patch)
-    end
+  -- Helper: map 3 digits like "369" -> "3.6.9"
+  local function ddd_to_semver(ddd)
+    if not ddd or #ddd ~= 3 then return nil end
+    return string.format("%s.%s.%s", ddd:sub(1,1), ddd:sub(2,2), ddd:sub(3,3))
+  end
 
-    -- Handle just 3 digits if other patterns failed (e.g., if only "369" was passed somehow)
-    if #version_str == 3 and version_str:match("^(%d)(%d)(%d)$") then
-        major, minor, patch = version_str:match("^(%d)(%d)(%d)$")
-        if major and minor and patch then
-            stdnse.debug1("Matched raw ddd format: %s.%s.%s", major, minor, patch)
-            return string.format("%s.%s.%s", major, minor, patch)
-        end
+  -- ======================
+  -- Vendor-targeted rules
+  -- ======================
+
+  -- DCMTK / OFFIS
+  if v == "dcmtk" or s:find("DCMTK", 1, true) or s:find("OFFIS", 1, true) then
+    -- OFFIS_DCMTK_369 / DCMTK_362 / with optional separators
+    local a,b,c = s:match("[Oo][Ff][Ff][Ii][Ss].-[Dd][Cc][Mm][Tt][Kk].-[ _-]?(%d)%.?(%d)%.?(%d)")
+    if a and b and c then return string.format("%s.%s.%s", a,b,c) end
+
+    a,b,c = s:match("[Dd][Cc][Mm][Tt][Kk][ _-]?(%d)%.?(%d)%.?(%d)")
+    if a and b and c then return string.format("%s.%s.%s", a,b,c) end
+
+    -- DCMTK-3.6.8 / OFFIS_DCMTK_3.6.9
+    local sem = s:match("[Dd][Cc][Mm][Tt][Kk][%s_%-/]*([%d]+%.%d+%.%d+)")
+              or s:match("[Oo][Ff][Ff][Ii][Ss].-[Dd][Cc][Mm][Tt][Kk][%s_%-/]*([%d]+%.%d+%.%d+)")
+    if sem then return sem end
+
+    -- Raw 3-digit only when we already believe it's DCMTK
+    local ddd = s:match("(%d%d%d)")
+    if ddd then
+      local semv = ddd_to_semver(ddd)
+      if semv then return semv end
     end
   end
 
-  -- If the version contains "OFFIS" but didn't match specific DCMTK patterns above
-  if vendor == "DCMTK" and version_str:match("OFFIS") then -- Added vendor check for safety
-    -- Try to extract any 3-digit sequence
-    local version_numbers = version_str:match("(%d%d%d)")
-    if version_numbers and #version_numbers == 3 then
-      local major = version_numbers:sub(1,1)
-      local minor = version_numbers:sub(2,2)
-      local patch = version_numbers:sub(3,3)
-      stdnse.debug1("Matched generic OFFIS ddd format: %s.%s.%s", major, minor, patch)
-      return string.format("%s.%s.%s", major, minor, patch)
+  -- pynetdicom
+  if v == "pynetdicom" or s:find("PYNETDICOM") or s:lower():find("pynetdicom") then
+    -- PYNETDICOM_210
+    local ddd = s:match("PYNETDICOM[_-](%d%d%d)$")
+    if ddd then
+      local semv = ddd_to_semver(ddd)
+      if semv then return semv end
+    end
+    -- pynetdicom/2.1.1 or pynetdicom 2.0.2 or PYNETDICOM 1.5.0
+    local sem = s:match("[Pp][Yy][Nn][Ee][Tt][Dd][Ii][Cc][Oo][Mm][%s/:-]+([%d]+%.%d+%.%d+)")
+             or s:match("[Pp][Yy][Nn][Ee][Tt][Dd][Ii][Cc][Oo][Mm][%s/:-]+([%d]+%.%d+)")
+    if sem then return sem end
+  end
+
+  -- dcm4che
+  if v == "dcm4che" or s:lower():find("dcm4che") then
+    local sem = s:match("dcm4che[%w-]*[%s/:-]+([%d]+%.%d+%.%d+)")
+    if sem then return sem end
+  end
+
+  -- Orthanc
+  if v == "orthanc" or s:lower():find("orthanc") then
+    local sem = s:match("[Oo]rthanc[%s%-/]*[vV]?([%d]+%.%d+%.%d+)")
+             or s:match("[Oo]rthanc[%s%-/]*[vV]?([%d]+%.%d+)")
+    if sem then return sem end
+  end
+
+  -- OsiriX / Horos
+  if v == "osirix" or v == "horos" or s:lower():find("osirix") or s:lower():find("horos") then
+    local sem = s:match("[vV]([%d]+%.%d+%.%d+)")
+             or s:match("([%d]+%.%d+%.%d+)")
+             or s:match("([%d]+%.%d+)")
+    if sem then return sem end
+  end
+
+  -- ClearCanvas
+  if v == "clearcanvas" or s:find("ClearCanvas") then
+    -- Prefer Major.Minor.Build if present (e.g., ClearCanvas_2.0.12345.37893 -> 2.0.12345)
+    local maj, min, build = s:match("ClearCanvas[_-](%d+)%.(%d+)%.(%d+)")
+    if maj and min and build then
+      return string.format("%s.%s.%s", maj, min, build)
+    end
+    -- Fallback to Major.Minor
+    maj, min = s:match("ClearCanvas[_-](%d+)%.(%d+)")
+    if maj and min then
+      return string.format("%s.%s", maj, min)
+    end
+    -- Or any semver present
+    local sem = s:match("([%d]+%.%d+%.%d+)") or s:match("([%d]+%.%d+)")
+    if sem then return sem end
+  end
+
+  -- ======================
+  -- Generic fallbacks
+  -- ======================
+
+  -- Try standard X.Y.Z first
+  local sem = s:match("(%d+%.%d+%.%d+)")
+  if sem then return sem end
+
+  -- Then X.Y
+  sem = s:match("(%d+%.%d+)")
+  if sem then return sem end
+
+  -- As a very last resort, if vendor strongly hints DCMTK and we only have 3 digits anywhere
+  if v == "dcmtk" then
+    local ddd = s:match("(%d%d%d)")
+    if ddd then
+      local semv = ddd_to_semver(ddd)
+      if semv then return semv end
     end
   end
 
-  -- Horos/OsiriX versions
-  if vendor == "Horos" or vendor == "OsiriX" then
-    -- Format: Horos-v3.3.6 or OsiriX-v9.0.2
-    local ver = version_str:match("[vV](%d+%.%d+%.%d+)") -- Allow V or v
-    if ver then
-        stdnse.debug1("Matched Horos/OsiriX format: %s", ver)
-        return ver
-    end
-      -- Try matching without 'v' prefix as well
-      ver = version_str:match("(%d+%.%d+%.%d+)")
-      if ver then
-        stdnse.debug1("Matched Horos/OsiriX numeric format: %s", ver)
-        return ver
-      end
-  end
-
-  -- ClearCanvas versions
-  if vendor == "ClearCanvas" then
-    -- Format: ClearCanvas_2.0.12345.37893
-    local major, minor = version_str:match("ClearCanvas_(%d+)%.(%d+)")
-    if major and minor then
-      local build = version_str:match("ClearCanvas_%d+%.%d+%.(%d+)")
-      if build then
-        stdnse.debug1("Matched ClearCanvas format (Major.Minor.Build): %s.%s.%s", major, minor, build)
-        return string.format("%s.%s.%s", major, minor, build)
-      end
-      stdnse.debug1("Matched ClearCanvas format (Major.Minor): %s.%s", major, minor)
-      return string.format("%s.%s", major, minor)
-    end
-  end
-
-  if vendor == "pynetdicom" then
-    -- *** ADDED BLOCK for PYNETDICOM_ddd format (e.g., PYNETDICOM_210) ***
-    local digits = version_str:match("PYNETDICOM_(%d%d%d)$")
-    if digits and #digits == 3 then
-        local major = digits:sub(1,1)
-        local minor = digits:sub(2,2)
-        local patch = digits:sub(3,3)
-        stdnse.debug1("Matched PYNETDICOM_ddd format: %s.%s.%s", major, minor, patch)
-        return string.format("%s.%s.%s", major, minor, patch)
-    end
-
-    local major, minor, patch = version_str:match("PYNETDICOM_(%d)%.(%d)%.(%d)") -- Assuming dots if not _ddd
-    if major and minor and patch then
-      stdnse.debug1("Matched PYNETDICOM_X.Y.Z format: %s.%s.%s", major, minor, patch)
-      return string.format("%s.%s.%s", major, minor, patch)
-    end
-    major, minor = version_str:match("PYNETDICOM_(%d)%.(%d)") -- Assuming dots if not _ddd
-    if major and minor then
-      stdnse.debug1("Matched PYNETDICOM_X.Y format: %s.%s", major, minor)
-      return string.format("%s.%s", major, minor)
-    end
-  end
-
-  if vendor == "DCM4CHE" then
-    local version = version_str:match("dcm4che%-(%d+%.%d+%.%d+)")
-    if version then
-        stdnse.debug1("Matched dcm4che-X.Y.Z format: %s", version)
-        return version
-    end
-  end
-
-  -- Generic version detection: Try standard X.Y.Z format first
-  local version = version_str:match("(%d+%.%d+%.%d+)")
-  if version then
-    stdnse.debug1("Matched generic X.Y.Z format: %s", version)
-    return version
-  end
-
-  -- Try just X.Y format
-  version = version_str:match("(%d+%.%d+)")
-  if version then
-    stdnse.debug1("Matched generic X.Y format: %s", version)
-    return version
-  end
-
-  -- If all else fails, return the cleaned original string
-  stdnse.debug1("No specific version format matched for '%s'. Returning as is.", version_str)
-  return version_str
+  -- Nothing matched; return cleaned original so caller can still display something
+  stdnse.debug2("extract_clean_version: no pattern matched for '%s' (vendor='%s')", s, v or "nil")
+  return s
 end
+
 
 ---
 -- associate(host, port) Attempts to associate to a DICOM Service Provider by sending an A-ASSOCIATE request.
@@ -521,17 +523,31 @@ function associate(host, port, calling_aet, called_aet)
     local received_version_str, received_uid_str
     local parsed_vendor, parsed_clean_version
 
-    -- Build application_context, presentation_context, userinfo_context
-    local application_context_name = "1.2.840.10008.3.1.1.1"
-    application_context = string.pack(">B B s2", 0x10, 0x0, application_context_name)
+    -- Application Context (0x10)
+    local ac_name = "1.2.840.10008.3.1.1.1"
+    local application_context = string.pack(">B B I2", 0x10, 0x00, #ac_name) .. ac_name
 
-    local abstract_syntax_name = "1.2.840.10008.1.1"
-    local transfer_syntax_name = "1.2.840.10008.1.2"
-    presentation_context = string.pack(">B B I2 B B B B B B s2 B B s2", 0x20, 0x0, 0x2e, 0x1, 0x0,0x0,0x0, 0x30, 0x0, abstract_syntax_name, 0x40, 0x0, transfer_syntax_name)
+    -- Presentation Context (0x20) with Abstract Syntax (0x30) + Transfer Syntax (0x40)
+    local as_name = "1.2.840.10008.1.1"
+    local ts_name = "1.2.840.10008.1.2" -- Implicit VR Little Endian
 
-    local implementation_id = "1.2.276.0.7230010.3.0.3.6.2" -- Client info
-    local implementation_version = "OFFIS_DCMTK_362"      -- Client info
-    userinfo_context = string.pack(">B B I2 B B I2 I4 B B s2 B B s2", 0x50, 0x0, 0x3a, 0x51, 0x0, 0x04, 0x4000, 0x52, 0x0, implementation_id, 0x55, 0x0, implementation_version)
+    local pcid = 1
+    local abstract_syntax = string.pack(">B B I2", 0x30, 0x00, #as_name) .. as_name
+    local transfer_syntax = string.pack(">B B I2", 0x40, 0x00, #ts_name) .. ts_name
+    local pc_value = string.pack(">B B B", pcid, 0x00, 0x00) .. abstract_syntax .. transfer_syntax
+    local presentation_context = string.pack(">B B I2", 0x20, 0x00, #pc_value) .. pc_value
+
+    -- User Information (0x50): 0x51 Max PDU, 0x52 Impl UID, 0x55 Impl Version
+    local implementation_id = "1.2.276.0.7230010.3.0.3.6.2"
+    local implementation_version = "OFFIS_DCMTK_362"
+    local max_pdu = 0x4000
+
+    local ui_51 = string.pack(">B B I2 I4", 0x51, 0x00, 4, max_pdu)
+    local ui_52 = string.pack(">B B I2",     0x52, 0x00, #implementation_id) .. implementation_id
+    local ui_55 = string.pack(">B B I2",     0x55, 0x00, #implementation_version) .. implementation_version
+
+    local ui_value = ui_51 .. ui_52 .. ui_55
+    local userinfo_context = string.pack(">B B I2", 0x50, 0x00, #ui_value) .. ui_value
 
     local called_ae_title_val = called_aet or stdnse.get_script_args("dicom.called_aet") or "ANY-SCP"
     local calling_ae_title_val = calling_aet or stdnse.get_script_args("dicom.calling_aet") or "ECHOSCU"
@@ -591,7 +607,7 @@ function associate(host, port, calling_aet, called_aet)
     parsed_clean_version = nil -- This will hold the final cleaned version
 
     if received_uid_str then
-        local vendor_result, version_part_from_uid = identify_vendor_from_uid(received_uid_str)
+        local vendor_result = identify_vendor_from_uid(received_uid_str)
         if vendor_result then parsed_vendor = vendor_result end -- Assign vendor based on UID
         if received_version_str then
             -- Clean the full string from field 0x55 if available
@@ -618,7 +634,6 @@ function associate(host, port, calling_aet, called_aet)
       stdnse.debug1("Only received_version_str ('%s') available for cleaning. Result: %s",
                     received_version_str, parsed_clean_version or "nil")
     end
-
 
     -- Final debug log before returning from pcall's function
     stdnse.debug1("Parsed values - Clean Version: %s, Raw UID: %s, Vendor: %s",

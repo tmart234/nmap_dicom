@@ -47,7 +47,7 @@ For this script we only send the A-ASSOCIATE request and look for the success co
 
 author = "Paulino Calderon <calderon()calderonpale.com>, Tyler M <tmart234()gmail.com>"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
-categories = {"discovery", "default", "safe", "auth"}
+categories = {"discovery", "default", "safe"}
 
 local shortport = require "shortport"
 local dicom = require "dicom"
@@ -167,9 +167,9 @@ action = function(host, port)
     output.vendor = vendor
 
     -- Orthanc-specific REST check for version confirmation/refinement
-    if vendor == "Orthanc" then
+    local try_rest = stdnse.get_script_args("dicom-ping.try-orthanc-rest")
+    if try_rest and vendor == "Orthanc" then  
       stdnse.debug1("Detected Orthanc, trying REST API for version...")
-
       -- Ports to try for Orthanc REST API (common default and the DICOM port itself)
       local ports_to_try = {8042, port.number}
       local orthanc_version_found = false

@@ -111,11 +111,12 @@ COPY --from=builder ${TEMP_CONFIG_DIR}/dicom.ini.default     /opt/conquest/defau
 COPY --from=builder ${TEMP_CONFIG_DIR}/acrnema.map.default   /opt/conquest/defaults/acrnema.map.default
 COPY --from=builder ${TEMP_CONFIG_DIR}/dgatesop.lst.default  /opt/conquest/defaults/dgatesop.lst.default
 COPY --from=builder ${TEMP_CONFIG_DIR}/dicom.sql.default     /opt/conquest/defaults/dicom.sql.default
-
-# Dictionary (also as a default so volume doesn't mask it)
 COPY --from=builder ${CONQUEST_SRC_DIR}/dgate.dic            /opt/conquest/defaults/dgate.dic
 
-# Bootstrap entrypoint: copy defaults into /opt/conquest/config if missing, then exec dgate from that dir
+# Bootstrap entrypoint:
+#  - Ensure config files exist in /opt/conquest/config
+#  - Create SYMLINKS in /usr/local/bin so dgate finds dicom.ini & dgate.dic where it expects them
+#  - Start dgate
 RUN printf '%s\n' \
 '#!/bin/sh' \
 'set -e' \
@@ -127,12 +128,12 @@ RUN printf '%s\n' \
 '[ -f "$CFG/acrnema.map" ]   || cp "$DEF/acrnema.map.default"    "$CFG/acrnema.map"' \
 '[ -f "$CFG/dgatesop.lst" ]  || cp "$DEF/dgatesop.lst.default"   "$CFG/dgatesop.lst"' \
 '[ -f "$CFG/dicom.sql" ]     || cp "$DEF/dicom.sql.default"      "$CFG/dicom.sql"' \
-'echo "Using config dir: $CFG"; ls -l "$CFG" || true' \
-'cd "$CFG"' \
+'ln -sf "$CFG/dicom.ini" /usr/local/bin/dicom.ini' \
+'ln -sf "$CFG/dgate.dic" /usr/local/bin/dgate.dic' \
+'echo "Config prepared in $CFG:"; ls -l "$CFG" || true' \
 'exec /usr/local/bin/dgate -v' \
 > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
-# Keep your data dir as the workdir; we `cd` to CFG only for starting dgate
 WORKDIR /opt/conquest/data
 EXPOSE 5678
 

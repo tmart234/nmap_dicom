@@ -115,7 +115,7 @@ COPY --from=builder ${TEMP_CONFIG_DIR}/dicom.sql.default     /opt/conquest/defau
 # Dictionary (also as a default so volume doesn't mask it)
 COPY --from=builder ${CONQUEST_SRC_DIR}/dgate.dic            /opt/conquest/defaults/dgate.dic
 
-# Bootstrap entrypoint: copy defaults into /opt/conquest/config if missing, then exec dgate
+# Bootstrap entrypoint: copy defaults into /opt/conquest/config if missing, then exec dgate from that dir
 RUN printf '%s\n' \
 '#!/bin/sh' \
 'set -e' \
@@ -128,9 +128,11 @@ RUN printf '%s\n' \
 '[ -f "$CFG/dgatesop.lst" ]  || cp "$DEF/dgatesop.lst.default"   "$CFG/dgatesop.lst"' \
 '[ -f "$CFG/dicom.sql" ]     || cp "$DEF/dicom.sql.default"      "$CFG/dicom.sql"' \
 'echo "Using config dir: $CFG"; ls -l "$CFG" || true' \
-'exec /usr/local/bin/dgate -v "-c$CFG/dicom.ini"' \
+'cd "$CFG"' \
+'exec /usr/local/bin/dgate -v' \
 > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
+# Keep your data dir as the workdir; we `cd` to CFG only for starting dgate
 WORKDIR /opt/conquest/data
 EXPOSE 5678
 

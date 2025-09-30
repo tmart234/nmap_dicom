@@ -79,8 +79,8 @@ local VENDOR_UID_PATTERNS = {
   {"^1%.2%.124%.113532%.",                    "Merge Healthcare"},
 
   -- Community PACS
-  {"^1%.2%.826%.0%.1%.3680043%.",             "ConQuest"},
-  {"^1%.3%.46%.670589%.",                     "Phillips"},
+  {"^1%.2%.826%.0%.1%.3680043%.2%.135%.1066%.101$", "ConQuest"},
+  {"^1%.3%.46%.670589%.",                     "Philips"},
 }
 
 ---
@@ -169,12 +169,13 @@ end
 ---
 function pdu_header_encode(pdu_type, length)
   -- Some simple sanity checks, we do not check ranges to allow users to create malformed packets.
-  if not(type(pdu_type)) == "number" then
+  if type(pdu_type) ~= "number" then
     return false, "PDU Type must be an unsigned integer. Range:0-7"
   end
-  if not(type(length)) == "number" then
+  if type(length) ~= "number" then
     return false, "Length must be an unsigned integer."
   end
+
 
   local header = string.pack(">B B I4",
                             pdu_type, -- PDU Type ( 1 byte - unsigned integer in Big Endian )
@@ -592,18 +593,13 @@ function associate(host, port, calling_aet, called_aet)
     parsed_clean_version = nil -- This will hold the final cleaned version
 
     if received_uid_str then
-        local vendor_result, version_part_from_uid = identify_vendor_from_uid(received_uid_str)
-        if vendor_result then parsed_vendor = vendor_result end -- Assign vendor based on UID
-        if received_version_str then
-            -- Clean the full string from field 0x55 if available
-            parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
-            stdnse.debug1("Using received_version_str ('%s') for cleaning. Result: %s", received_version_str, parsed_clean_version or "nil")
-        elseif version_part_from_uid then
-            -- Fallback to UID part only if full version string is missing
-            parsed_clean_version = extract_clean_version(version_part_from_uid, parsed_vendor)
-            stdnse.debug1("No received_version_str. Using version_part_from_uid ('%s') for cleaning. Result: %s", version_part_from_uid, parsed_clean_version or "nil")
-        end
-        -- *** END MODIFIED LOGIC ***
+      local vendor_result = identify_vendor_from_uid(received_uid_str)
+      if vendor_result then parsed_vendor = vendor_result end
+      if received_version_str then
+        parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
+        stdnse.debug1("Using received_version_str ('%s') for cleaning. Result: %s",
+                      received_version_str, parsed_clean_version or "nil")
+      end
 
     elseif received_version_str then
       -- No (useful) UID vendor — try the version string

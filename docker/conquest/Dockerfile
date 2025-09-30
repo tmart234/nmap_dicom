@@ -107,7 +107,7 @@ RUN printf '%s\n' \
 'set -e' \
 'CFG=/opt/conquest/config' \
 'DEF=/opt/conquest/defaults' \
-'mkdir -p "$CFG" /opt/conquest/data"' \
+'mkdir -p "$CFG" /opt/conquest/data' \ 
 '[ -f "$CFG/dgate.dic" ]     || cp "$DEF/dgate.dic"            "$CFG/dgate.dic"' \
 '[ -f "$CFG/dicom.ini" ]     || cp "$DEF/dicom.ini.default"    "$CFG/dicom.ini"' \
 '[ -f "$CFG/acrnema.map" ]   || cp "$DEF/acrnema.map.default"  "$CFG/acrnema.map"' \

@@ -137,17 +137,32 @@ function receive(dcm)
 
   -- Read at least 6 bytes (header). Nsock may return more.
   local ok1, chunk = sock:receive_bytes(6)
-  if ok1 == false then return false, chunk end
-  if #chunk < 6 then return false, "Short PDU header" end
+  if ok1 == false then
+    -- Preserve original nsock error string, but make it clearer
+    return false, ("No response / header read failed: %s"):format(chunk or "EOF/timeout")
+  end
+  if #chunk < 6 then
+    return false, "No response (connection closed before header)"
+  end
 
   local header = chunk:sub(1, 6)
   local pdu_type, _, pdu_length = string.unpack(">B B I4", header)
-  -- sanity on PDU type and length
-  if pdu_length < 0 or pdu_length > MAX_SIZE_PDU then
-    return false, ("Unreasonable PDU length: %d"):format(pdu_length)
+
+  -- First: ensure this looks like an association-related PDU we expect
+  -- (AC=0x02, RJ=0x03, ABORT=0x07, DATA=0x04 is unexpected here but tolerate)
+  local known = PDU_NAMES[pdu_type] ~= nil
+  if not known then
+    -- Some servers just close without sending anything; if we got junk,
+    -- return a clearer error instead of a scary length message.
+    return false, ("Unexpected/unknown PDU type: %d"):format(pdu_type)
   end
-  if not PDU_NAMES[pdu_type] then
-    return false, ("Unknown PDU type: %d"):format(pdu_type)
+
+  -- Then: sanity on declared body length.
+  -- Be tolerant here—some stacks lie or split—but still guard absurd values.
+  -- Raise ceiling to 1 MiB to avoid false positives on partial reads.
+  local MAX_REASONABLE_PDU = 1024 * 1024
+  if pdu_length < 0 or pdu_length > MAX_REASONABLE_PDU then
+    return false, ("Unreasonable PDU length: %d"):format(pdu_length)
   end
 
   -- Anything past the first 6 bytes is already part of the body
@@ -613,13 +628,7 @@ function associate(host, port, calling_aet, called_aet)
             -- Clean the full string from field 0x55 if available
             parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
             stdnse.debug1("Using received_version_str ('%s') for cleaning. Result: %s", received_version_str, parsed_clean_version or "nil")
-        elseif version_part_from_uid then
-            -- Fallback to UID part only if full version string is missing
-            parsed_clean_version = extract_clean_version(version_part_from_uid, parsed_vendor)
-            stdnse.debug1("No received_version_str. Using version_part_from_uid ('%s') for cleaning. Result: %s", version_part_from_uid, parsed_clean_version or "nil")
         end
-        -- *** END MODIFIED LOGIC ***
-
     elseif received_version_str then
       -- No (useful) UID vendor — try the version string
       if vendor == nil then

@@ -59,15 +59,14 @@ end
 -- Define vendor UIDs lookup table with patterns (matching base prefixes only)
 local VENDOR_UID_PATTERNS = {
   -- DCMTK / OFFIS (org root: 1.2.276.0.7230010)
-  {"^1%.2%.276%.0%.7230010(%.)", "DCMTK"},
+  {"^1%.2%.276%.0%.7230010%.",                "DCMTK"},
   {"^1%.2%.826%.0%.1%.3680043%.8%.641%.",     "Orthanc"},       -- Orthanc branch
-  {"^1%.4%.3%.6%.1%.4%.1%.78293%.3%.1",       "Orthanc"},        -- Orthanc base
+  {"^1%.4%.3%.6%.1%.4%.1%.78293%.",       "Orthanc"},        -- Orthanc base
   {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.",    "OsiriX"},        -- OsiriX branch
   {"^1%.3%.46%.670589%.",                    "Conquest PACS"},       -- Conquest PACS base
   {"^1%.2%.40%.0%.13%.1%.3%.",               "dcm4che"}, 
   {"^1%.2%.826%.0%.1%.3680043%.9%.3811",    "pynetdicom"},       -- dcm4chee base
   {"^1%.2%.840%.113619%.",                  "GE Healthcare"},-- GE base
-  {"^1%.3%.12%.2%.1107%.5%.99",           "Siemens Syngo"},  -- Siemens Syngo base
   {"^1%.3%.12%.2%.1107%.",                "Siemens"},        -- Other Siemens base
   {"^1%.2%.124%.113532%.",            "Merge Healthcare"},-- Merge PACS base
   {"^1%.2%.826%.0%.1%.3680043%.",       "ClearCanvas"},    -- ClearCanvas base

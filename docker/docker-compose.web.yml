@@ -15,6 +15,11 @@ services:
       ORTHANC__VERBOSE_STARTUP: "true"
     volumes:
       - orthanc_db:/var/lib/orthanc/db
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8042/system"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
   viewer:
     image: ohif/app:latest      # new OHIF image name
@@ -24,6 +29,34 @@ services:
     environment:
       - PUBLIC_URL=/            # fine for local
     # OHIF can run without a DICOMweb config for our detection; no volume needed.
+
+  db:
+    image: dcm4che/postgres-dcm4chee:latest
+    environment:
+      - POSTGRES_DB=pacsdb
+      - POSTGRES_USER=pacs
+      - POSTGRES_PASSWORD=pacs
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "pacs"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  dcm4chee:
+    image: dcm4che/dcm4chee-arc-psql:latest
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - POSTGRES_DB=pacsdb
+      - POSTGRES_USER=pacs
+      - POSTGRES_PASSWORD=pacs
+      - POSTGRES_HOST=db
+      - DCM4CHEE_ARC_AET=DCM4CHEE
+      - WILDFLY_BIND_ADDRESS=0.0.0.0
+      - HTTP_PORT=8080
+    ports:
+      - "8080:8080"
 
 volumes:
   orthanc_db:

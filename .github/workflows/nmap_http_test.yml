@@ -14,96 +14,78 @@ jobs:
       matrix:
         target:
           - name: orthanc-web
+            compose: docker/docker-compose.web.yml
             service: orthanc
-            host_port: 8042
-            expect: version
-            nmap_args: "--script-args dicom-http.user=orthanc,dicom-http.pass=orthanc"
+            port: 8042
+            expect: "Orthanc REST API: /system (version"
           - name: ohif-viewer
+            compose: docker/docker-compose.web.yml
             service: viewer
-            host_port: 3000
-            expect: ohif_viewer
-            nmap_args: ""
+            port: 3000
+            expect: "OHIF Viewer: detected at /"
+          - name: dcm4chee-arc-web
+            compose: docker/docker-compose.web.yml
+            service: dcm4chee
+            port: 8080
+            expect: "DCM4CHEE Archive UI: /dcm4chee-arc/ui2/"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y nmap docker-compose netcat-openbsd
+          sudo apt-get install -y nmap docker-compose
 
-      - name: Install dicom-http NSE
+      - name: Install NSE
         run: |
           sudo mkdir -p /usr/share/nmap/scripts
-          sudo cp scripts/dicom-http.nse /usr/share/nmap/scripts/
+          sudo cp scripts/dicom-web-info.nse /usr/share/nmap/scripts/
           sudo nmap --script-updatedb
 
-      - name: Pull latest image (${{ matrix.target.name }})
-        run: |
-          docker-compose -f docker/docker-compose.web.yml pull ${{ matrix.target.service }} || true
-
-      - name: Start service (${{ matrix.target.name }})
+      - name: Up ${{ matrix.target.name }}
         run: |
           set -e
-          docker-compose -f docker/docker-compose.web.yml up -d --remove-orphans ${{ matrix.target.service }}
-          # wait for container
-          for i in {1..12}; do
-            STATUS=$(docker-compose -f docker/docker-compose.web.yml ps -q ${{ matrix.target.service }} | xargs docker inspect --format='{{.State.Status}}' 2>/dev/null || echo "notfound")
-            if [ "$STATUS" = "running" ]; then break; fi
-            echo "Waiting for service to run... ($i/12)"; sleep 5
-          done
-          # wait for port
-          for i in {1..12}; do
-            if nc -z localhost ${{ matrix.target.host_port }}; then
-              echo "Port ${{ matrix.target.host_port }} open."; break
-            fi
-            echo "Waiting for port ${{ matrix.target.host_port }}... ($i/12)"; sleep 5
-          done
+          docker-compose -f ${{ matrix.target.compose }} up -d ${{ matrix.target.service }}
+          if [ "${{ matrix.target.name }}" = "dcm4chee-arc-web" ]; then
+            # WildFly + app boot can be slow: poll the UI2 endpoint up to 3 min
+            for i in {1..36}; do
+              if curl -fsS "http://localhost:8080/dcm4chee-arc/ui2/" >/dev/null; then break; fi
+              sleep 5
+            done
+          else
+            sleep 15
+          fi
+          nc -zv localhost ${{ matrix.target.port }}
 
-      - name: Nmap dicom-http (${{ matrix.target.name }})
+      - name: Scan ${{ matrix.target.name }}
         id: scan
         run: |
           set -o pipefail
           OUT="nmap_http_${{ matrix.target.name }}.txt"
-          nmap -p ${{ matrix.target.host_port }} --script dicom-http ${{ matrix.target.nmap_args }} localhost | tee "$OUT"
+          nmap -p ${{ matrix.target.port }} --script dicom-web-info localhost | tee "$OUT"
           echo "out=$OUT" >> $GITHUB_OUTPUT
 
-      - name: Assert output (${{ matrix.target.name }})
+      - name: Assert ${{ matrix.target.name }} output
         run: |
-            OUT="${{ steps.scan.outputs.out }}"
-            case "${{ matrix.target.expect }}" in
-            version)
-                # accept lines starting with '|' or '|_'
-                if ! grep -Eq '^\|( |_)\s+version:\s*\S' "$OUT"; then
-                echo "::error::Missing 'version:' in dicom-http output for Orthanc"
-                tail -n 200 "$OUT" || true
-                exit 1
-                fi
-                ;;
-            ohif_viewer)
-                if ! grep -Ei '^\|\s+ohif_viewer:\s*detected|^\|_\s+ohif_viewer:\s*detected' "$OUT"; then
-                echo "::error::Missing 'ohif_viewer: detected' in dicom-http output"
-                tail -n 200 "$OUT" || true
-                exit 1
-                fi
-                ;;
-            *)
-                echo "::error::Unknown expectation"; exit 1;;
-            esac
+          OUT="${{ steps.scan.outputs.out }}"
+          grep -E '^\|[[:space:]]+${{ matrix.target.expect }}' "$OUT" || {
+            echo "::error::Missing expected pattern: ${{ matrix.target.expect }}"
+            sed -n '1,200p' "$OUT" || true
+            exit 1
+          }
 
-      - name: Upload Nmap output (${{ matrix.target.name }})
+      - name: Upload ${{ matrix.target.name }} artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: nmap-http-${{ matrix.target.name }}
           path: ${{ steps.scan.outputs.out }}
-          if-no-files-found: warn
 
-      - name: Logs (${{ matrix.target.name }})
+      - name: Logs ${{ matrix.target.name }}
         if: always()
-        run: docker-compose -f docker/docker-compose.web.yml logs --tail=200 ${{ matrix.target.service }} || true
+        run: docker-compose -f ${{ matrix.target.compose }} logs --tail=200 ${{ matrix.target.service }} || true
 
-      - name: Teardown
+      - name: Down ${{ matrix.target.name }}
         if: always()
-        run: docker-compose -f docker/docker-compose.web.yml down --volumes --remove-orphans
+        run: docker-compose -f ${{ matrix.target.compose }} down -v --remove-orphans

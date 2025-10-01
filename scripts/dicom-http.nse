@@ -1,114 +1,147 @@
--- scripts/dicom-http.nse
+-- dicom-web-info.nse
 --[[
-Detect Orthanc REST (report version) and/or OHIF Viewer over HTTP(S).
+Detects DICOM-related HTTP endpoints:
+ - Orthanc REST API (/system) and extracts version if readable
+ - OHIF Viewer (static frontend)
+ - dcm4chee-arc UI2 (admin console)
 
 @usage
-nmap -p8042 --script dicom-http --script-args dicom-http.user=orthanc,dicom-http.pass=orthanc <target>
-nmap -p3000 --script dicom-http <target>
+nmap -p 8042,3000,8080 --script dicom-web-info <target>
+nmap --script dicom-web-info --script-args dicom-web.ports=8042,3000,8080,dicom-web.orthanc.user=foo,dicom-web.orthanc.pass=bar <target>
+
+@args dicom-web.ports            Comma-separated list of ports to test (optional)
+@args dicom-web.orthanc.user     Basic auth user for Orthanc (optional)
+@args dicom-web.orthanc.pass     Basic auth pass for Orthanc (optional)
 
 @output
-PORT     STATE SERVICE
-8042/tcp open  http
-| dicom-http:
-|   orthanc_rest: reachable
-|_  version: 1.12.9
-
-PORT     STATE SERVICE
-3000/tcp open  http
-|_dicom-http: ohif_viewer: detected
-]]
-
-author = "Tyler M"
+| dicom-web-info:
+|   Orthanc REST API: /system (version 1.12.9)
+|   DCM4CHEE Archive UI: /dcm4chee-arc/ui2/ (authentication required)
+|_  OHIF Viewer: detected at /
+]] author = "Tyler M"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
-categories = {"discovery","safe","version"}
+categories = {"discovery", "safe", "version"}
 
 local shortport = require "shortport"
-local http      = require "http"
-local stdnse    = require "stdnse"
-local string    = require "string"
-
--- base64 optional
-local base64_ok, base64 = pcall(require, "base64")
+local http = require "http"
+local stdnse = require "stdnse"
+local base64 = require "base64"
+local string = require "string"
+local json = require "json"
 
 local function parse_ports_arg(s)
-  if not s then return nil end
-  local t = {}
-  for p in string.gmatch(s, "%d+") do t[tonumber(p)] = true end
-  return next(t) and t or nil
+    if not s then
+        return nil
+    end
+    local t = {}
+    for p in string.gmatch(s, "%d+") do
+        t[tonumber(p)] = true
+    end
+    return next(t) and t or nil
 end
 
 portrule = function(host, port)
-  if not (port.protocol == "tcp" and port.state == "open") then return false end
-  local set = parse_ports_arg(stdnse.get_script_args("dicom-http.ports"))
-  if set and set[port.number] then return true end
-  return shortport.port_or_service({80,443,8042,3000}, {"http","https"}, "tcp")(host, port)
-end
-
-local function get_header_ci(h, key)
-  if not h then return nil end
-  return h[key] or h[key:lower()] or h[key:upper()]
-end
-
-local function is_json(resp)
-  local ct = get_header_ci(resp.header, "content-type") or ""
-  if ct:lower():find("json", 1, true) then return true end
-  -- fallback heuristic: body starting with "{" and containing "Version"
-  if resp.body and resp.body:match("^%s*{") and resp.body:find("[Vv]ersion") then
-    return true
-  end
-  return false
-end
-
-local function try_http(host, port, path, opts)
-  local ok, resp = pcall(http.get, host, port, path, opts)
-  if not ok or not resp then return nil end
-  return resp
-end
-
-local function build_opts(user, pass)
-  local opts = { timeout = 5000, header = { ["Accept"] = "application/json, text/html" } }
-  if user and pass and base64_ok and base64 then
-    local enc = base64.encode or base64.enc
-    if enc then
-      opts.header["Authorization"] = "Basic " .. enc(user .. ":" .. pass)
+    if not (port.protocol == "tcp" and port.state == "open") then
+        return false
     end
-  end
-  return opts
+    local arg = stdnse.get_script_args("dicom-web.ports")
+    local set = parse_ports_arg(arg)
+    if set and set[port.number] then
+        return true
+    end
+    return shortport.port_or_service({80, 443, 8042, 3000, 8080}, {"http", "https"}, "tcp")(host, port)
 end
 
 action = function(host, port)
-  local out = stdnse.output_table()
+    local results = {}
 
-  local user = stdnse.get_script_args("dicom-http.user")
-  local pass = stdnse.get_script_args("dicom-http.pass")
-  local opts = build_opts(user, pass)
+    -- Common opts; enable TLS if needed
+    local use_ssl = shortport.ssl(host, port)
+    local opts = {
+        timeout = 5000,
+        header = {
+            ["Accept"] = "application/json, */*"
+        },
+        ssl = use_ssl
+    }
 
-  -- 1) Orthanc REST detection: must be JSON AND contain "Version"
-  do
-    local resp = try_http(host, port, "/system", opts)
-    if resp and resp.status == 200 and resp.body and is_json(resp) then
-      local ver = resp.body:match('"%s*[Vv]ersion%s*"%s*:%s*"([^"]+)"')
-      if ver then
-        out.orthanc_rest = "reachable"
-        out.version = ver
-        return out
-      end
-      -- If JSON but no Version, treat as not Orthanc and keep checking
+    -- Orthanc /system
+    do
+        local path = "/system"
+        local user = stdnse.get_script_args("dicom-web.orthanc.user")
+        local pass = stdnse.get_script_args("dicom-web.orthanc.pass")
+        local o = {
+            timeout = 5000,
+            ssl = use_ssl,
+            header = {
+                ["Accept"] = "application/json"
+            }
+        }
+        if user and pass then
+            o.header["Authorization"] = "Basic " .. base64.encode(user .. ":" .. pass)
+        end
+        local ok, resp = pcall(http.get, host, port, path, o)
+        if ok and resp and resp.status then
+            if resp.status == 200 and resp.body then
+                local ct = resp.header and (resp.header["Content-Type"] or resp.header["content-type"]) or ""
+                local is_json = ct:lower():find("application/json", 1, true) ~= nil
+                local ver
+                if is_json then
+                    local okj, j = pcall(json.parse, resp.body)
+                    if okj and type(j) == "table" and j["Version"] then
+                        ver = tostring(j["Version"])
+                    end
+                end
+                if ver then
+                    table.insert(results, string.format("Orthanc REST API: %s (version %s)", path, ver))
+                end
+            elseif resp.status == 401 or resp.status == 403 then
+                table.insert(results, string.format("Orthanc REST API: %s (authentication required)", path))
+            end
+        end
     end
-  end
 
-  -- 2) OHIF Viewer detection (root HTML)
-  do
-    local resp = try_http(host, port, "/", { timeout = 5000 })
-    if resp and resp.status and resp.body then
-      local body = resp.body
-      -- A few robust signals without being too specific
-      if body:find("OHIF") or body:find("ohif") or body:find("OHIF Viewer")
-         or body:find("window%.config") or body:find("app%-config%.js") then
-        return { ["ohif_viewer"] = "detected" }
-      end
+    -- dcm4chee-arc UI2
+    do
+        local candidates = {"/dcm4chee-arc/ui2/", "/dcm4chee-arc/ui2/index.html"}
+        for _, p in ipairs(candidates) do
+            local ok, resp = pcall(http.get, host, port, p, {
+                timeout = 5000,
+                ssl = use_ssl
+            })
+            if ok and resp and resp.status then
+                if resp.status == 200 then
+                    table.insert(results, string.format("DCM4CHEE Archive UI: %s", p))
+                    break
+                elseif resp.status == 302 or resp.status == 401 or resp.status == 403 then
+                    table.insert(results, string.format("DCM4CHEE Archive UI: %s (authentication required)", p))
+                    break
+                end
+            end
+        end
     end
-  end
 
-  return nil
+    -- OHIF Viewer
+    do
+        local ok, resp = pcall(http.get, host, port, "/", {
+            timeout = 5000,
+            ssl = use_ssl
+        })
+        if ok and resp and resp.status == 200 and resp.body then
+            if resp.body:find("app%-config%.js", 1, true) or resp.body:find("OHIF", 1, true) or
+                (resp.header and ((resp.header["X-Powered-By"] or ""):lower():find("ohif", 1, true) ~= nil)) then
+                table.insert(results, "OHIF Viewer: detected at /")
+            end
+        end
+    end
+
+    if #results == 0 then
+        return nil
+    end
+
+    local out = stdnse.output_table()
+    for _, line in ipairs(results) do
+        table.insert(out, line)
+    end
+    return out
 end

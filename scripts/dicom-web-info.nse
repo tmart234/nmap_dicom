@@ -36,7 +36,7 @@ local stdnse    = require "stdnse"
 local string    = require "string"
 local table     = require "table"
 
--- optional base64 module
+-- optional base64 module provided by Nmap (nselib/base64.lua)
 local base64_ok, base64 = pcall(require, "base64")
 
 -- -------------------- helpers --------------------
@@ -73,7 +73,7 @@ local function body_has(b, needle)
   return b and string.find(lc(b), lc(needle), 1, true) ~= nil
 end
 
--- Build Authorization: Basic ... (no http.basic_auth to satisfy strict.lua)
+-- Build Authorization: Basic ... (avoid undeclared globals)
 local function make_basic_auth(user, pass)
   if not (user and pass) then return nil end
   if base64_ok and base64 then
@@ -83,7 +83,7 @@ local function make_basic_auth(user, pass)
   return nil
 end
 
--- simple wrappers around http.generic_request (no unknown options keys!)
+-- minimal wrappers around http.generic_request (no unsupported option keys)
 local function http_get(host, port, path, hdr)
   local ok, resp = pcall(http.generic_request, host, port, "GET", path, {
     header = hdr or {},
@@ -107,7 +107,7 @@ end
 portrule = function(host, port)
   if not (port.protocol == "tcp" and port.state == "open") then return false end
   local set = parse_ports_arg(stdnse.get_script_args("dicom-web.ports"))
-  if set and set[port.number] then return true end
+  if set then return set[port.number] == true end
   return shortport.port_or_service({80, 443, 8042, 3000, 8080, 8443}, {"http","https"}, "tcp")(host, port)
 end
 
@@ -123,8 +123,8 @@ action = function(host, port)
   local do_stow  = truthy(stdnse.get_script_args("dicom-web.stow-test") or "false")
   local try_defs = truthy(stdnse.get_script_args("dicom-web.try-defaults") or "false")
 
-  -- TLS/HTTP hint
-  local is_tls = (port.tunnel == "ssl") or shortport.ssl(host, port)
+  -- TLS/HTTP hint (no explicit ssl/https option sent to http lib)
+  local is_tls = (port.tunnel == "ssl")
   if not is_tls then
     table.insert(warn, "Warning: HTTP (no TLS) detected")
   end
@@ -207,8 +207,8 @@ action = function(host, port)
 
   -- -------- OHIF detection (tolerant) --------
   do
-    local r = http_get(host, port, "/")
     local ohif = false
+    local r = http_get(host, port, "/")
     if r and r.status == 200 and r.body then
       if body_has(r.body, "ohif") or body_has(r.body, "app-config.js") then
         ohif = true
@@ -235,14 +235,14 @@ action = function(host, port)
     if not (r and r.status == 200 and r.body) then return false end
     local ct = lc(hget(r.header, "Content-Type") or "")
     if ct:find("application/dicom%+json", 1, false) then return true end
-    -- heuristic tags/fields commonly present in DICOM JSON
+    -- heuristic tags commonly present in DICOM JSON
     return body_has(r.body, '"StudyInstanceUID"')
         or body_has(r.body, '"SeriesInstanceUID"')
         or body_has(r.body, '"SOPInstanceUID"')
         or body_has(r.body, '"MainDicomTags"')
   end
 
-  if truthy(stdnse.get_script_args("dicom-web.qido-test") or "true") then
+  if do_qido then
     for _, b in ipairs(bases) do
       local path = b.base .. "/studies?limit=1"
       local r = http_get(host, port, path, { ["Accept"]="application/dicom+json" })
@@ -250,13 +250,13 @@ action = function(host, port)
         if is_dicom_json(r) then
           table.insert(warn, ("Insecure: Unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.name, path))
         elseif r.status == 401 or r.status == 403 then
-          -- secured, fine
+          -- secured, good
         end
       end
     end
   end
 
-  if truthy(stdnse.get_script_args("dicom-web.cors-test") or "true") then
+  if do_cors then
     for _, b in ipairs(bases) do
       local path = b.base .. "/studies?limit=0"
       local r = http_options(host, port, path, {
@@ -273,7 +273,7 @@ action = function(host, port)
     end
   end
 
-  if truthy(stdnse.get_script_args("dicom-web.stow-test") or "false") then
+  if do_stow then
     for _, b in ipairs(bases) do
       local path = b.base .. "/studies"
       local r = http_options(host, port, path, { ["Access-Control-Request-Method"] = "POST" })

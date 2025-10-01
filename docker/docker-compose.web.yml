@@ -7,11 +7,9 @@ services:
       - "8042:8042"      # HTTP
       - "4242:4242"      # DICOM
     environment:
-      # Orthanc creates a default "orthanc:orthanc" user if none provided.
-      # You can override explicitly if you want:
-      # ORTHANC__REGISTERED_USERS: |
-      #   {"orthanc": "orthanc"}
-      ORTHANC__REMOTE_ACCESS_ALLOWED: "true"
+      ORTHANC__REGISTERED_USERS__orthanc: orthanc
+      ORTHANC__DICOM_WEB__Enable: "true"
+      ORTHANC__RemoteAccessAllowed: "true"
       ORTHANC__VERBOSE_STARTUP: "true"
     volumes:
       - orthanc_db:/var/lib/orthanc/db

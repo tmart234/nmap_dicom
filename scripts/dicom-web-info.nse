@@ -2,27 +2,19 @@
 --[[
 Detects DICOM-related HTTP endpoints:
  - Orthanc REST API (/system) and extracts version if readable
- - OHIF Viewer (static frontend)
- - dcm4chee-arc UI2 (admin console)
+ - OHIF Viewer (static front-end)
+ - dcm4chee-arc UI2 (admin console) with strict fingerprinting
 
-@usage
-nmap -p 8042,3000,8080 --script dicom-web-info <target>
-nmap --script dicom-web-info --script-args dicom-web.ports=8042,3000,8080,dicom-web.orthanc.user=foo,dicom-web.orthanc.pass=bar <target>
+Usage:
+  nmap -p 8042,3000,8080 --script dicom-web-info <target>
+  nmap --script dicom-web-info --script-args dicom-web.ports=8042,3000,8080,dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc <target>
 
-@args dicom-web.ports            Comma-separated list of ports to test (optional)
-@args dicom-web.orthanc.user     Basic auth user for Orthanc (optional)
-@args dicom-web.orthanc.pass     Basic auth pass for Orthanc (optional)
-
-@output
-| dicom-web-info:
-|   Orthanc REST API: /system (version 1.12.9)
-|   DCM4CHEE Archive UI: /dcm4chee-arc/ui2/ (authentication required)
-|_  OHIF Viewer: detected at /
+Script classes: discovery, safe, version
 ]]
 
 author = "Tyler M"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
-categories = {"discovery", "safe", "version"}
+categories = {"discovery","safe","version"}
 
 local shortport = require "shortport"
 local http      = require "http"
@@ -30,13 +22,20 @@ local stdnse    = require "stdnse"
 local base64    = require "base64"
 local string    = require "string"
 
-local have_json, json = pcall(require, "json")
-
 local function parse_ports_arg(s)
   if not s then return nil end
   local t = {}
   for p in string.gmatch(s, "%d+") do t[tonumber(p)] = true end
   return next(t) and t or nil
+end
+
+local function lc(v) return (v or ""):lower() end
+local function has(h, k)
+  if not h then return nil end
+  return h[k] or h[string.lower(k)]
+end
+local function body_has(b, needle)
+  return b and string.find(string.lower(b), string.lower(needle), 1, true) ~= nil
 end
 
 portrule = function(host, port)
@@ -47,73 +46,69 @@ portrule = function(host, port)
 end
 
 action = function(host, port)
-  local results = {}
+  local out = stdnse.output_table()
+  local use_ssl = shortport.ssl(host, port)
 
-  -- best-effort TLS hint (don’t worry if unknown; our test ports are HTTP)
-  local use_ssl = (port.version and port.version.tunnel == "ssl") or (port.service_tunnel == "ssl")
-
-  -- -------- Orthanc /system --------
+  -- ---------- Orthanc ----------
   do
-    local path = "/system"
     local user = stdnse.get_script_args("dicom-web.orthanc.user")
     local pass = stdnse.get_script_args("dicom-web.orthanc.pass")
-    local o = { timeout = 5000, ssl = use_ssl, header = { ["Accept"] = "application/json" } }
+    local hdr  = { ["Accept"]="application/json" }
     if user and pass then
-      o.header["Authorization"] = "Basic " .. base64.encode(user .. ":" .. pass)
+      hdr["Authorization"] = "Basic " .. base64.encode(user .. ":" .. pass)
     end
-    local ok, resp = pcall(http.get, host, port, path, o)
+    local ok, resp = pcall(http.get, host, port, "/system", {timeout=5000, ssl=use_ssl, header=hdr})
     if ok and resp and resp.status then
       if resp.status == 200 and resp.body then
-        local ct = resp.header and (resp.header["Content-Type"] or resp.header["content-type"]) or ""
-        local is_json = ct:lower():find("application/json", 1, true) ~= nil
-        local ver
-        if is_json and have_json then
-          local okj, j = pcall(json.parse, resp.body)
-          if okj and type(j) == "table" and j["Version"] then ver = tostring(j["Version"]) end
-        end
+        local ver = resp.body:match('"[ ]*Version[ ]*"[ ]*:[ ]*"([^"]+)"')
         if ver then
-          results[#results+1] = string.format("Orthanc REST API: %s (version %s)", path, ver)
+          table.insert(out, ("Orthanc REST API: /system (version %s)"):format(ver))
+        else
+          table.insert(out, "Orthanc REST API: /system (reachable)")
         end
       elseif resp.status == 401 or resp.status == 403 then
-        results[#results+1] = string.format("Orthanc REST API: %s (authentication required)", path)
+        table.insert(out, "Orthanc REST API: /system (authentication required)")
       end
     end
   end
 
-  -- -------- dcm4chee-arc UI2 --------
+  -- ---------- dcm4chee-arc UI2 (be strict to avoid OHIF false positives) ----------
   do
-    local paths = { "/dcm4chee-arc/ui2/", "/dcm4chee-arc/ui2/index.html" }
+    local paths = {"/dcm4chee-arc/ui2/index.html", "/dcm4chee-arc/ui2/"}
     for _, p in ipairs(paths) do
-      local ok, resp = pcall(http.get, host, port, p, { timeout = 5000, ssl = use_ssl })
-      if ok and resp and resp.status then
-        if resp.status == 200 then
-          results[#results+1] = string.format("DCM4CHEE Archive UI: %s", p)
-          break
-        elseif resp.status == 302 or resp.status == 401 or resp.status == 403 then
-          results[#results+1] = string.format("DCM4CHEE Archive UI: %s (authentication required)", p)
+      local ok, resp = pcall(http.get, host, port, p, {timeout=5000, ssl=use_ssl})
+      if ok and resp and resp.status and resp.body then
+        local server = lc(has(resp.header, "Server") or "")
+        local loc    = lc(has(resp.header, "Location") or "")
+        local bdy    = lc(resp.body)
+        local looks_like_arc =
+           bdy:find("dcm4chee%-arc", 1, true) or
+           bdy:find("dcm4che", 1, true) or
+           server:find("wildfly", 1, true) or
+           server:find("undertow", 1, true) or
+           loc:find("/auth", 1, true)  -- keycloak redirect sometimes
+        if looks_like_arc then
+          if resp.status == 200 then
+            table.insert(out, "DCM4CHEE Archive UI: /dcm4chee-arc/ui2/")
+          else
+            table.insert(out, "DCM4CHEE Archive UI: /dcm4chee-arc/ui2/ (authentication required)")
+          end
           break
         end
       end
     end
   end
 
-  -- -------- OHIF Viewer --------
+  -- ---------- OHIF ----------
   do
-    local ok, resp = pcall(http.get, host, port, "/", { timeout = 5000, ssl = use_ssl })
+    local ok, resp = pcall(http.get, host, port, "/", {timeout=5000, ssl=use_ssl})
     if ok and resp and resp.status == 200 and resp.body then
-      local body = resp.body
-      local hdr = resp.header or {}
-      local powered = (hdr["X-Powered-By"] or hdr["x-powered-by"] or "")
-      if body:find("app%-config%.js", 1, true)
-        or body:find("OHIF", 1, true)
-        or powered:lower():find("ohif", 1, true) then
-        results[#results+1] = "OHIF Viewer: detected at /"
+      if body_has(resp.body, "OHIF") or body_has(resp.body, "app-config.js") then
+        table.insert(out, "OHIF Viewer: detected at /")
       end
     end
   end
 
-  if #results == 0 then return nil end
-  local out = stdnse.output_table()
-  for _, line in ipairs(results) do out[#out+1] = line end
+  if #out == 0 then return nil end
   return out
 end

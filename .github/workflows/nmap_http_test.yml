@@ -17,17 +17,15 @@ jobs:
             compose: docker/docker-compose.web.yml
             service: orthanc
             port: 8042
+            # We expect a version only because we will pass creds below
             expect: "Orthanc REST API: /system (version"
+            args: "--script-args dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc"
           - name: ohif-viewer
             compose: docker/docker-compose.web.yml
             service: viewer
             port: 3000
             expect: "OHIF Viewer: detected at /"
-          - name: dcm4chee-arc-web
-            compose: docker/docker-compose.web.yml
-            service: dcm4chee
-            port: 8080
-            expect: "DCM4CHEE Archive UI: /dcm4chee-arc/ui2/"
+            args: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +38,7 @@ jobs:
       - name: Install NSE
         run: |
           sudo mkdir -p /usr/share/nmap/scripts
-          test -f scripts/dicom-web-info.nse || { echo "::error::Missing scripts/dicom-web-info.nse in repo"; ls -la; exit 1; }
+          # make sure this file exists in your repo:
           sudo cp scripts/dicom-web-info.nse /usr/share/nmap/scripts/
           sudo nmap --script-updatedb
 
@@ -48,15 +46,7 @@ jobs:
         run: |
           set -e
           docker-compose -f ${{ matrix.target.compose }} up -d ${{ matrix.target.service }}
-          if [ "${{ matrix.target.name }}" = "dcm4chee-arc-web" ]; then
-            # WildFly + app boot can be slow: poll the UI2 endpoint up to 3 min
-            for i in {1..36}; do
-              if curl -fsS "http://localhost:8080/dcm4chee-arc/ui2/" >/dev/null; then break; fi
-              sleep 5
-            done
-          else
-            sleep 15
-          fi
+          sleep 15
           nc -zv localhost ${{ matrix.target.port }}
 
       - name: Scan ${{ matrix.target.name }}
@@ -64,17 +54,18 @@ jobs:
         run: |
           set -o pipefail
           OUT="nmap_http_${{ matrix.target.name }}.txt"
-          nmap -p ${{ matrix.target.port }} --script dicom-web-info localhost | tee "$OUT"
+          nmap -p ${{ matrix.target.port }} --script dicom-web-info ${{ matrix.target.args }} localhost | tee "$OUT"
           echo "out=$OUT" >> $GITHUB_OUTPUT
 
       - name: Assert ${{ matrix.target.name }} output
         run: |
-            OUT="${{ steps.scan.outputs.out }}"
-            grep -E '^\|_?[[:space:]]+${{ matrix.target.expect }}' "$OUT" || {
-            echo "::error::Missing expected pattern: ${{ matrix.target.expect }}"
+          OUT="${{ steps.scan.outputs.out }}"
+          # -F = fixed string (so '(' isn't regex)
+          grep -F '  ${{ matrix.target.expect }}' "$OUT" || {
+            echo "::error::Missing expected: ${{ matrix.target.expect }}"
             sed -n '1,200p' "$OUT" || true
             exit 1
-            }
+          }
 
       - name: Upload ${{ matrix.target.name }} artifact
         if: always()

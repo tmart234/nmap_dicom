@@ -9,6 +9,8 @@ on:
 jobs:
   test-nmap-dicom:
     runs-on: ubuntu-latest
+    env:
+      COMPOSE_FILE: docker/docker-compose.yml 
     strategy:
         fail-fast: false
         matrix:

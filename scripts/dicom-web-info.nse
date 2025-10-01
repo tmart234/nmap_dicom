@@ -87,7 +87,8 @@ action = function(host, port)
   local out = stdnse.output_table()
   local use_https = decide_https(host, port)
 
-  -- helper to GET with hTLS flag (nselib/http expects 'ssl', not 'https')
+  -- helper to GET with TLS flag (nselib/http expects 'ssl', not 'https')
+  local function http_get(path, hdr, https_flag)
     local ok, resp = pcall(http.get, host, port, path, {
       timeout = 5000,
       ssl     = https_flag,
@@ -96,7 +97,7 @@ action = function(host, port)
     return ok and resp or nil
   end
 
-  -- If we accidentally talk HTTPS to HTTP (or vice versa), Orthanc returns 400 Bad Request.
+  -- If we accidentally talk HTTPS to HTTP (or vice versa), Orthanc may return 400 Bad Request.
   -- We'll flip the scheme once if we see that pattern.
   local function resilient_get(path, hdr)
     local resp = http_get(path, hdr, use_https)
@@ -140,8 +141,7 @@ action = function(host, port)
         local loc    = lc(hget(resp.header, "Location") or "")
         local bdy    = lc(resp.body)
         local looks_like_arc =
-          bdy:find("dcm4chee%-arc", 1, true) or
-          bdy:find("dcm4che", 1, true) or
+          (bdy and (bdy:find("dcm4chee%-arc", 1, true) or bdy:find("dcm4che", 1, true))) or
           server:find("wildfly", 1, true) or
           server:find("undertow", 1, true) or
           loc:find("/auth", 1, true)

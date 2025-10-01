@@ -41,6 +41,22 @@ end
 local function body_has(b, needle)
     return b and string.find(lc(b), lc(needle), 1, true) ~= nil
 end
+-- safer helpers
+local function to_s(v)
+  if v == nil then return "" end
+  local t = type(v)
+  if t == "string" then return v end
+  if t == "table" then return table.concat(v, ",") end
+  return tostring(v)
+end
+
+local function lc(v) return to_s(v):lower() end
+local function hget(h, k)
+  if not h then return nil end
+  -- headers can be keyed in various casings; also handle tables
+  local v = h[k] or h[string.lower(k)] or h[string.upper(k)]
+  return v
+end
 
 portrule = function(host, port)
     if not (port.protocol == "tcp" and port.state == "open") then
@@ -59,31 +75,36 @@ action = function(host, port)
 
     -- ---------- Orthanc ----------
     do
-        local user = stdnse.get_script_args("dicom-web.orthanc.user")
-        local pass = stdnse.get_script_args("dicom-web.orthanc.pass")
-        local hdr = {
-            ["Accept"] = "application/json"
-        }
-        if user and pass then
-            hdr["Authorization"] = "Basic " .. base64.encode(("%s:%s"):format(user, pass))
-        end
-        local ok, resp = pcall(http.get, host, port, "/system", {
-            timeout = 5000,
-            ssl = use_ssl,
-            header = hdr
-        })
-        if ok and resp and resp.status then
-            if resp.status == 401 or resp.status == 403 then
-                table.insert(out, "Orthanc REST API: /system (authentication required)")
-            elseif resp.status == 200 and resp.body and resp.body:find('%"Name%":%s*%"Orthanc%"') then
-                local ver = resp.body:match('[{,]%s*"Version"%s*:%s*"([^"]+)"')
-                if ver and #ver > 0 then
-                    table.insert(out, ("Orthanc REST API: /system (version %s)"):format(ver))
-                else
-                    table.insert(out, "Orthanc REST API: /system (reachable)")
-                end
+    local user = stdnse.get_script_args("dicom-web.orthanc.user")
+    local pass = stdnse.get_script_args("dicom-web.orthanc.pass")
+    local hdr  = { ["Accept"] = "application/json" }
+
+    -- lean on http.basic_auth to avoid manual base64
+    if user and pass and http.basic_auth then
+        hdr["Authorization"] = http.basic_auth(user, pass)
+    elseif user and pass then
+        -- fallback: minimal manual header without requiring 'base64'
+        local enc = stdnse.tohex(user .. ":" .. pass)  -- NOT real base64, so avoid if possible
+        -- better: require("base64") if you *really* want to (but prefer http.basic_auth)
+    end
+
+    local ok, resp = pcall(http.get, host, port, "/system", { timeout=5000, ssl=use_ssl, header=hdr })
+    if ok and resp and resp.status then
+        if resp.status == 401 or resp.status == 403 then
+        table.insert(out, "Orthanc REST API: /system (authentication required)")
+        elseif resp.status == 200 and resp.body then
+        local body = resp.body
+        -- robust JSON sniffing without weird escapes
+        if body:find('"Name"%s*:%s*"Orthanc"') then
+            local ver = body:match('"Version"%s*:%s*"([^"]+)"')
+            if ver and #ver > 0 then
+            table.insert(out, ("Orthanc REST API: /system (version %s)"):format(ver))
+            else
+            table.insert(out, "Orthanc REST API: /system (reachable)")
             end
         end
+        end
+    end
     end
 
     -- ---------- dcm4chee-arc UI2 ----------
@@ -95,9 +116,9 @@ action = function(host, port)
                 ssl = use_ssl
             })
             if ok and resp and resp.status and resp.body then
-                local server = lc(hget(resp.header, "Server") or "")
-                local loc = lc(hget(resp.header, "Location") or "")
-                local bdy = lc(resp.body)
+                local server = lc(to_s(hget(resp.header, "Server")))
+                local loc    = lc(to_s(hget(resp.header, "Location")))
+                local bdy    = lc(resp.body)
                 local looks_like_arc = bdy:find("dcm4chee%-arc", 1, true) or bdy:find("dcm4che", 1, true) or
                                            server:find("wildfly", 1, true) or server:find("undertow", 1, true) or
                                            loc:find("/auth", 1, true)

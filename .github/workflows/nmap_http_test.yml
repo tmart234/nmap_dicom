@@ -53,7 +53,11 @@ jobs:
         run: |
             set -o pipefail
             OUT="nmap_http_${{ matrix.target.name }}.txt"
-            nmap -p ${{ matrix.target.port }} --script dicom-web-info ${{ matrix.target.args }} localhost | tee "$OUT"
+            # Add -d2 and --script-trace for visibility (you can remove after it’s green)
+            nmap -d2 --script-trace \
+                -p ${{ matrix.target.port }} \
+                --script dicom-web-info ${{ matrix.target.args }} \
+                localhost | tee "$OUT"
             echo "out=$OUT" >> $GITHUB_OUTPUT
 
       - name: Assert ${{ matrix.target.name }} output

@@ -59,7 +59,7 @@ jobs:
           nmap \
             -p ${{ matrix.target.port }} \
             --script dicom-web-info ${{ matrix.target.args }} \
-            localhost | tee "$OUT"
+            127.0.0.1 | tee "$OUT"
           echo "out=$OUT" >> $GITHUB_OUTPUT
 
       - name: Assert ${{ matrix.target.name }} output

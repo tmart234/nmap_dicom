@@ -87,11 +87,10 @@ action = function(host, port)
   local out = stdnse.output_table()
   local use_https = decide_https(host, port)
 
-  -- helper to GET with https flag (nselib/http expects 'https', not 'ssl')
-  local function http_get(path, hdr, https_flag)
+  -- helper to GET with hTLS flag (nselib/http expects 'ssl', not 'https')
     local ok, resp = pcall(http.get, host, port, path, {
       timeout = 5000,
-      https   = https_flag,
+      ssl     = https_flag,
       header  = hdr
     })
     return ok and resp or nil
@@ -168,6 +167,6 @@ action = function(host, port)
     end
   end
 
-  if #out == 0 then return nil end
+  if next(out) == nil then return nil end
   return out
 end

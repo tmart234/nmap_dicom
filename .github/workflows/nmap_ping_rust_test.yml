@@ -1,4 +1,4 @@
-name: Rust C-ECHO (dicom-rs) ping
+name: Rust C-ECHO (dicom-rs) + Nmap ping
 
 on:
   push:
@@ -15,7 +15,7 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y netcat-openbsd tcpdump tshark
+          sudo apt-get install -y nmap netcat-openbsd tcpdump tshark
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -26,46 +26,73 @@ jobs:
           cargo install --locked dicom-echoscu
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # --- Copy your custom NSE + library (same files you use in the nmap ping matrix job)
+      - name: Install Nmap dicom-ping NSE + lib
+        run: |
+          set -e
+          sudo mkdir -p /usr/share/nmap/scripts /usr/share/nmap/nselib
+          sudo cp scripts/dicom-ping.nse /usr/share/nmap/scripts/
+          sudo cp nselib/dicom.lua      /usr/share/nmap/nselib/
+          sudo nmap --script-updatedb
+
       - name: Start Orthanc (DIMSE on host 11112)
         run: |
           set -e
+          # PORT MAPPING: host 11112 -> container 4242
           docker run -d --rm --name orthanc_test \
             -p 11112:4242 -p 8042:8042 \
             -e ORTHANC__REMOTE_ACCESS_ALLOWED=true \
             orthancteam/orthanc:latest
-
-          # wait for DIMSE port
+          # wait for DIMSE to accept TCP
           for i in {1..60}; do
-            if nc -z 127.0.0.1 11112; then
-              echo "DIMSE port is up"; break
-            fi
+            nc -z 127.0.0.1 11112 && break
             sleep 1
           done
           nc -z 127.0.0.1 11112
 
-      - name: Start tcpdump capture (optional)
+      - name: Start tcpdump (optional)
         id: cap
         run: |
-          PCAP="dicom_echoscu_ping.pcap"
+          PCAP="dicom_rust_ping.pcap"
           sudo tcpdump -i any -s 0 "port 11112" -w "$PCAP" &
           echo "pcap=$PCAP" >> "$GITHUB_OUTPUT"
           echo "pid=$!"   >> "$GITHUB_OUTPUT"
 
+      # ---------- Nmap DICOM ping (this is the bit you wanted added) ----------
+      - name: Nmap DICOM ping (dicom-ping.nse)
+        id: nmap_ping
+        run: |
+          set -euxo pipefail
+          OUT="nmap_dicom_ping_orthanc.txt"
+          nmap -p 11112 \
+               --script "dicom-ping" \
+               --script-trace \
+               --reason \
+               --unprivileged \
+               --script-args dicom.called_aet=ORTHANC \
+               localhost | tee "$OUT"
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Assert Nmap ping output
+        run: |
+          OUT="${{ steps.nmap_ping.outputs.out }}"
+          # require vendor + version like your matrix job
+          grep -E '^[|]_?\s*vendor:\s*\S'  "$OUT" || { echo '::error::Missing vendor:';  tail -n 100 "$OUT"; exit 1; }
+          grep -E '^[|]_?\s*version:\s*.*[0-9]' "$OUT" || { echo '::error::Missing version:'; tail -n 100 "$OUT"; exit 1; }
+
+      # ---------- Rust C-ECHO after Nmap ping ----------
       - name: Run dicom-echoscu (C-ECHO)
         id: echoscu
         run: |
           set -euxo pipefail
           OUT="echoscu_orthanc.log"
           for i in {1..10}; do
-            # retry because Orthanc may accept TCP but not DIMSE association yet
             if dicom-echoscu --verbose --called-ae-title ORTHANC 127.0.0.1:11112 | tee "$OUT"; then
               break
             fi
             echo "ECHO failed (try $i); sleeping 1s…"
             sleep 1
           done
-
-          # Accept either the friendly checkmark line or raw 0000H status
           if grep -q "✓ C-ECHO successful" "$OUT" || grep -q "Status:[[:space:]]*0000H" "$OUT"; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
             echo "C-ECHO success confirmed."
@@ -79,21 +106,22 @@ jobs:
         if: always()
         run: |
           PID="${{ steps.cap.outputs.pid }}"
-          if [ -n "$PID" ]; then sudo kill "$PID" 2>/dev/null || true; fi
+          [ -n "$PID" ] && sudo kill "$PID" 2>/dev/null || true
           sleep 1
 
       - name: Quick PCAP summary
         if: always()
         run: |
           PCAP="${{ steps.cap.outputs.pcap }}"
-          [ -s "$PCAP" ] && tshark -r "$PCAP" -c 50 -Y dicom || echo "No DICOM frames captured or tshark not available."
+          [ -s "$PCAP" ] && tshark -r "$PCAP" -c 50 -Y dicom || echo "No DICOM frames captured."
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rust-echoscu-artifacts
+          name: rust-nmap-ping-and-echoscu
           path: |
+            ${{ steps.nmap_ping.outputs.out }}
             echoscu_orthanc.log
             ${{ steps.cap.outputs.pcap }}
 

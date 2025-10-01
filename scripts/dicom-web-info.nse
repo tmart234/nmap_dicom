@@ -38,10 +38,12 @@ local function to_s(v)
 end
 
 local function lc(v) return to_s(v):lower() end
+
 local function hget(h, k)
   if not h then return nil end
   return h[k] or h[string.lower(k)] or h[string.upper(k)]
 end
+
 local function body_has(b, needle)
   return b and string.find(lc(b), lc(needle), 1, true) ~= nil
 end
@@ -49,31 +51,28 @@ end
 -- Build Authorization: Basic ... header safely across Nmap versions
 local function make_basic_auth(user, pass)
   if not (user and pass) then return nil end
-  -- Prefer base64.enc; fall back to base64.encode if present
+  -- Prefer http.basic_auth if present
+  if http.basic_auth then
+    return http.basic_auth(user, pass)
+  end
+  -- Fall back to base64 (enc vs encode differs by version)
   if base64_ok and base64 then
     local f = base64.enc or base64.encode
     if f then
       return "Basic " .. f(("%s:%s"):format(user, pass))
     end
   end
-  -- As a last resort, try http.basic_auth if available (guarded)
-  local ok, auth = pcall(function()
-    return http.basic_auth and http.basic_auth(user, pass) or nil
-  end)
-  if ok then return auth end
   return nil
 end
 
--- Decide SSL use: default to false except common HTTPS ports, allow override via arg
-local function decide_ssl(port)
+-- Decide HTTPS use: default to shortport.ssl() hint, allow override via arg
+local function decide_https(host, port)
   local override = stdnse.get_script_args("dicom-web.ssl")
   if override ~= nil then
     local v = lc(override)
     return (v == "true" or v == "1" or v == "yes")
   end
-  local n = port.number or 0
-  if n == 443 or n == 8443 then return true end
-  return false
+  return shortport.ssl(host, port)
 end
 
 portrule = function(host, port)
@@ -86,26 +85,37 @@ end
 
 action = function(host, port)
   local out = stdnse.output_table()
-  local use_ssl = decide_ssl(port)
+  local use_https = decide_https(host, port)
+
+  -- helper to GET with https flag (nselib/http expects 'https', not 'ssl')
+  local function http_get(path, hdr, https_flag)
+    local ok, resp = pcall(http.get, host, port, path, {
+      timeout = 5000,
+      https   = https_flag,
+      header  = hdr
+    })
+    return ok and resp or nil
+  end
+
+  -- If we accidentally talk HTTPS to HTTP (or vice versa), Orthanc returns 400 Bad Request.
+  -- We'll flip the scheme once if we see that pattern.
+  local function resilient_get(path, hdr)
+    local resp = http_get(path, hdr, use_https)
+    if resp and resp.status == 400 and body_has(resp.body, "Bad Request") then
+      resp = http_get(path, hdr, not use_https)
+    end
+    return resp
+  end
 
   -- ---------- Orthanc ----------
   do
     local user = stdnse.get_script_args("dicom-web.orthanc.user")
     local pass = stdnse.get_script_args("dicom-web.orthanc.pass")
-    local hdr  = { ["Accept"]="application/json" }
+    local hdr  = { ["Accept"] = "application/json" }
     local auth = make_basic_auth(user, pass)
     if auth then hdr["Authorization"] = auth end
 
-    -- try once with decided ssl; if we get a 400/plain text (likely TLS sent to HTTP or vice versa), flip and retry
-    local function try_get(ssl_flag)
-      local ok, resp = pcall(http.get, host, port, "/system", { timeout=5000, ssl=ssl_flag, header=hdr })
-      return ok and resp or nil
-    end
-
-    local resp = try_get(use_ssl)
-    if not resp or (resp.status == 400 and resp.body and body_has(resp.body, "Bad Request")) then
-      resp = try_get(not use_ssl)
-    end
+    local resp = resilient_get("/system", hdr)
 
     if resp and resp.status then
       if resp.status == 401 or resp.status == 403 then
@@ -125,8 +135,8 @@ action = function(host, port)
   do
     local paths = {"/dcm4chee-arc/ui2/index.html", "/dcm4chee-arc/ui2/"}
     for _, p in ipairs(paths) do
-      local ok, resp = pcall(http.get, host, port, p, { timeout=5000, ssl=use_ssl })
-      if ok and resp and resp.status and resp.body then
+      local resp = resilient_get(p, nil)
+      if resp and resp.status and resp.body then
         local server = lc(hget(resp.header, "Server") or "")
         local loc    = lc(hget(resp.header, "Location") or "")
         local bdy    = lc(resp.body)
@@ -150,8 +160,8 @@ action = function(host, port)
 
   -- ---------- OHIF ----------
   do
-    local ok, resp = pcall(http.get, host, port, "/", { timeout=5000, ssl=use_ssl })
-    if ok and resp and resp.status == 200 and resp.body then
+    local resp = resilient_get("/", nil)
+    if resp and resp.status == 200 and resp.body then
       if body_has(resp.body, "OHIF") or body_has(resp.body, "app-config.js") then
         table.insert(out, "OHIF Viewer: detected at /")
       end

@@ -53,9 +53,7 @@ local shortport = require "shortport"
 local dicom = require "dicom"
 local stdnse = require "stdnse"
 local nmap = require "nmap"
-local http = require "http"
 local string = require "string"
-local table = require "table"
 
 -- Helper function to parse the ports argument into a table of numbers
 local function parse_ports_arg(ports_str)
@@ -144,7 +142,9 @@ action = function(host, port)
 
   -- Set port info as DICOM
   port.version.name = "dicom"
-  nmap.set_port_version(host, port) -- Update port info in Nmap
+  if vendor then port.version.product = vendor end
+  if output and output.version then port.version.version = output.version end
+  nmap.set_port_version(host, port)
 
   output.dicom = "DICOM Service Provider discovered!"
   if not called_aet_arg or called_aet_arg == "ANY-SCP" then
@@ -165,57 +165,6 @@ action = function(host, port)
   if vendor then
     stdnse.debug1("Detected DICOM vendor: %s", vendor)
     output.vendor = vendor
-
-    -- Orthanc-specific REST check for version confirmation/refinement
-    local try_rest = stdnse.get_script_args("dicom-ping.try-orthanc-rest")
-    if try_rest and vendor == "Orthanc" then  
-      stdnse.debug1("Detected Orthanc, trying REST API for version...")
-      -- Ports to try for Orthanc REST API (common default and the DICOM port itself)
-      local ports_to_try = {8042, port.number}
-      local orthanc_version_found = false
-
-      for _, test_port in ipairs(ports_to_try) do
-        stdnse.debug1("Trying Orthanc REST API on port %d", test_port)
-        -- Use pcall for safety when making HTTP request
-        local status, response = pcall(http.get, host, test_port, "/system", {timeout=3000})
-
-        if status and response and response.status then -- Check pcall status first
-          stdnse.debug1("HTTP response status: %d from port %d", response.status, test_port)
-
-          if response.status == 200 and response.body then
-            stdnse.debug1("Response body length: %d", #(response.body))
-            -- Attempt to parse version from JSON response
-            local ver = response.body:match('"Version"%s*:%s*"([%d.]+)"')
-            if ver then
-              stdnse.debug1("Found Orthanc version via REST: %s", ver)
-              -- Update output and Nmap port info with more specific info
-              output.version = ver
-              output.vendor = "Orthanc"
-              output.notes = "Version confirmed via REST API"
-              orthanc_version_found = true
-
-              port.version.product = "Orthanc"
-              port.version.version = ver
-              nmap.set_port_version(host, port)
-              break -- Stop checking ports once version found
-            else
-              stdnse.debug1("Version field not found in JSON response from port %d", test_port)
-            end
-          end
-        else
-          stdnse.debug1("Failed to connect/get from REST API on port %d: %s", test_port, (response and tostring(response)) or "pcall failed")
-        end
-      end -- end for loop checking REST ports
-
-      if not orthanc_version_found then
-        stdnse.debug1("Could not determine Orthanc version via REST API")
-        -- Still report vendor as Orthanc based on initial DICOM association
-        output.vendor = "Orthanc"
-        port.version.product = "Orthanc"
-        -- Don't overwrite version if already found via DICOM
-        nmap.set_port_version(host, port)
-      end
-    end -- end Orthanc check
   end -- end vendor check
 
   stdnse.debug1("Final output table contents (on success):\n%s", stdnse.format_output(true, output))

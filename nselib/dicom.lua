@@ -59,13 +59,13 @@ end
 -- Most-specific FIRST. Only org roots known to be used as Implementation Class UIDs.
 local VENDOR_UID_PATTERNS = {
   -- Projects under UK NHS OID tree
-  {"^1%.2%.826%.0%.1%.3680043%.9%.3%.9%.1%.", "ClearCanvas"},
+  {"^1%.3%.6%.1%.4%.1%.25403%.",              "ClearCanvas"},
   {"^1%.2%.826%.0%.1%.3680043%.9%.3811%.",    "pynetdicom"},
   {"^1%.2%.826%.0%.1%.3680043%.8%.641%.",     "Orthanc"},
-  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.",    "OsiriX"},
+  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.",    "OsiriX/Horos"},
 
   -- DCMTK / OFFIS
-  {"^1%.2%.276%.0%.7230010%.",                "DCMTK"},
+  {"^1%.2%.276%.0%.7230010%.3%.",                "DCMTK"},
 
   -- dcm4che / dcm4chee
   {"^1%.2%.40%.0%.13%.1%.3$",                "dcm4che"},
@@ -74,13 +74,14 @@ local VENDOR_UID_PATTERNS = {
   {"^1%.2%.840%.113619%.",                    "GE Healthcare"},
   {"^1%.3%.12%.2%.1107%.",                    "Siemens"},
   {"^1%.2%.840%.114257%.",                    "Agfa"},
-  {"^1%.2%.840%.113704%.",                    "Carestream"},
+  {"^1%.2%.840%.113704%.",                    "Philips"},
+  {"^1%.2%.840%.113564%.",                    "Carestream"},
   {"^1%.2%.392%.200036%.",                    "Fujifilm"},
-  {"^1%.2%.124%.113532%.",                    "Merge Healthcare"},
-
+  {"^1%.2%.840%.113669%..*",                  "Merge Healthcare"},
+  {"^1%.3%.46%.670589%.",                     "Philips"},
+  
   -- Community PACS
   {"^1%.2%.826%.0%.1%.3680043%.2%.135%.1066%.101$", "ConQuest"},
-  {"^1%.3%.46%.670589%.",                     "Philips"},
 }
 
 ---

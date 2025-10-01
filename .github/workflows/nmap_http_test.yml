@@ -1,0 +1,119 @@
+name: Nmap DICOM Web Matrix
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-dicom-web:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: orthanc-web
+            service: orthanc       # <-- compose service name for Orthanc (web)
+            host_port: 8042        # <-- Orthanc HTTP
+            expect: version        # expect a 'version:' line from dicom-http.nse
+            nmap_args: "--script-args dicom-http.user=orthanc,dicom-http.pass=orthanc"
+          - name: ohif-viewer
+            service: viewer        # <-- compose service name for OHIF
+            host_port: 3000        # <-- OHIF UI
+            expect: ohif_viewer    # expect 'ohif_viewer: detected'
+            nmap_args: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nmap docker-compose netcat-openbsd
+
+      - name: Install dicom-http NSE
+        run: |
+          sudo mkdir -p /usr/share/nmap/scripts
+          sudo cp scripts/dicom-http.nse /usr/share/nmap/scripts/
+          sudo nmap --script-updatedb
+
+      - name: Pull latest image (${{ matrix.target.name }})
+        run: |
+          docker-compose pull ${{ matrix.target.service }} || true
+
+      - name: Start service (${{ matrix.target.name }})
+        id: up
+        run: |
+          set -e
+          docker-compose up -d --remove-orphans ${{ matrix.target.service }}
+          # wait a bit for first-start
+          sleep 10
+          STATUS=$(docker-compose ps -q ${{ matrix.target.service }} | xargs docker inspect --format='{{.State.Status}}' 2>/dev/null || echo "notfound")
+          if [ "$STATUS" != "running" ]; then
+            echo "::error::Service ${{ matrix.target.service }} not running (status: $STATUS)"
+            docker ps -a
+            docker-compose logs --no-color ${{ matrix.target.service }} || true
+            exit 1
+          fi
+          # wait for the mapped port to open
+          for i in {1..12}; do
+            if nc -z localhost ${{ matrix.target.host_port }}; then
+              echo "Port ${{ matrix.target.host_port }} open."
+              exit 0
+            fi
+            echo "Waiting for port ${{ matrix.target.host_port }}... ($i/12)"
+            sleep 5
+          done
+          echo "::error::Host port ${{ matrix.target.host_port }} not open."
+          docker-compose logs --no-color ${{ matrix.target.service }} || true
+          exit 1
+
+      - name: Nmap dicom-http (${{ matrix.target.name }})
+        id: scan
+        run: |
+          set -o pipefail
+          OUT="nmap_http_${{ matrix.target.name }}.txt"
+          nmap -p ${{ matrix.target.host_port }} --script dicom-http ${{ matrix.target.nmap_args }} localhost | tee "$OUT"
+          echo "out=$OUT" >> $GITHUB_OUTPUT
+
+      - name: Assert output (${{ matrix.target.name }})
+        run: |
+          OUT="${{ steps.scan.outputs.out }}"
+          case "${{ matrix.target.expect }}" in
+            version)
+              # Orthanc: must have a version line
+              if ! grep -Eq '^\|_?\s*version:\s*\S' "$OUT"; then
+                echo "::error::Missing 'version:' in dicom-http output for Orthanc."
+                tail -n 200 "$OUT" || true
+                exit 1
+              fi
+              ;;
+            ohif_viewer)
+              # OHIF: must show detected line
+              if ! grep -Ei '^\|\s+ohif_viewer:\s*detected' "$OUT"; then
+                echo "::error::Missing 'ohif_viewer: detected' in dicom-http output."
+                tail -n 200 "$OUT" || true
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Unknown expectation '${{ matrix.target.expect }}'"; exit 1;;
+          esac
+
+      - name: Upload Nmap output (${{ matrix.target.name }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nmap-http-${{ matrix.target.name }}
+          path: ${{ steps.scan.outputs.out }}
+          if-no-files-found: warn
+
+      - name: Logs (${{ matrix.target.name }})
+        if: always()
+        run: docker-compose logs --tail=200 ${{ matrix.target.service }} || true
+
+      - name: Teardown
+        if: always()
+        run: docker-compose down --volumes --remove-orphans

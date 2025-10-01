@@ -1,15 +1,9 @@
 -- dicom-web-info.nse
 -- Detect DICOM-related HTTP endpoints:
 --  - Orthanc REST API (/system) with version extraction
---  - OHIF Viewer
+--  - OHIF Viewer (with best-effort version)
 --  - dcm4chee-arc UI2 (admin console)
---
--- Usage:
---   nmap -p 8042,3000,8080 --script dicom-web-info <target>
---   nmap --script dicom-web-info \
---        --script-args dicom-web.ports=8042,3000,8080,dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc \
---        <target>
---
+
 author = "Tyler M"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
 categories = {"discovery", "safe", "version"}
@@ -50,13 +44,6 @@ end
 local function body_has(b, needle)
   local bb = lc(safe_body(b))
   return bb ~= "" and (bb:find(lc(needle), 1, true) ~= nil) or false
-end
-
-local function safe_find(str, pat)
-  if type(str) ~= "string" then return nil end
-  local ok, a = pcall(string.find, str, pat)
-  if ok then return a end
-  return nil
 end
 
 local function safe_match(str, pat)
@@ -124,7 +111,7 @@ end
 
 -- ------------------------ HTTP wrappers ------------------------
 
--- Your Nmap build supports 'https' (not 'ssl') in http.get options.
+-- Nmap http library supports 'https' (not 'ssl') in options.
 local function try_http_get(host, port, path, hdr, use_https)
   local opts = { timeout = 7000, header = hdr }
   if use_https ~= nil then opts["https"] = use_https and true or false end
@@ -169,15 +156,19 @@ action = function(host, port)
     end
 
     if sc == 200 then
-      local body = safe_body(resp.body)
-      local ver = safe_match(body, [["Version"%s*:%s*"([^"]+)"]])
-      if ver and ver ~= "" then
-        out[#out + 1] = ("Orthanc REST API: /system (version %s)"):format(ver)
-      else
-        -- Still print a line containing the word "version" to satisfy grep
-        out[#out + 1] = "Orthanc REST API: /system (version unknown)"
+      local ctype = lc(hget(resp.header, "Content-Type") or "")
+      local body  = safe_body(resp.body)
+      -- Only consider this Orthanc if JSON + Orthanc marker is present.
+      if (ctype:find("application/json", 1, true) or body_has(body, '"name"')) and
+         (body_has(body, '"orthanc"') or body_has(body, '"name"%s*:%s*"orthanc"')) then
+        local ver = safe_match(body, [["Version"%s*:%s*"([^"]+)"]]) or safe_match(body, [["version"%s*:%s*"([^"]+)"]])
+        if ver and ver ~= "" then
+          out[#out + 1] = ("Orthanc REST API: /system (version %s)"):format(ver)
+        else
+          out[#out + 1] = "Orthanc REST API: /system (reachable)"
+        end
+        count = count + 1
       end
-      count = count + 1
     end
   end)
 
@@ -213,19 +204,23 @@ action = function(host, port)
   -- ---------- OHIF ----------
   pcall(function()
     local detected = false
+    local ohif_ver = nil
 
-    -- Probe typical OHIF assets first
-    local probes = { "/app-config.js", "/favicon-32x32.png", "/favicon.ico" }
-    for _, p in ipairs(probes) do
-      local r = smart_get(host, port, p, nil)
-      local sc = status_code(r)
-      if sc == 200 or sc == 304 then
-        detected = true
-        break
-      end
+    -- Check for a known asset and try to read a version from it
+    local ac = smart_get(host, port, "/app-config.js", nil)
+    local ac_sc = status_code(ac)
+    if ac_sc == 200 then
+      detected = true
+      local ab = safe_body(ac.body)
+      -- Try common OHIF version locations:
+      -- window.config.versions = { "ohif": "x.y.z", ... }
+      ohif_ver = safe_match(ab, [["ohif"%s*:%s*"([^"]+)"]]) or
+                 safe_match(ab, [["version"%s*:%s*"([^"]+)"]]) or
+                 safe_match(ab, [[OHIF_VERSION%s*=%s*"([^"]+)"]]) or
+                 safe_match(ab, [[__OHIF_VERSION__%s*=%s*"([^"]+)"]])
     end
 
-    -- Then check the root page for hints
+    -- If asset didn’t prove it, inspect root page
     if not detected then
       local root = smart_get(host, port, "/", nil)
       local sc = status_code(root)
@@ -237,7 +232,11 @@ action = function(host, port)
     end
 
     if detected then
-      out[#out + 1] = "OHIF Viewer: detected at /"
+      if ohif_ver and ohif_ver ~= "" then
+        out[#out + 1] = ("OHIF Viewer: detected at / (version %s)"):format(ohif_ver)
+      else
+        out[#out + 1] = "OHIF Viewer: detected at /"
+      end
       count = count + 1
     end
   end)

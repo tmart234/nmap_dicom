@@ -17,7 +17,6 @@ jobs:
             compose: docker/docker-compose.web.yml
             service: orthanc
             port: 8042
-            # We expect a version only because we will pass creds below
             expect: "Orthanc REST API: /system (version"
             args: "--script-args dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc"
           - name: ohif-viewer
@@ -52,20 +51,19 @@ jobs:
       - name: Scan ${{ matrix.target.name }}
         id: scan
         run: |
-          set -o pipefail
-          OUT="nmap_http_${{ matrix.target.name }}.txt"
-          nmap -p ${{ matrix.target.port }} --script dicom-web-info ${{ matrix.target.args }} localhost | tee "$OUT"
-          echo "out=$OUT" >> $GITHUB_OUTPUT
+            set -o pipefail
+            OUT="nmap_http_${{ matrix.target.name }}.txt"
+            nmap -p ${{ matrix.target.port }} --script dicom-web-info ${{ matrix.target.args }} localhost | tee "$OUT"
+            echo "out=$OUT" >> $GITHUB_OUTPUT
 
       - name: Assert ${{ matrix.target.name }} output
         run: |
-          OUT="${{ steps.scan.outputs.out }}"
-          # -F = fixed string (so '(' isn't regex)
-          grep -F '  ${{ matrix.target.expect }}' "$OUT" || {
+            OUT="${{ steps.scan.outputs.out }}"
+            grep -F '  ${{ matrix.target.expect }}' "$OUT" || {
             echo "::error::Missing expected: ${{ matrix.target.expect }}"
             sed -n '1,200p' "$OUT" || true
             exit 1
-          }
+            }
 
       - name: Upload ${{ matrix.target.name }} artifact
         if: always()

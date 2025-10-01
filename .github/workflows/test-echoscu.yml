@@ -52,12 +52,19 @@ jobs:
 
       - name: Run dicom-echoscu (C-ECHO)
         run: |
-          set -euxo pipefail
-          OUT="echoscu_orthanc.log"
-          # Orthanc AET is typically ORTHANC; calling AE defaults to ECHOSCU
-          dicom-echoscu --verbose --called-ae-title ORTHANC 127.0.0.1:${DICOM_PORT} | tee "$OUT"
-          # Assert success (0x0000 success or 'success' string in verbose output)
-          grep -Ei 'success|0x0000' "$OUT" >/dev/null
+            set -euxo pipefail
+            OUT="echoscu_orthanc.log"
+            for i in {1..10}; do
+            if dicom-echoscu --verbose --called-ae-title ORTHANC 127.0.0.1:${DICOM_PORT:-11112} | tee "$OUT"; then
+                break
+            fi
+            echo "ECHO failed (try $i); sleeping 1s…"
+            sleep 1
+            done
+
+            grep -q "C-ECHO-RSP Status: Success" "$OUT" || {
+            echo "::error::ECHO never succeeded"; exit 1;
+            }
 
       - name: Upload echoscu log
         if: always()

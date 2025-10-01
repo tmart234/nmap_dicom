@@ -1,17 +1,13 @@
 -- dicom-web-info.nse
---[[
-Detects DICOM-related HTTP endpoints:
- - Orthanc REST API (/system) and extracts version if readable
- - OHIF Viewer (static front-end)
- - dcm4chee-arc UI2 (admin console) with strict fingerprinting
-
-Usage:
-  nmap -p 8042,3000,8080 --script dicom-web-info <target>
-  nmap --script dicom-web-info --script-args dicom-web.ports=8042,3000,8080,dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc <target>
-
-Script classes: discovery, safe, version
-]]
-
+-- Detect DICOM-related HTTP endpoints:
+--  - Orthanc REST API (/system) with version extraction
+--  - OHIF Viewer
+--  - dcm4chee-arc UI2 (admin console)
+--
+-- Usage:
+--   nmap -p 8042,3000,8080 --script dicom-web-info <target>
+--   nmap --script dicom-web-info --script-args dicom-web.ports=8042,3000,8080,dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc <target>
+--
 author = "Tyler M"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
 categories = {"discovery","safe","version"}
@@ -30,13 +26,8 @@ local function parse_ports_arg(s)
 end
 
 local function lc(v) return (v or ""):lower() end
-local function has(h, k)
-  if not h then return nil end
-  return h[k] or h[string.lower(k)]
-end
-local function body_has(b, needle)
-  return b and string.find(string.lower(b), string.lower(needle), 1, true) ~= nil
-end
+local function hget(h, k) if not h then return nil end return h[k] or h[string.lower(k)] end
+local function body_has(b, needle) return b and string.find(lc(b), lc(needle), 1, true) ~= nil end
 
 portrule = function(host, port)
   if not (port.protocol == "tcp" and port.state == "open") then return false end
@@ -57,36 +48,41 @@ action = function(host, port)
     if user and pass then
       hdr["Authorization"] = "Basic " .. base64.encode(user .. ":" .. pass)
     end
-    local ok, resp = pcall(http.get, host, port, "/system", {timeout=5000, ssl=use_ssl, header=hdr})
+
+    local ok, resp = pcall(http.get, host, port, "/system", { timeout=5000, ssl=use_ssl, header=hdr })
     if ok and resp and resp.status then
-      if resp.status == 200 and resp.body then
-        local ver = resp.body:match('"[ ]*Version[ ]*"[ ]*:[ ]*"([^"]+)"')
-        if ver then
-          table.insert(out, ("Orthanc REST API: /system (version %s)"):format(ver))
-        else
-          table.insert(out, "Orthanc REST API: /system (reachable)")
-        end
-      elseif resp.status == 401 or resp.status == 403 then
+      if (resp.status == 401 or resp.status == 403) then
         table.insert(out, "Orthanc REST API: /system (authentication required)")
+      elseif resp.status == 200 and resp.body then
+        -- Be strict: only accept if JSON-like and has "Version"
+        local body = resp.body
+        if body:find('"%s*Version%s*"%s*:%s*"', 1) and (body:find('"Name"%s*:%s*"Orthanc"', 1) or body:find('"ApiVersion"%s*:%s*', 1)) then
+          local ver = body:match('"%s*Version%s*"%s*:%s*"([^"]+)"')
+          if ver and #ver > 0 then
+            table.insert(out, ("Orthanc REST API: /system (version %s)"):format(ver))
+          else
+            table.insert(out, "Orthanc REST API: /system (reachable)")
+          end
+        end
       end
     end
   end
 
-  -- ---------- dcm4chee-arc UI2 (be strict to avoid OHIF false positives) ----------
+  -- ---------- dcm4chee-arc UI2 ----------
   do
     local paths = {"/dcm4chee-arc/ui2/index.html", "/dcm4chee-arc/ui2/"}
     for _, p in ipairs(paths) do
-      local ok, resp = pcall(http.get, host, port, p, {timeout=5000, ssl=use_ssl})
+      local ok, resp = pcall(http.get, host, port, p, { timeout=5000, ssl=use_ssl })
       if ok and resp and resp.status and resp.body then
-        local server = lc(has(resp.header, "Server") or "")
-        local loc    = lc(has(resp.header, "Location") or "")
+        local server = lc(hget(resp.header, "Server") or "")
+        local loc    = lc(hget(resp.header, "Location") or "")
         local bdy    = lc(resp.body)
         local looks_like_arc =
-           bdy:find("dcm4chee%-arc", 1, true) or
-           bdy:find("dcm4che", 1, true) or
-           server:find("wildfly", 1, true) or
-           server:find("undertow", 1, true) or
-           loc:find("/auth", 1, true)  -- keycloak redirect sometimes
+          bdy:find("dcm4chee%-arc", 1, true) or
+          bdy:find("dcm4che", 1, true) or
+          server:find("wildfly", 1, true) or
+          server:find("undertow", 1, true) or
+          loc:find("/auth", 1, true)
         if looks_like_arc then
           if resp.status == 200 then
             table.insert(out, "DCM4CHEE Archive UI: /dcm4chee-arc/ui2/")
@@ -101,7 +97,7 @@ action = function(host, port)
 
   -- ---------- OHIF ----------
   do
-    local ok, resp = pcall(http.get, host, port, "/", {timeout=5000, ssl=use_ssl})
+    local ok, resp = pcall(http.get, host, port, "/", { timeout=5000, ssl=use_ssl })
     if ok and resp and resp.status == 200 and resp.body then
       if body_has(resp.body, "OHIF") or body_has(resp.body, "app-config.js") then
         table.insert(out, "OHIF Viewer: detected at /")

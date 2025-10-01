@@ -136,36 +136,27 @@ action = function(host, port)
   end
 
   -- Association was successful
-  stdnse.debug1("Associate success - Version: %s, Vendor: %s",
-                version or "nil",
-                vendor or "nil")
-
-  -- Set port info as DICOM
-  port.version.name = "dicom"
-  if vendor then port.version.product = vendor end
-  if output and output.version then port.version.version = output.version end
-  nmap.set_port_version(host, port)
-
   output.dicom = "DICOM Service Provider discovered!"
   if not called_aet_arg or called_aet_arg == "ANY-SCP" then
     output.config = "Any AET is accepted (Insecure)"
-  else
-      stdnse.debug1("Specific Called AET ('%s') used successfully.", called_aet_arg)
-  end
-  -- Add version information if available
-  if version then
-    stdnse.debug1("Detected DICOM version string: %s", version)
-    -- Try cleaning the version string using the library function
-    local clean_version = dicom.extract_clean_version(version, vendor)
-    output.version = clean_version or version -- Use cleaned version if successful, else original
-    stdnse.debug1("Reported version: %s", output.version)
   end
 
-  -- Add vendor information if available
+  -- Version first
+  if version then
+    local clean_version = dicom.extract_clean_version(version, vendor)
+    output.version = clean_version or version
+  end
+
+  -- Vendor next
   if vendor then
-    stdnse.debug1("Detected DICOM vendor: %s", vendor)
     output.vendor = vendor
-  end -- end vendor check
+  end
+
+  -- Now populate Nmap's fields and commit
+  port.version.name = "dicom"
+  if vendor then port.version.product = vendor end
+  if output.version then port.version.version = output.version end
+  nmap.set_port_version(host, port)
 
   stdnse.debug1("Final output table contents (on success):\n%s", stdnse.format_output(true, output))
 

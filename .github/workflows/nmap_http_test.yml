@@ -35,11 +35,12 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y nmap docker-compose
+          sudo apt-get install -y nmap docker-compose curl
 
       - name: Install NSE
         run: |
           sudo mkdir -p /usr/share/nmap/scripts
+          test -f scripts/dicom-web-info.nse || { echo "::error::Missing scripts/dicom-web-info.nse in repo"; ls -la; exit 1; }
           sudo cp scripts/dicom-web-info.nse /usr/share/nmap/scripts/
           sudo nmap --script-updatedb
 
@@ -68,12 +69,12 @@ jobs:
 
       - name: Assert ${{ matrix.target.name }} output
         run: |
-          OUT="${{ steps.scan.outputs.out }}"
-          grep -E '^\|[[:space:]]+${{ matrix.target.expect }}' "$OUT" || {
+            OUT="${{ steps.scan.outputs.out }}"
+            grep -E '^\|_?[[:space:]]+${{ matrix.target.expect }}' "$OUT" || {
             echo "::error::Missing expected pattern: ${{ matrix.target.expect }}"
             sed -n '1,200p' "$OUT" || true
             exit 1
-          }
+            }
 
       - name: Upload ${{ matrix.target.name }} artifact
         if: always()

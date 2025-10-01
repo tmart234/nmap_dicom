@@ -1,0 +1,106 @@
+name: Rust C-ECHO (dicom-rs) ping
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  rust-echoscu-ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y netcat-openbsd tcpdump tshark
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dicom-echoscu
+        run: |
+          set -euxo pipefail
+          cargo install --locked dicom-echoscu
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Start Orthanc (DIMSE on host 11112)
+        run: |
+          set -e
+          docker run -d --rm --name orthanc_test \
+            -p 11112:4242 -p 8042:8042 \
+            -e ORTHANC__REMOTE_ACCESS_ALLOWED=true \
+            orthancteam/orthanc:latest
+
+          # wait for DIMSE port
+          for i in {1..60}; do
+            if nc -z 127.0.0.1 11112; then
+              echo "DIMSE port is up"; break
+            fi
+            sleep 1
+          done
+          nc -z 127.0.0.1 11112
+
+      - name: Start tcpdump capture (optional)
+        id: cap
+        run: |
+          PCAP="dicom_echoscu_ping.pcap"
+          sudo tcpdump -i any -s 0 "port 11112" -w "$PCAP" &
+          echo "pcap=$PCAP" >> "$GITHUB_OUTPUT"
+          echo "pid=$!"   >> "$GITHUB_OUTPUT"
+
+      - name: Run dicom-echoscu (C-ECHO)
+        id: echoscu
+        run: |
+          set -euxo pipefail
+          OUT="echoscu_orthanc.log"
+          for i in {1..10}; do
+            # retry because Orthanc may accept TCP but not DIMSE association yet
+            if dicom-echoscu --verbose --called-ae-title ORTHANC 127.0.0.1:11112 | tee "$OUT"; then
+              break
+            fi
+            echo "ECHO failed (try $i); sleeping 1s…"
+            sleep 1
+          done
+
+          # Accept either the friendly checkmark line or raw 0000H status
+          if grep -q "✓ C-ECHO successful" "$OUT" || grep -q "Status:[[:space:]]*0000H" "$OUT"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "C-ECHO success confirmed."
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::error::ECHO never succeeded"
+            exit 1
+          fi
+
+      - name: Stop tcpdump
+        if: always()
+        run: |
+          PID="${{ steps.cap.outputs.pid }}"
+          if [ -n "$PID" ]; then sudo kill "$PID" 2>/dev/null || true; fi
+          sleep 1
+
+      - name: Quick PCAP summary
+        if: always()
+        run: |
+          PCAP="${{ steps.cap.outputs.pcap }}"
+          [ -s "$PCAP" ] && tshark -r "$PCAP" -c 50 -Y dicom || echo "No DICOM frames captured or tshark not available."
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-echoscu-artifacts
+          path: |
+            echoscu_orthanc.log
+            ${{ steps.cap.outputs.pcap }}
+
+      - name: Dump Orthanc logs (tail)
+        if: always()
+        run: docker logs --tail=200 orthanc_test || true
+
+      - name: Stop Orthanc
+        if: always()
+        run: docker stop orthanc_test || true

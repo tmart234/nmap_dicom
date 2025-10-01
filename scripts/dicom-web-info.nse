@@ -16,6 +16,7 @@ local shortport = require "shortport"
 local http = require "http"
 local stdnse = require "stdnse"
 local string = require "string"
+local base64    = require "base64"
 
 local function parse_ports_arg(s)
     if not s then
@@ -64,7 +65,7 @@ action = function(host, port)
             ["Accept"] = "application/json"
         }
         if user and pass then
-            hdr["Authorization"] = http.basic_auth(user, pass)
+            hdr["Authorization"] = "Basic " .. base64.encode(("%s:%s"):format(user, pass))
         end
         local ok, resp = pcall(http.get, host, port, "/system", {
             timeout = 5000,

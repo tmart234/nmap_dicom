@@ -71,25 +71,26 @@ jobs:
 
       - name: Assert output (${{ matrix.target.name }})
         run: |
-          OUT="${{ steps.scan.outputs.out }}"
-          case "${{ matrix.target.expect }}" in
+            OUT="${{ steps.scan.outputs.out }}"
+            case "${{ matrix.target.expect }}" in
             version)
-              if ! grep -Eq '^\|[[:space:]]+version:[[:space:]]*\S' "$OUT"; then
+                # accept lines starting with '|' or '|_'
+                if ! grep -Eq '^\|( |_)\s+version:\s*\S' "$OUT"; then
                 echo "::error::Missing 'version:' in dicom-http output for Orthanc"
                 tail -n 200 "$OUT" || true
                 exit 1
-              fi
-              ;;
+                fi
+                ;;
             ohif_viewer)
-              if ! grep -Ei '^\|\s+ohif_viewer:\s*detected' "$OUT"; then
+                if ! grep -Ei '^\|\s+ohif_viewer:\s*detected|^\|_\s+ohif_viewer:\s*detected' "$OUT"; then
                 echo "::error::Missing 'ohif_viewer: detected' in dicom-http output"
                 tail -n 200 "$OUT" || true
                 exit 1
-              fi
-              ;;
+                fi
+                ;;
             *)
-              echo "::error::Unknown expectation"; exit 1;;
-          esac
+                echo "::error::Unknown expectation"; exit 1;;
+            esac
 
       - name: Upload Nmap output (${{ matrix.target.name }})
         if: always()

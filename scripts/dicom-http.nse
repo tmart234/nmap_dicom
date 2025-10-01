@@ -27,7 +27,7 @@ local http      = require "http"
 local stdnse    = require "stdnse"
 local string    = require "string"
 
--- base64 is optional; load safely
+-- base64 optional
 local base64_ok, base64 = pcall(require, "base64")
 
 local function parse_ports_arg(s)
@@ -39,11 +39,24 @@ end
 
 portrule = function(host, port)
   if not (port.protocol == "tcp" and port.state == "open") then return false end
-  -- allow explicit override
   local set = parse_ports_arg(stdnse.get_script_args("dicom-http.ports"))
   if set and set[port.number] then return true end
-  -- default interesting ports
-  return shortport.port_or_service({80, 443, 8042, 3000}, {"http","https"}, "tcp")(host, port)
+  return shortport.port_or_service({80,443,8042,3000}, {"http","https"}, "tcp")(host, port)
+end
+
+local function get_header_ci(h, key)
+  if not h then return nil end
+  return h[key] or h[key:lower()] or h[key:upper()]
+end
+
+local function is_json(resp)
+  local ct = get_header_ci(resp.header, "content-type") or ""
+  if ct:lower():find("json", 1, true) then return true end
+  -- fallback heuristic: body starting with "{" and containing "Version"
+  if resp.body and resp.body:match("^%s*{") and resp.body:find("[Vv]ersion") then
+    return true
+  end
+  return false
 end
 
 local function try_http(host, port, path, opts)
@@ -70,30 +83,32 @@ action = function(host, port)
   local pass = stdnse.get_script_args("dicom-http.pass")
   local opts = build_opts(user, pass)
 
-  -- 1) Try Orthanc REST /system
+  -- 1) Orthanc REST detection: must be JSON AND contain "Version"
   do
     local resp = try_http(host, port, "/system", opts)
-    if resp and resp.status == 200 and resp.body then
-      -- parse "Version": "x.y.z"
+    if resp and resp.status == 200 and resp.body and is_json(resp) then
       local ver = resp.body:match('"%s*[Vv]ersion%s*"%s*:%s*"([^"]+)"')
-      out.orthanc_rest = "reachable"
-      if ver then out.version = ver end
-      return out
+      if ver then
+        out.orthanc_rest = "reachable"
+        out.version = ver
+        return out
+      end
+      -- If JSON but no Version, treat as not Orthanc and keep checking
     end
-    -- If 401 without creds, don’t error—just fall through to OHIF check
   end
 
-  -- 2) Try OHIF Viewer detection (HTML root)
+  -- 2) OHIF Viewer detection (root HTML)
   do
     local resp = try_http(host, port, "/", { timeout = 5000 })
     if resp and resp.status and resp.body then
       local body = resp.body
-      if body:find("OHIF%W*Viewer") or body:find("window%.config") or body:find("ohif") then
+      -- A few robust signals without being too specific
+      if body:find("OHIF") or body:find("ohif") or body:find("OHIF Viewer")
+         or body:find("window%.config") or body:find("app%-config%.js") then
         return { ["ohif_viewer"] = "detected" }
       end
     end
   end
 
-  -- Nothing to report
   return nil
 end

@@ -58,7 +58,7 @@ jobs:
           OUT="nmap_http_${{ matrix.target.name }}.txt"
           nmap \
             -p ${{ matrix.target.port }} \
-            --script dicom-web-info ${{ matrix.target.args }} \
+            --script dicom-web-info -d 2 ${{ matrix.target.args }} \
             127.0.0.1 | tee "$OUT"
           echo "out=$OUT" >> $GITHUB_OUTPUT
 

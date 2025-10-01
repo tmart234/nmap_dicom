@@ -9,102 +9,109 @@ on:
 jobs:
   rust-dicom-ping:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install deps
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y nmap docker-compose netcat-openbsd curl
+          sudo apt-get install -y nmap netcat-openbsd iproute2 lsof docker.io docker-compose
 
-      - name: Install Nmap script + lib
+      - name: Install custom Nmap dicom-ping
         run: |
-          set -eux
           sudo mkdir -p /usr/share/nmap/scripts /usr/share/nmap/nselib
           sudo cp scripts/dicom-ping.nse /usr/share/nmap/scripts/
-          sudo cp nselib/dicom.lua       /usr/share/nmap/nselib/
+          sudo cp nselib/dicom.lua /usr/share/nmap/nselib/
           sudo nmap --script-updatedb
 
-      - name: Start upstream Orthanc (DIMSE on 11112)
+      # Upstream target only (so the Rust proxy can accept and forward associations)
+      - name: Start Orthanc upstream (DIMSE 4242)
         run: |
           set -eux
           docker run -d --rm --name orthanc_up \
-            -p 11112:4242 -p 8042:8042 \
+            -p 4242:4242 -p 8042:8042 \
             -e ORTHANC__REMOTE_ACCESS_ALLOWED=true \
             orthancteam/orthanc:latest
-          # wait for DIMSE (mapped to host 11112)
-          for i in {1..60}; do nc -z 127.0.0.1 11112 && break; sleep 1; done
-          nc -z 127.0.0.1 11112
+          # Wait until Orthanc DIMSE 4242 is accepting connections
+          for i in {1..60}; do
+            if nc -z 127.0.0.1 4242; then echo "Orthanc DIMSE is up"; break; fi
+            sleep 1
+          done
+          nc -z 127.0.0.1 4242
 
-      - name: Install Rust proxy SCP
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dicom-scpproxy
         run: |
           set -eux
           cargo install --locked dicom-scpproxy
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Start Rust DICOM SCP (dicom-scpproxy on 11116)
+      - name: Start Rust DIMSE SCP (dicom-scpproxy on 11116)
         run: |
           set -eux
-          PORT=11116
-          LOG=rust_scpproxy.log
-          BIN="$HOME/.cargo/bin/dicom-scpproxy"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # Start the proxy so it LISTENS on 11116 and forwards to Orthanc's DIMSE on 4242.
+          # NOTE: CLI flags here are the common ones; adjust if your version differs.
+          nohup dicom-scpproxy \
+            --listen 0.0.0.0:11116 \
+            --connect 127.0.0.1:4242 \
+            --accept-any \
+            > scpproxy.log 2>&1 & echo $! > scpproxy.pid
 
-          # NOTE: adjust flags if your binary differs (check `$BIN --help`)
-          nohup "$BIN" \
-            --bind 0.0.0.0:${PORT} \
-            --upstream 127.0.0.1:11112 \
-            --ae-title RUSTDICOM \
-            --called-aet ORTHANC \
-            --accept-unknown-aet \
-            > "$LOG" 2>&1 &
-
-          echo "pid=$!" >> $GITHUB_OUTPUT
-
-          # Wait for the Rust SCP to LISTEN
+          # Wait for the listener using ss (reliable check for LISTEN state)
           for i in {1..60}; do
-            nc -z 127.0.0.1 ${PORT} && break
-            sleep 0.5
+            if ss -ltn '( sport = :11116 )' | grep -q ':11116'; then
+              echo "dicom-scpproxy is listening on 11116"
+              break
+            fi
+            sleep 1
           done
-          nc -z 127.0.0.1 ${PORT}
-          echo "Rust DICOM SCP is listening on ${PORT}"
-          tail -n +1 "$LOG" | sed -n '1,120p' || true
+          # Double-check with nc (optional)
+          nc -z 127.0.0.1 11116
 
-      - name: Nmap ping Rust DICOM (not Orthanc)
-        id: nmap
+      - name: Nmap ping against Rust DIMSE (11116)
+        id: nmap_ping
         run: |
           set -euxo pipefail
-          OUT="nmap_rust_dicom.txt"
-          # Tell the script which nonstandard port to treat as DICOM and set a called AET that our proxy accepts
-          nmap -p 11116 --script dicom-ping \
-            --script-args dicom-ping.ports=11116,dicom.called_aet=RUSTDICOM \
+          OUT="nmap_rust_dicom_ping.txt"
+          # IMPORTANT: explicitly allow the nonstandard port for the portrule
+          nmap -p 11116 \
+            --script dicom-ping \
+            --script-args dicom-ping.ports=11116,dicom.called_aet=ORTHANC \
             localhost | tee "$OUT"
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
 
-      - name: Assert vendor + version came from Rust side
+      - name: Assert output (vendor/version present, not DCMTK)
         run: |
-          OUT="${{ steps.nmap.outputs.out }}"
-          # Must have vendor and version lines
-          grep -E '^[|]_?\s*vendor:\s*\S'  "$OUT" || { echo "::error::Missing vendor"; exit 1; }
-          grep -E '^[|]_?\s*version:\s*\S' "$OUT" || { echo "::error::Missing version"; exit 1; }
-          # Optional: try to ensure it's NOT DCMTK/Orthanc (best-effort)
-          if grep -qiE 'dcmtk|orthanc' "$OUT"; then
-            echo "::warning::Scan output mentions DCMTK/Orthanc; your proxy may be transparently tunneling Implementation info."
-            echo "If you want the Rust proxy to expose its own Implementation Class/Version, check dicom-scpproxy flags/env."
+          OUT="${{ steps.nmap_ping.outputs.out }}"
+          # Must have the discovery line
+          grep -E 'DICOM Service Provider discovered' "$OUT" || {
+            echo "::error::DICOM service not discovered on Rust port 11116"; exit 1; }
+          # Must have vendor/version lines
+          grep -E '^[|]_?\s*vendor:\s*\S' "$OUT" || { echo "::error::Missing vendor line"; exit 1; }
+          grep -E '^[|]_?\s*version:\s*\S' "$OUT" || { echo "::error::Missing version line"; exit 1; }
+          # Ensure we are not reporting DCMTK (that would mean we somehow hit Orthanc)
+          if grep -E '^[|]_?\s*vendor:\s*DCMTK' "$OUT"; then
+            echo "::error::Vendor shows DCMTK; you likely scanned Orthanc instead of the Rust SCP (port mix-up)."
+            exit 1
           fi
-          sed -n '1,200p' "$OUT"
+          echo "✔ Rust DIMSE was scanned (vendor not DCMTK)."
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rust-dicom-ping
+          name: rust-dicom-ping-artifacts
           path: |
-            ${{ steps.nmap.outputs.out }}
-            rust_scpproxy.log
-          if-no-files-found: ignore
+            scpproxy.log
+            ${{ steps.nmap_ping.outputs.out }}
 
-      - name: Teardown
+      - name: Cleanup
         if: always()
         run: |
+          set -eux
+          if [ -f scpproxy.pid ]; then kill "$(cat scpproxy.pid)" || true; fi
           docker stop orthanc_up || true
-          pkill -f dicom-scpproxy || true

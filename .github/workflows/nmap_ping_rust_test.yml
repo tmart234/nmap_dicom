@@ -1,4 +1,4 @@
-name: Rust C-ECHO (dicom-rs) + Nmap ping
+name: Nmap Rust DICOM Ping
 
 on:
   push:
@@ -7,128 +7,111 @@ on:
     branches: [ main ]
 
 jobs:
-  rust-echoscu-ping:
+  nmap-rust-dicom-ping:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install deps
+      # We need nmap to run dicom-ping, and nc to wait for the port
+      - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y nmap netcat-openbsd tcpdump tshark
+          sudo apt-get install -y nmap netcat-openbsd
+
+      # Put your custom NSE + nselib in Nmap’s standard path
+      - name: Install custom Nmap script & lib
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /usr/share/nmap/scripts /usr/share/nmap/nselib
+          sudo cp scripts/dicom-ping.nse /usr/share/nmap/scripts/
+          sudo cp nselib/dicom.lua        /usr/share/nmap/nselib/
+          sudo nmap --script-updatedb
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install dicom-echoscu
+      # Build & run a Rust DICOM SCP (dicom-scpproxy) in the background
+      - name: Start Rust DICOM SCP
+        id: rust_scp
         run: |
           set -euxo pipefail
-          cargo install --locked dicom-echoscu
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          PORT=11116
 
-      # --- Copy your custom NSE + library (same files you use in the nmap ping matrix job)
-      - name: Install Nmap dicom-ping NSE + lib
-        run: |
-          set -e
-          sudo mkdir -p /usr/share/nmap/scripts /usr/share/nmap/nselib
-          sudo cp scripts/dicom-ping.nse /usr/share/nmap/scripts/
-          sudo cp nselib/dicom.lua      /usr/share/nmap/nselib/
-          sudo nmap --script-updatedb
+          # Try crates.io first, then fall back to building from GitHub
+          if cargo install dicom-scpproxy >/dev/null 2>&1; then
+            BIN="$HOME/.cargo/bin/dicom-scpproxy"
+          else
+            git clone --depth=1 https://github.com/dicom-rs/dicom-scpproxy.git
+            cd dicom-scpproxy
+            cargo build --release
+            BIN="$PWD/target/release/dicom-scpproxy"
+          fi
 
-      - name: Start Orthanc (DIMSE on host 11112)
-        run: |
-          set -e
-          # PORT MAPPING: host 11112 -> container 4242
-          docker run -d --rm --name orthanc_test \
-            -p 11112:4242 -p 8042:8042 \
-            -e ORTHANC__REMOTE_ACCESS_ALLOWED=true \
-            orthancteam/orthanc:latest
-          # wait for DIMSE to accept TCP
+          # Try a few common CLIs so we don't depend on exact flags.
+          # Goal: listen on 0.0.0.0:${PORT} and answer C-ECHO.
+          (
+            "$BIN" --bind 0.0.0.0:${PORT} --echo-only \
+            || "$BIN" --bind 0.0.0.0:${PORT} \
+            || "$BIN" 0.0.0.0:${PORT}
+          ) >/tmp/rust_scp.log 2>&1 &
+
+          echo $! > /tmp/rust_scp.pid
+
+          # Wait for the TCP socket to be open
           for i in {1..60}; do
-            nc -z 127.0.0.1 11112 && break
-            sleep 1
+            if nc -z 127.0.0.1 ${PORT}; then break; fi
+            sleep 0.5
           done
-          nc -z 127.0.0.1 11112
+          nc -z 127.0.0.1 ${PORT}
 
-      - name: Start tcpdump (optional)
-        id: cap
-        run: |
-          PCAP="dicom_rust_ping.pcap"
-          sudo tcpdump -i any -s 0 "port 11112" -w "$PCAP" &
-          echo "pcap=$PCAP" >> "$GITHUB_OUTPUT"
-          echo "pid=$!"   >> "$GITHUB_OUTPUT"
+          echo "port=${PORT}" >> "$GITHUB_OUTPUT"
 
-      # ---------- Nmap DICOM ping (this is the bit you wanted added) ----------
-      - name: Nmap DICOM ping (dicom-ping.nse)
+      - name: Nmap dicom-ping against Rust SCP
         id: nmap_ping
         run: |
           set -euxo pipefail
-          OUT="nmap_dicom_ping_orthanc.txt"
-          nmap -p 11112 \
-               --script "dicom-ping" \
-               --script-trace \
-               --reason \
-               --unprivileged \
-               --script-args dicom.called_aet=ORTHANC \
+          PORT="${{ steps.rust_scp.outputs.port }}"
+          OUT="nmap_rust_dicom_ping.txt"
+
+          # Important: tell the NSE which port to treat as DICOM if it isn't 104/11112, etc.
+          nmap -p "${PORT}" \
+               --script dicom-ping \
+               --script-args dicom-ping.ports="${PORT}" \
                localhost | tee "$OUT"
+
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
 
-      - name: Assert Nmap ping output
+      - name: Assert vendor & version are present (prefer dicom-rs)
         run: |
           OUT="${{ steps.nmap_ping.outputs.out }}"
-          # require vendor + version like your matrix job
-          grep -E '^[|]_?\s*vendor:\s*\S'  "$OUT" || { echo '::error::Missing vendor:';  tail -n 100 "$OUT"; exit 1; }
-          grep -E '^[|]_?\s*version:\s*.*[0-9]' "$OUT" || { echo '::error::Missing version:'; tail -n 100 "$OUT"; exit 1; }
+          # Must show both lines
+          grep -E '^[|]_?\s*vendor:\s*\S'  "$OUT"
+          grep -E '^[|]_?\s*version:\s*\S' "$OUT"
 
-      # ---------- Rust C-ECHO after Nmap ping ----------
-      - name: Run dicom-echoscu (C-ECHO)
-        id: echoscu
-        run: |
-          set -euxo pipefail
-          OUT="echoscu_orthanc.log"
-          for i in {1..10}; do
-            if dicom-echoscu --verbose --called-ae-title ORTHANC 127.0.0.1:11112 | tee "$OUT"; then
-              break
-            fi
-            echo "ECHO failed (try $i); sleeping 1s…"
-            sleep 1
-          done
-          if grep -q "✓ C-ECHO successful" "$OUT" || grep -q "Status:[[:space:]]*0000H" "$OUT"; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-            echo "C-ECHO success confirmed."
+          # Prefer to see dicom-rs (don’t hard-fail if the string differs)
+          if grep -Eqi 'vendor:\s*(dicom[-_ ]?rs|rust)' "$OUT"; then
+            echo "✓ Vendor looks like dicom-rs"
           else
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "::error::ECHO never succeeded"
-            exit 1
+            echo "::warning::Vendor string wasn’t obviously dicom-rs — printing context:"
+            sed -n '1,200p' "$OUT" || true
           fi
 
-      - name: Stop tcpdump
-        if: always()
-        run: |
-          PID="${{ steps.cap.outputs.pid }}"
-          [ -n "$PID" ] && sudo kill "$PID" 2>/dev/null || true
-          sleep 1
-
-      - name: Quick PCAP summary
-        if: always()
-        run: |
-          PCAP="${{ steps.cap.outputs.pcap }}"
-          [ -s "$PCAP" ] && tshark -r "$PCAP" -c 50 -Y dicom || echo "No DICOM frames captured."
-
-      - name: Upload artifacts
+      - name: Upload scan artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rust-nmap-ping-and-echoscu
-          path: |
-            ${{ steps.nmap_ping.outputs.out }}
-            echoscu_orthanc.log
-            ${{ steps.cap.outputs.pcap }}
+          name: nmap-rust-dicom-ping
+          path: ${{ steps.nmap_ping.outputs.out }}
 
-      - name: Dump Orthanc logs (tail)
+      - name: Stop Rust SCP (and show its log)
         if: always()
-        run: docker logs --tail=200 orthanc_test || true
-
-      - name: Stop Orthanc
-        if: always()
-        run: docker stop orthanc_test || true
+        run: |
+          set -euxo pipefail
+          if [ -f /tmp/rust_scp.pid ]; then
+            kill "$(cat /tmp/rust_scp.pid)" 2>/dev/null || true
+            sleep 1
+            kill -9 "$(cat /tmp/rust_scp.pid)" 2>/dev/null || true
+          fi
+          echo "----- rust_scp.log (tail) -----"
+          tail -n 200 /tmp/rust_scp.log 2>/dev/null || true

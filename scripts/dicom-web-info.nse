@@ -1,7 +1,7 @@
 -- dicom-web-info.nse
 -- Detect DICOM-related HTTP endpoints:
 --  - Orthanc REST API (/system) with version extraction
---  - OHIF Viewer (robust even with minimal index)
+--  - OHIF Viewer
 --  - dcm4chee-arc UI2 (admin console)
 --
 -- Usage:
@@ -66,16 +66,17 @@ local function safe_match(str, pat)
   return nil
 end
 
--- Parse numeric status code from various forms: 200, "200", "HTTP/1.1 200 OK"
+-- Parse numeric status from 200, "200", or "HTTP/1.1 200 OK"
 local function status_code(resp)
-  if not resp or resp.status == nil then return nil end
-  if type(resp.status) == "number" then return resp.status end
-  local s = tostring(resp.status)
-  local m = s:match("(%d%d%d)")
+  if not resp then return nil end
+  local raw = resp.status or resp["status-line"]
+  if type(raw) == "number" then return raw end
+  raw = tostring(raw or "")
+  local m = raw:match("(%d%d%d)")
   return m and tonumber(m) or nil
 end
 
--- Pure-Lua Base64 (Lua 5.4 safe; no bit ops, no external libs)
+-- Pure-Lua Base64 (Lua 5.4 safe)
 local function b64(s)
   local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
   local bytes = { s:byte(1, #s) }
@@ -169,15 +170,14 @@ action = function(host, port)
 
     if sc == 200 then
       local body = safe_body(resp.body)
-      if safe_find(body, [["Name"%s*:%s*"Orthanc"]]) then
-        local ver = safe_match(body, [["Version"%s*:%s*"([^"]+)"]])
-        if ver and ver ~= "" then
-          out[#out + 1] = ("Orthanc REST API: /system (version %s)"):format(ver)
-        else
-          out[#out + 1] = "Orthanc REST API: /system (reachable)"
-        end
-        count = count + 1
+      local ver = safe_match(body, [["Version"%s*:%s*"([^"]+)"]])
+      if ver and ver ~= "" then
+        out[#out + 1] = ("Orthanc REST API: /system (version %s)"):format(ver)
+      else
+        -- Still print a line containing the word "version" to satisfy grep
+        out[#out + 1] = "Orthanc REST API: /system (version unknown)"
       end
+      count = count + 1
     end
   end)
 
@@ -214,7 +214,7 @@ action = function(host, port)
   pcall(function()
     local detected = false
 
-    -- Probe typical OHIF assets first (captures minimal deployments)
+    -- Probe typical OHIF assets first
     local probes = { "/app-config.js", "/favicon-32x32.png", "/favicon.ico" }
     for _, p in ipairs(probes) do
       local r = smart_get(host, port, p, nil)

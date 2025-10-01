@@ -18,7 +18,7 @@ jobs:
             service: orthanc
             port: 8042
             expect: "Orthanc REST API: /system (version"
-            args: "--script-args dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc"
+            args: "--script-args dicom-web.ssl=false,dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc"
           - name: ohif-viewer
             compose: docker/docker-compose.web.yml
             service: viewer

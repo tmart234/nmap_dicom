@@ -6,19 +6,22 @@
 --
 -- Usage:
 --   nmap -p 8042,3000,8080 --script dicom-web-info <target>
---   nmap --script dicom-web-info --script-args dicom-web.ports=8042,3000,8080,dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc <target>
+--   nmap --script dicom-web-info \
+--        --script-args dicom-web.ports=8042,3000,8080,dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc \
+--        <target>
 --
 author = "Tyler M"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
-categories = {"discovery","safe","version"}
+categories = {"discovery", "safe", "version"}
 
 local shortport = require "shortport"
 local http      = require "http"
 local stdnse    = require "stdnse"
 local string    = require "string"
-local base64    = require "base64"
 
--- ---------- helpers ----------
+-- optional base64 (API differs across Nmap versions)
+local base64_ok, base64 = pcall(require, "base64")
+
 local function parse_ports_arg(s)
   if not s then return nil end
   local t = {}
@@ -35,66 +38,97 @@ local function to_s(v)
 end
 
 local function lc(v) return to_s(v):lower() end
-
 local function hget(h, k)
   if not h then return nil end
   return h[k] or h[string.lower(k)] or h[string.upper(k)]
 end
-
 local function body_has(b, needle)
   return b and string.find(lc(b), lc(needle), 1, true) ~= nil
 end
 
--- ---------- portrule ----------
+-- Build Authorization: Basic ... header safely across Nmap versions
+local function make_basic_auth(user, pass)
+  if not (user and pass) then return nil end
+  -- Prefer base64.enc; fall back to base64.encode if present
+  if base64_ok and base64 then
+    local f = base64.enc or base64.encode
+    if f then
+      return "Basic " .. f(("%s:%s"):format(user, pass))
+    end
+  end
+  -- As a last resort, try http.basic_auth if available (guarded)
+  local ok, auth = pcall(function()
+    return http.basic_auth and http.basic_auth(user, pass) or nil
+  end)
+  if ok then return auth end
+  return nil
+end
+
+-- Decide SSL use: default to false except common HTTPS ports, allow override via arg
+local function decide_ssl(port)
+  local override = stdnse.get_script_args("dicom-web.ssl")
+  if override ~= nil then
+    local v = lc(override)
+    return (v == "true" or v == "1" or v == "yes")
+  end
+  local n = port.number or 0
+  if n == 443 or n == 8443 then return true end
+  return false
+end
+
 portrule = function(host, port)
   if not (port.protocol == "tcp" and port.state == "open") then return false end
   local set = parse_ports_arg(stdnse.get_script_args("dicom-web.ports"))
   if set and set[port.number] then return true end
-  return shortport.port_or_service({80,443,8042,3000,8080}, {"http","https"}, "tcp")(host, port)
+  -- Common web ports
+  return shortport.port_or_service({80, 443, 8042, 3000, 8080, 8443}, {"http","https"}, "tcp")(host, port)
 end
 
--- ---------- action ----------
 action = function(host, port)
   local out = stdnse.output_table()
-  local use_ssl = shortport.ssl(host, port)
+  local use_ssl = decide_ssl(port)
 
-  -- ----- Orthanc (/system, Basic auth optional) -----
+  -- ---------- Orthanc ----------
   do
     local user = stdnse.get_script_args("dicom-web.orthanc.user")
     local pass = stdnse.get_script_args("dicom-web.orthanc.pass")
-    local hdr  = { ["Accept"] = "application/json" }
+    local hdr  = { ["Accept"]="application/json" }
+    local auth = make_basic_auth(user, pass)
+    if auth then hdr["Authorization"] = auth end
 
-    if user and pass then
-      hdr["Authorization"] = "Basic " .. base64.encode(("%s:%s"):format(user, pass))
+    -- try once with decided ssl; if we get a 400/plain text (likely TLS sent to HTTP or vice versa), flip and retry
+    local function try_get(ssl_flag)
+      local ok, resp = pcall(http.get, host, port, "/system", { timeout=5000, ssl=ssl_flag, header=hdr })
+      return ok and resp or nil
     end
 
-    local ok, resp = pcall(http.get, host, port, "/system", { timeout=5000, ssl=use_ssl, header=hdr })
-    if ok and resp and resp.status then
+    local resp = try_get(use_ssl)
+    if not resp or (resp.status == 400 and resp.body and body_has(resp.body, "Bad Request")) then
+      resp = try_get(not use_ssl)
+    end
+
+    if resp and resp.status then
       if resp.status == 401 or resp.status == 403 then
         table.insert(out, "Orthanc REST API: /system (authentication required)")
-      elseif resp.status == 200 and resp.body then
-        local body = resp.body
-        -- Be strict: must look like Orthanc JSON
-        if body:find('"%s*Name%s*"%s*:%s*"Orthanc"') then
-          local ver = body:match('"%s*Version%s*"%s*:%s*"([^"]+)"')
-          if ver and #ver > 0 then
-            table.insert(out, ("Orthanc REST API: /system (version %s)"):format(ver))
-          else
-            table.insert(out, "Orthanc REST API: /system (reachable)")
-          end
+      elseif resp.status == 200 and resp.body and resp.body:find('"Name"%s*:%s*"Orthanc"') then
+        local ver = resp.body:match('"Version"%s*:%s*"([^"]+)"')
+        if ver and #ver > 0 then
+          table.insert(out, ("Orthanc REST API: /system (version %s)"):format(ver))
+        else
+          table.insert(out, "Orthanc REST API: /system (reachable)")
         end
       end
     end
   end
 
-  -- ----- dcm4chee-arc UI2 -----
+  -- ---------- dcm4chee-arc UI2 ----------
   do
     local paths = {"/dcm4chee-arc/ui2/index.html", "/dcm4chee-arc/ui2/"}
     for _, p in ipairs(paths) do
       local ok, resp = pcall(http.get, host, port, p, { timeout=5000, ssl=use_ssl })
       if ok and resp and resp.status and resp.body then
-        local server = lc(hget(resp.header, "Server"))
-        local loc    = lc(hget(resp.header, "Location"))
+        local server = lc(hget(resp.header, "Server") or "")
+        local loc    = lc(hget(resp.header, "Location") or "")
         local bdy    = lc(resp.body)
         local looks_like_arc =
           bdy:find("dcm4chee%-arc", 1, true) or
@@ -114,7 +148,7 @@ action = function(host, port)
     end
   end
 
-  -- ----- OHIF -----
+  -- ---------- OHIF ----------
   do
     local ok, resp = pcall(http.get, host, port, "/", { timeout=5000, ssl=use_ssl })
     if ok and resp and resp.status == 200 and resp.body then

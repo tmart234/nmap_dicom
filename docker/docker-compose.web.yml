@@ -1,0 +1,29 @@
+version: "3.8"
+services:
+  orthanc:
+    image: orthancteam/orthanc:latest
+    container_name: orthanc_test
+    ports:
+      - "8042:8042"      # HTTP
+      - "4242:4242"      # DICOM
+    environment:
+      # Orthanc creates a default "orthanc:orthanc" user if none provided.
+      # You can override explicitly if you want:
+      # ORTHANC__REGISTERED_USERS: |
+      #   {"orthanc": "orthanc"}
+      ORTHANC__REMOTE_ACCESS_ALLOWED: "true"
+      ORTHANC__VERBOSE_STARTUP: "true"
+    volumes:
+      - orthanc_db:/var/lib/orthanc/db
+
+  viewer:
+    image: ohif/app:latest      # new OHIF image name
+    container_name: ohif_viewer_test
+    ports:
+      - "3000:80"               # expose on 3000
+    environment:
+      - PUBLIC_URL=/            # fine for local
+    # OHIF can run without a DICOMweb config for our detection; no volume needed.
+
+volumes:
+  orthanc_db:

@@ -1,26 +1,21 @@
 -- scripts/dicom-http.nse
 --[[
-Detects DICOM-related HTTP surfaces:
-  * Orthanc REST: fetches /system and reports version (supports Basic Auth)
-  * OHIF Viewer: detects via landing page markers
+Detect Orthanc REST (report version) and/or OHIF Viewer over HTTP(S).
 
 @usage
-nmap -p8042 --script dicom-http <target>
 nmap -p8042 --script dicom-http --script-args dicom-http.user=orthanc,dicom-http.pass=orthanc <target>
-nmap -p80,443,3000 --script dicom-http <target>
-nmap --script dicom-http --script-args dicom-http.ports=8042,3000 <target>
+nmap -p3000 --script dicom-http <target>
 
 @output
 PORT     STATE SERVICE
 8042/tcp open  http
 | dicom-http:
-|   orthanc: REST reachable
-|_  version: 1.12.0
+|   orthanc_rest: reachable
+|_  version: 1.12.9
 
 PORT     STATE SERVICE
 3000/tcp open  http
-| dicom-http:
-|_  ohif_viewer: detected
+|_dicom-http: ohif_viewer: detected
 ]]
 
 author = "Tyler M"
@@ -30,8 +25,10 @@ categories = {"discovery","safe","version"}
 local shortport = require "shortport"
 local http      = require "http"
 local stdnse    = require "stdnse"
-local base64    = require "base64"
 local string    = require "string"
+
+-- base64 is optional; load safely
+local base64_ok, base64 = pcall(require, "base64")
 
 local function parse_ports_arg(s)
   if not s then return nil end
@@ -42,32 +39,28 @@ end
 
 portrule = function(host, port)
   if not (port.protocol == "tcp" and port.state == "open") then return false end
-  -- Optional explicit list override
-  local arg = stdnse.get_script_args("dicom-http.ports")
-  local set = parse_ports_arg(arg)
+  -- allow explicit override
+  local set = parse_ports_arg(stdnse.get_script_args("dicom-http.ports"))
   if set and set[port.number] then return true end
-  -- Otherwise: only HTTP(S) services/ports
+  -- default interesting ports
   return shortport.port_or_service({80, 443, 8042, 3000}, {"http","https"}, "tcp")(host, port)
 end
 
-local function is_https(port)
-  local name = (port.service or port.version and port.version.name) or ""
-  name = type(name) == "string" and name:lower() or ""
-  return name == "https" or port.tls == true or port.number == 443
+local function try_http(host, port, path, opts)
+  local ok, resp = pcall(http.get, host, port, path, opts)
+  if not ok or not resp then return nil end
+  return resp
 end
 
-local function get(host, port, path, user, pass)
-  local opts = {
-    timeout = 5000,
-    header = { ["Accept"] = "application/json, */*;q=0.1" },
-    ssl = is_https(port)
-  }
-  if user and pass then
-    opts.header["Authorization"] = "Basic " .. base64.encode(user .. ":" .. pass)
+local function build_opts(user, pass)
+  local opts = { timeout = 5000, header = { ["Accept"] = "application/json, text/html" } }
+  if user and pass and base64_ok and base64 then
+    local enc = base64.encode or base64.enc
+    if enc then
+      opts.header["Authorization"] = "Basic " .. enc(user .. ":" .. pass)
+    end
   end
-  local ok, resp = pcall(http.get, host, port, path, opts)
-  if not ok then return nil end
-  return resp
+  return opts
 end
 
 action = function(host, port)
@@ -75,38 +68,32 @@ action = function(host, port)
 
   local user = stdnse.get_script_args("dicom-http.user")
   local pass = stdnse.get_script_args("dicom-http.pass")
+  local opts = build_opts(user, pass)
 
   -- 1) Try Orthanc REST /system
   do
-    local resp = get(host, port, "/system", user, pass)
+    local resp = try_http(host, port, "/system", opts)
     if resp and resp.status == 200 and resp.body then
-      local ct = (resp.header and resp.header["content-type"] or ""):lower()
-      if ct:find("json", 1, true) or resp.body:find('"%s*Version%s*"%s*:%s*"', 1) then
-        local ver = resp.body:match('"%s*Version%s*"%s*:%s*"([^"]+)"')
-                   or resp.body:match('"OrthancVersion"%s*:%s*"([^"]+)"')
-        out["orthanc"] = "REST reachable"
-        if ver then out["version"] = ver end
-        return out
-      end
+      -- parse "Version": "x.y.z"
+      local ver = resp.body:match('"%s*[Vv]ersion%s*"%s*:%s*"([^"]+)"')
+      out.orthanc_rest = "reachable"
+      if ver then out.version = ver end
+      return out
     end
-    -- If 401/403 and no creds were supplied, just don’t report; another script-arg run can supply creds.
+    -- If 401 without creds, don’t error—just fall through to OHIF check
   end
 
-  -- 2) Try OHIF Viewer (HTML landing page)
+  -- 2) Try OHIF Viewer detection (HTML root)
   do
-    local resp = get(host, port, "/", nil, nil)
-    if resp and resp.status and resp.status >= 200 and resp.status < 400 and resp.body then
+    local resp = try_http(host, port, "/", { timeout = 5000 })
+    if resp and resp.status and resp.body then
       local body = resp.body
-      -- Common markers: title, window.config, logos, meta
-      if body:find("OHIF", 1, true)
-         or body:match("<title>[^<]*OHIF[^<]*</title>")
-         or body:lower():find("ohif%-viewer", 1, true)
-         or body:lower():find("ohif/app", 1, true) then
-        out["ohif_viewer"] = "detected"
-        return out
+      if body:find("OHIF%W*Viewer") or body:find("window%.config") or body:find("ohif") then
+        return { ["ohif_viewer"] = "detected" }
       end
     end
   end
 
+  -- Nothing to report
   return nil
 end

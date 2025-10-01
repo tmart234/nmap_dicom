@@ -1,7 +1,7 @@
 -- dicom-web-info.nse
 -- Detect DICOM-related HTTP endpoints:
 --  - Orthanc REST API (/system) with version extraction
---  - OHIF Viewer (handles minimal index via /app-config.js probe)
+--  - OHIF Viewer (robust even with minimal index)
 --  - dcm4chee-arc UI2 (admin console)
 --
 -- Usage:
@@ -17,9 +17,6 @@ categories = {"discovery", "safe", "version"}
 local shortport = require "shortport"
 local http      = require "http"
 local stdnse    = require "stdnse"
-
--- optional base64 (API differs across Nmap versions)
-local base64_ok, base64 = pcall(require, "base64")
 
 -- ------------------------ helpers ------------------------
 
@@ -69,23 +66,40 @@ local function safe_match(str, pat)
   return nil
 end
 
--- Build Authorization: Basic ... header safely across Nmap versions
-local function make_basic_auth(user, pass)
-  if not (user and pass) then return nil end
-  if http.basic_auth then
-    local ok, val = pcall(http.basic_auth, user, pass)
-    if ok and type(val) == "string" then return val end
+-- Pure-Lua Base64 (Lua 5.4 safe; no bit ops, no external libs)
+local function b64(s)
+  local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  local bytes = { s:byte(1, #s) }
+  local len = #bytes
+  local padding = (3 - (len % 3)) % 3
+  -- pad with zeros for chunking
+  if padding > 0 then
+    for _ = 1, padding do bytes[#bytes + 1] = 0 end
   end
-  if base64_ok and base64 then
-    local f = base64.enc or base64.encode
-    if f then
-      local ok, enc = pcall(f, ("%s:%s"):format(user, pass))
-      if ok and type(enc) == "string" then
-        return "Basic " .. enc
-      end
+  local out = {}
+  for i = 1, #bytes, 3 do
+    local n = bytes[i] * 65536 + bytes[i + 1] * 256 + bytes[i + 2]
+    local a = math.floor(n / 262144) % 64       -- n >> 18
+    local b = math.floor(n / 4096) % 64         -- (n >> 12) & 63
+    local c = math.floor(n / 64) % 64           -- (n >> 6) & 63
+    local d = n % 64
+    out[#out + 1] = alphabet:sub(a + 1, a + 1)
+    out[#out + 1] = alphabet:sub(b + 1, b + 1)
+    out[#out + 1] = alphabet:sub(c + 1, c + 1)
+    out[#out + 1] = alphabet:sub(d + 1, d + 1)
+  end
+  if padding > 0 then
+    out[#out] = "="
+    if padding == 2 then
+      out[#out - 1] = "="
     end
   end
-  return nil
+  return table.concat(out)
+end
+
+local function make_basic_auth(user, pass)
+  if not (user and pass) then return nil end
+  return "Basic " .. b64(("%s:%s"):format(user, pass))
 end
 
 -- ------------------------ portrule ------------------------
@@ -103,7 +117,7 @@ end
 
 -- ------------------------ HTTP wrappers ------------------------
 
--- Try a request with an optional TLS option (only 'https' is supported on your runner)
+-- Your Nmap build supports 'https' (not 'ssl') in http.get options.
 local function try_http_get(host, port, path, hdr, use_https)
   local opts = { timeout = 7000, header = hdr }
   if use_https ~= nil then opts["https"] = use_https and true or false end
@@ -113,9 +127,7 @@ local function try_http_get(host, port, path, hdr, use_https)
   return resp
 end
 
--- Generic GET:
--- 1) Plain (no TLS flag) — works for HTTP (Orthanc:8042, OHIF:3000)
--- 2) If 400 Bad Request (likely HTTPS endpoint), retry with https=true
+-- 1) Plain (no TLS flag). 2) If 400 Bad Request, retry with https=true.
 local function smart_get(host, port, path, hdr)
   local resp = try_http_get(host, port, path, hdr, nil)
   if resp and resp.status == 400 and body_has(resp.body, "bad request") then
@@ -134,6 +146,7 @@ action = function(host, port)
     pcall(function()
       local user = stdnse.get_script_args("dicom-web.orthanc.user")
       local pass = stdnse.get_script_args("dicom-web.orthanc.pass")
+
       local hdr  = { ["Accept"] = "application/json" }
       local auth = make_basic_auth(user, pass)
       if auth then hdr["Authorization"] = auth end
@@ -194,20 +207,22 @@ action = function(host, port)
     pcall(function()
       local detected = false
 
-      local root = smart_get(host, port, "/", nil)
-      if root and root.status == 200 then
-        if body_has(root.body, "ohif") or body_has(root.body, "app-config.js") then
+      -- Probe typical OHIF assets first (captures minimal deployments)
+      local probes = { "/app-config.js", "/favicon-32x32.png", "/favicon.ico" }
+      for _, p in ipairs(probes) do
+        local r = smart_get(host, port, p, nil)
+        if r and (r.status == 200 or r.status == 304) then
           detected = true
+          break
         end
       end
 
+      -- Then check the root page for hints
       if not detected then
-        local probes = { "/app-config.js", "/favicon-32x32.png", "/favicon.ico" }
-        for _, p in ipairs(probes) do
-          local r = smart_get(host, port, p, nil)
-          if r and (r.status == 200 or r.status == 304) then
+        local root = smart_get(host, port, "/", nil)
+        if root and root.status == 200 then
+          if body_has(root.body, "ohif") or body_has(root.body, "app-config.js") then
             detected = true
-            break
           end
         end
       end

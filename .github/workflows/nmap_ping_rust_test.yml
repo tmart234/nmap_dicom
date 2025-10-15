@@ -13,10 +13,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Basic system tools only — Docker already installed on runner
       - name: Install tools
         run: |
           sudo apt-get update
-          # Install the small tools we need. Do NOT install docker.io/containerd here
           sudo apt-get install -y nmap netcat-openbsd iproute2 lsof
 
       - name: Install custom Nmap dicom-ping
@@ -35,7 +35,10 @@ jobs:
             orthancteam/orthanc:latest
           # Wait until Orthanc DIMSE 4242 is accepting connections
           for i in {1..60}; do
-            if nc -z 127.0.0.1 4242; then echo "Orthanc DIMSE is up"; break; fi
+            if nc -z 127.0.0.1 4242; then
+              echo "Orthanc DIMSE is up"
+              break
+            fi
             sleep 1
           done
           nc -z 127.0.0.1 4242
@@ -53,21 +56,40 @@ jobs:
         run: |
           set -eux
           export PATH="$HOME/.cargo/bin:$PATH"
-          nohup dicom-scpproxy \
+
+          echo "Starting dicom-scpproxy..."
+          # Delay a few seconds to ensure Orthanc is ready
+          sleep 5
+          dicom-scpproxy \
             --listen 0.0.0.0:11116 \
             --connect 127.0.0.1:4242 \
             --accept-any \
-            > scpproxy.log 2>&1 & echo $! > scpproxy.pid
+            --dictionary standard \
+            > scpproxy.log 2>&1 &
+          echo $! > scpproxy.pid
 
-          # Wait for the listener using ss (reliable check for LISTEN state)
+          echo "Waiting for dicom-scpproxy to bind port 11116..."
           for i in {1..60}; do
-            if ss -ltn '( sport = :11116 )' | grep -q ':11116'; then
+            if ss -ltn | grep -q ':11116'; then
               echo "dicom-scpproxy is listening on 11116"
               break
             fi
             sleep 1
           done
-          nc -z 127.0.0.1 11116
+
+          if ! ss -ltn | grep -q ':11116'; then
+            echo "dicom-scpproxy failed to start. Log output follows:"
+            cat scpproxy.log || true
+            exit 1
+          fi
+
+      - name: Debug scpproxy log and sockets
+        if: always()
+        run: |
+          echo "---- dicom-scpproxy.log ----"
+          cat scpproxy.log || echo "(no log file)"
+          echo "---- Listening sockets ----"
+          ss -ltn
 
       - name: Nmap ping against Rust DIMSE (11116)
         id: nmap_ping
@@ -88,7 +110,7 @@ jobs:
           grep -E '^[|]_?\s*vendor:\s*\S' "$OUT" || { echo "::error::Missing vendor line"; exit 1; }
           grep -E '^[|]_?\s*version:\s*\S' "$OUT" || { echo "::error::Missing version line"; exit 1; }
           if grep -E '^[|]_?\s*vendor:\s*DCMTK' "$OUT"; then
-            echo "::error::Vendor shows DCMTK; you likely scanned Orthanc instead of the Rust SCP (port mix-up)."
+            echo "::error::Vendor shows DCMTK; likely scanned Orthanc instead of Rust SCP (port mix-up)."
             exit 1
           fi
           echo "✔ Rust DIMSE was scanned (vendor not DCMTK)."
@@ -106,5 +128,7 @@ jobs:
         if: always()
         run: |
           set -eux
-          if [ -f scpproxy.pid ]; then kill "$(cat scpproxy.pid)" || true; fi
+          if [ -f scpproxy.pid ]; then
+            kill "$(cat scpproxy.pid)" || true
+          fi
           docker stop orthanc_up || true

@@ -16,7 +16,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y nmap netcat-openbsd iproute2 lsof docker.io docker-compose
+          # Install the small tools we need. Do NOT install docker.io/containerd here
+          sudo apt-get install -y nmap netcat-openbsd iproute2 lsof
 
       - name: Install custom Nmap dicom-ping
         run: |
@@ -25,7 +26,6 @@ jobs:
           sudo cp nselib/dicom.lua /usr/share/nmap/nselib/
           sudo nmap --script-updatedb
 
-      # Upstream target only (so the Rust proxy can accept and forward associations)
       - name: Start Orthanc upstream (DIMSE 4242)
         run: |
           set -eux
@@ -53,8 +53,6 @@ jobs:
         run: |
           set -eux
           export PATH="$HOME/.cargo/bin:$PATH"
-          # Start the proxy so it LISTENS on 11116 and forwards to Orthanc's DIMSE on 4242.
-          # NOTE: CLI flags here are the common ones; adjust if your version differs.
           nohup dicom-scpproxy \
             --listen 0.0.0.0:11116 \
             --connect 127.0.0.1:4242 \
@@ -69,7 +67,6 @@ jobs:
             fi
             sleep 1
           done
-          # Double-check with nc (optional)
           nc -z 127.0.0.1 11116
 
       - name: Nmap ping against Rust DIMSE (11116)
@@ -77,7 +74,6 @@ jobs:
         run: |
           set -euxo pipefail
           OUT="nmap_rust_dicom_ping.txt"
-          # IMPORTANT: explicitly allow the nonstandard port for the portrule
           nmap -p 11116 \
             --script dicom-ping \
             --script-args dicom-ping.ports=11116,dicom.called_aet=ORTHANC \
@@ -87,13 +83,10 @@ jobs:
       - name: Assert output (vendor/version present, not DCMTK)
         run: |
           OUT="${{ steps.nmap_ping.outputs.out }}"
-          # Must have the discovery line
           grep -E 'DICOM Service Provider discovered' "$OUT" || {
             echo "::error::DICOM service not discovered on Rust port 11116"; exit 1; }
-          # Must have vendor/version lines
           grep -E '^[|]_?\s*vendor:\s*\S' "$OUT" || { echo "::error::Missing vendor line"; exit 1; }
           grep -E '^[|]_?\s*version:\s*\S' "$OUT" || { echo "::error::Missing version line"; exit 1; }
-          # Ensure we are not reporting DCMTK (that would mean we somehow hit Orthanc)
           if grep -E '^[|]_?\s*vendor:\s*DCMTK' "$OUT"; then
             echo "::error::Vendor shows DCMTK; you likely scanned Orthanc instead of the Rust SCP (port mix-up)."
             exit 1

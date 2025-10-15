@@ -117,7 +117,7 @@ action = function(host, port)
 
   -- Handle association rejection
   if dcm_status == false then
-    stdnse.debug1("Association failed: %s", err or "Unknown error")
+    stdnse.debug(level1, "Association failed: %s", err or "Unknown error")
     -- Check if the failure was specifically due to AET rejection
     if err == "ASSOCIATE REJECT received" then
       -- Set service name to dicom even on failure if reject is received
@@ -131,7 +131,7 @@ action = function(host, port)
         output.config = string.format("Association Rejected (Tried AET: %s)", called_aet_arg)
       end   
     end
-    stdnse.debug1("Final output table contents (on failure):\n%s", stdnse.format_output(true, output))
+    stdnse.debug(level1, "Final output table contents (on failure):\n%s", stdnse.format_output(true, output))
     if output.dicom then return output else return nil end
   end
 
@@ -158,7 +158,7 @@ action = function(host, port)
   if output.version then port.version.version = output.version end
   nmap.set_port_version(host, port)
 
-  stdnse.debug1("Final output table contents (on success):\n%s", stdnse.format_output(true, output))
+  stdnse.debug(level1, "Final output table contents (on success):\n%s", stdnse.format_output(true, output))
 
   return output
 end

@@ -165,9 +165,10 @@ action = function(host, port)
   local no_defs   = truthy(stdnse.get_script_args("dicom-web.no-defaults") or "false")
 
   -- structures
-  out.orthanc  = {}
-  out.ui       = {}
-  out.dicomweb = { bases = {} }
+  out.orthanc  = stdnse.output_table()
+  out.ui       = stdnse.output_table()
+  out.dicomweb = stdnse.output_table()
+  out.dicomweb.bases = {}
 
   -- TLS hint
   if port.tunnel ~= "ssl" then
@@ -292,7 +293,10 @@ action = function(host, port)
   end
 
   for _, b in ipairs(bases) do
-    local info = { base=b.base, impl=b.impl }
+    -- Ordered per-base output
+    local info = stdnse.output_table()
+    info.base = b.base
+    info.impl = b.impl
 
     -- Reachability (+ Orthanc plugin index hint)
     local r = http_get(host, port, b.base .. "/")
@@ -303,7 +307,7 @@ action = function(host, port)
       end
     end
 
-    -- QIDO
+    -- QIDO (set only when meaningful)
     if do_qido then
       local path = b.base .. "/studies?limit=1"
       local rq = qido_try(host, port, path)
@@ -317,9 +321,8 @@ action = function(host, port)
           if wa then info["www-authenticate"] = wa end
         elseif rq.status == 404 then
           info.qido = "not-found"
-        else
-          info.qido = "unknown"
         end
+        -- omit qido entirely if indeterminate
       end
     end
 

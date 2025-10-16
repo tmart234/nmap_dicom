@@ -156,7 +156,10 @@ end
 
 action = function(host, port)
   local out   = stdnse.output_table()
-  local warn  = {}
+
+  -- stable, pretty warnings
+  local warn = stdnse.output_table()
+  local function addwarn(s) table.insert(warn, s) end
 
   -- toggles (kept minimal)
   local do_qido   = truthy(stdnse.get_script_args("dicom-web.qido-test") or "true")
@@ -172,7 +175,7 @@ action = function(host, port)
 
   -- TLS hint
   if port.tunnel ~= "ssl" then
-    table.insert(warn, "warning: http (no TLS) detected")
+    addwarn("warning: http (no TLS) detected")
   end
 
   -- -------- Orthanc detection --------
@@ -197,7 +200,7 @@ action = function(host, port)
           if def_auth then
             local r_def = http_get(host, port, "/system", { ["Accept"]="application/json", ["Authorization"]=def_auth })
             if r_def and r_def.status == 200 and r_def.body then
-              table.insert(warn, "warning: Orthanc accepts default credentials (orthanc:orthanc)")
+              addwarn("warning: Orthanc accepts default credentials (orthanc:orthanc)")
               orthanc_version = r_def.body:match('"version"%s*:%s*"([^"]+)"') or
                                 r_def.body:match('"Version"%s*:%s*"([^"]+)"') or orthanc_version
             end
@@ -211,7 +214,7 @@ action = function(host, port)
       out.orthanc.auth    = orthanc_auth
       if orthanc_wa then out.orthanc["www-authenticate"] = orthanc_wa end
       if orthanc_auth == "no-auth" then
-        table.insert(warn, "warning: Orthanc /system reachable without authentication")
+        addwarn("warning: Orthanc /system reachable without authentication")
       end
     end
   end
@@ -234,7 +237,7 @@ action = function(host, port)
         if looks then
           out.ui["dcm4chee-arc-ui"] = "/dcm4chee-arc/ui2/"
           if not hget(r.header, "Content-Security-Policy") then
-            table.insert(warn, "advisory: DCM4CHEE UI missing Content-Security-Policy")
+            addwarn("advisory: DCM4CHEE UI missing Content-Security-Policy")
           end
           break
         end
@@ -251,7 +254,7 @@ action = function(host, port)
         ohif = true
       end
       if ohif and not hget(r.header, "Content-Security-Policy") then
-        table.insert(warn, "advisory: OHIF root missing Content-Security-Policy")
+        addwarn("advisory: OHIF root missing Content-Security-Policy")
       end
     end
     if not ohif then
@@ -300,7 +303,7 @@ action = function(host, port)
 
     -- Reachability (+ Orthanc plugin index hint)
     local r = http_get(host, port, b.base .. "/")
-    if r and (r.status == 200 or r.status == 401 or r.status == 403) then
+    if r and (r.status == 200 or r.status == 204 or r.status == 401 or r.status == 403) then
       info.reachable = true
       if b.base == "/dicom-web" and r.status == 200 then
         info["orthanc-plugin-enabled"] = true
@@ -314,7 +317,7 @@ action = function(host, port)
       if rq then
         if is_dicom_json(rq) then
           info.qido = "open"
-          table.insert(warn, ("warning: unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.base, path))
+          addwarn(("warning: unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.base, path))
         elseif rq.status == 401 or rq.status == 403 then
           info.qido = "secured"
           local wa = hget(rq.header, "WWW-Authenticate")
@@ -337,7 +340,7 @@ action = function(host, port)
         local acc  = hget(rc.header, "Access-Control-Allow-Credentials")
         if (acao and lc(acao) == "*") and (acc and truthy(acc)) then
           info.cors_risky = true
-          table.insert(warn, ("warning: risky CORS at %s (ACAO: * with credentials=true)"):format(b.base))
+          addwarn(("warning: risky CORS at %s (ACAO: * with credentials=true)"):format(b.base))
         end
       end
     end
@@ -352,7 +355,7 @@ action = function(host, port)
         local allow = (hget(rs.header, "Allow") or "") .. "," .. (hget(rs.header, "Access-Control-Allow-Methods") or "")
         if lc(allow):find("post", 1, true) and not (rs.status == 401 or rs.status == 403) then
           info.stow_maybe = true
-          table.insert(warn, ("advisory: STOW-RS may allow POST (unauthenticated?) at %s (via OPTIONS)"):format(b.base .. "/studies"))
+          addwarn(("advisory: STOW-RS may allow POST (unauthenticated?) at %s (via OPTIONS)"):format(b.base .. "/studies"))
         end
       end
     end

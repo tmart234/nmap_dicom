@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Hosted runners already have Docker; install only small tools
+      # Small tools only (Docker already available on hosted runner)
       - name: Install tools
         run: |
           set -eux
@@ -106,10 +106,6 @@ jobs:
           DBG="nmap_debug.txt"
 
           # Force our script to run on 11116 and keep it fast/bounded.
-          # -Pn/-n: no host discovery or DNS
-          # --max-retries 0: don't retry probes
-          # --host-timeout/--script-timeout: bound runtimes
-          # -d2 --script-trace: capture NSE debug for artifacts
           nmap -Pn -n -p 11116 \
             --max-retries 0 \
             --host-timeout 45s \
@@ -121,7 +117,7 @@ jobs:
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
           echo "dbg=$DBG" >> "$GITHUB_OUTPUT"
 
-      - name: Assert output (discovered, identity best-effort)
+      - name: Assert output (must show early-close discovery on 11116)
         run: |
           set -e
           OUT="${{ steps.nmap_ping.outputs.out }}"
@@ -135,12 +131,15 @@ jobs:
             exit 1
           fi
 
-          # Identity (vendor/version/UID) is best-effort—don’t fail if proxy closes early
-          if grep -Eq '^[|]_?\s*(vendor|version|impl_uid|uid_root):' "$OUT"; then
-            echo "✔ Identity fields present (vendor/version or UID)."
-          else
-            echo "ℹ Discovered without identity (proxy closed early)."
+          # Specifically require the early-close config line for this target
+          if ! grep -q 'Association ended early by peer' "$OUT"; then
+            echo "::error::Expected 'Association ended early by peer' on port 11116 but did not find it."
+            echo "---- Nmap STDOUT ----"; cat "$OUT" || true
+            echo "---- Nmap NSE debug ----"; tail -n +1 "$DBG" || true
+            exit 1
           fi
+
+          echo "✔ Rust DIMSE discovered and early-close behavior confirmed on 11116."
 
       - name: Nmap sanity check against Orthanc (4242)
         if: always()

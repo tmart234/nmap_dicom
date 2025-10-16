@@ -117,22 +117,30 @@ action = function(host, port)
   -- Expecting: status, err, version, vendor, uid (uid may be nil if peer didn't send it)
   local dcm_status, err, version, vendor, uid = dicom.associate(host, port, nil, called_aet_arg)
 
-  -- Handle association rejection
+  -- association rejection handling
   if dcm_status == false then
     stdnse.debug(1, "Association failed: %s", err or "Unknown error")
-    -- Check if the failure was specifically due to AET rejection
-    if err == "ASSOCIATE REJECT received" then
-      -- Set service name to dicom even on failure if reject is received
+
+    local e = tostring(err or "")
+    local early_close =
+         e:find("Couldn't read ASSOCIATE response:", 1, true)
+      or e:lower():find("could not read pdu", 1, true)
+      or e:lower():find("failed to receive pdu", 1, true)
+      or e:lower():find("connection reset by peer", 1, true)
+
+    if early_close then
+      -- Treat as discovered even if the peer closed after our probe
       port.version.name = "dicom"
       nmap.set_port_version(host, port)
-
-      output.dicom = "DICOM Service Provider discovered!"
-      if not called_aet_arg or called_aet_arg == "ANY-SCP" then
-        output.config = "Called AET check enabled (Rejected ANY-SCP)"
-      else
-        output.config = string.format("Association Rejected (Tried AET: %s)", called_aet_arg)
-      end
+      output.dicom  = "DICOM Service Provider discovered!"
+      output.config = "Association ended early by peer"
+    elseif e == "ASSOCIATE REJECT received" then
+      port.version.name = "dicom"
+      nmap.set_port_version(host, port)
+      output.dicom  = "DICOM Service Provider discovered!"
+      output.config = "Called AET check enabled (Rejected ANY-SCP)"
     end
+
     stdnse.debug(1, "Final output table contents (on failure):\n%s", stdnse.format_output(true, output))
     if output.dicom then return output else return nil end
   end

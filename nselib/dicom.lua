@@ -39,6 +39,44 @@ local MIN_SIZE_ASSOC_REQ = 68
 local MAX_SIZE_PDU = 128000
 local MIN_HEADER_LEN = 6
 local PDU_NAMES = {}
+
+-- generic "UL item" helper: ItemType, 0x00, I2 length, value
+local function ul_item(item_type, value_bytes)
+  return string.pack(">B B I2", item_type, 0x00, #value_bytes) .. value_bytes
+end
+
+-- application-context (0x10), abstract-syntax (0x30), transfer-syntax (0x40)
+local function item_application_context(uid) return ul_item(0x10, uid) end
+local function item_abstract_syntax(uid)    return ul_item(0x30, uid) end
+local function item_transfer_syntax(uid)    return ul_item(0x40, uid) end
+
+-- presentation-context (0x20) with one abstract + one transfer syntax
+local function item_presentation_context(pc_id, abstract_uid, transfer_uid)
+  -- PC ID (1), rsvd (1), rsvd (1), result/ reason (1=0 in RQ)
+  local header = string.pack(">B B B B", pc_id, 0x00, 0x00, 0x00)
+  local payload = header .. item_abstract_syntax(abstract_uid) .. item_transfer_syntax(transfer_uid)
+  return ul_item(0x20, payload)
+end
+
+-- user-information (0x50): max PDU (0x51), impl class UID (0x52), impl version (0x55)
+local function item_max_pdu(max_len)
+  return string.pack(">B B I2 I4", 0x51, 0x00, 0x0004, max_len)
+end
+local function item_impl_uid(uid)     return ul_item(0x52, uid) end
+local function item_impl_version(ver) return ul_item(0x55, ver) end
+
+local function item_user_information(impl_uid, impl_ver, max_pdu_len)
+  local payload = item_max_pdu(max_pdu_len) .. item_impl_uid(impl_uid) .. item_impl_version(impl_ver)
+  return ul_item(0x50, payload)
+end
+
+-- pad AE titles to exactly 16 bytes
+local function pad16(s)
+  s = (s or ""):sub(1,16)
+  if #s < 16 then s = s .. string.rep(" ", 16 - #s) end
+  return s
+end
+
 local PDU_CODES = {}
 
 PDU_CODES =
@@ -498,95 +536,108 @@ end
 --                                                If status is false, dcm_or_error is the error message.
 ---
 function associate(host, port, calling_aet, called_aet)
-  local application_context = ""
-  local presentation_context = ""
-  local userinfo_context = ""
-
   local status, dcm = start_connection(host, port)
   if status == false then
     return false, dcm -- dcm contains the error message from start_connection
   end
 
+  -- ===== helpers scoped to this function (no external deps) =====
+  local function ul_item(item_type, value_bytes)
+    return string.pack(">B B I2", item_type, 0x00, #value_bytes) .. value_bytes
+  end
+  local function item_application_context(uid) return ul_item(0x10, uid) end
+  local function item_abstract_syntax(uid)    return ul_item(0x30, uid) end
+  local function item_transfer_syntax(uid)    return ul_item(0x40, uid) end
+  local function item_presentation_context(pc_id, abstract_uid, transfer_uid)
+    -- For RQ, result/ reason byte must be 0x00
+    local header  = string.pack(">B B B B", pc_id, 0x00, 0x00, 0x00)
+    local payload = header .. item_abstract_syntax(abstract_uid) .. item_transfer_syntax(transfer_uid)
+    return ul_item(0x20, payload)
+  end
+  local function item_max_pdu(max_len)
+    return string.pack(">B B I2 I4", 0x51, 0x00, 0x0004, max_len)
+  end
+  local function item_impl_uid(uid)     return ul_item(0x52, uid) end
+  local function item_impl_version(ver) return ul_item(0x55, ver) end
+  local function item_user_information(impl_uid, impl_ver, max_pdu_len)
+    local payload = item_max_pdu(max_pdu_len) .. item_impl_uid(impl_uid) .. item_impl_version(impl_ver)
+    return ul_item(0x50, payload)
+  end
+  local function pad16(s)
+    s = (s or ""):sub(1,16)
+    if #s < 16 then s = s .. string.rep(" ", 16 - #s) end
+    return s
+  end
+  -- =============================================================
+
   -- Variables to hold results from pcall
   local success, pcall_ret1, pcall_ret2, pcall_ret3
-  local clean_version, vendor, uid_str -- Variables to hold final parsed values
 
-  -- Wrap the main logic in pcall
   success, pcall_ret1, pcall_ret2, pcall_ret3 = pcall(function()
-    -- Local variables for use inside pcall's function
-    local assoc_request, header, err, resp_type, resp_length
-    local received_version_str, received_uid_str
-    local parsed_vendor, parsed_clean_version
+    -- Build A-ASSOCIATE-RQ items properly (no magic lengths)
+    local application_context_name = "1.2.840.10008.3.1.1.1"   -- Application Context Name
+    local abstract_syntax_name     = "1.2.840.10008.1.1"       -- Verification SOP Class
+    local transfer_syntax_name     = "1.2.840.10008.1.2"       -- Implicit VR Little Endian
 
-    -- Build application_context, presentation_context, userinfo_context
-    local application_context_name = "1.2.840.10008.3.1.1.1"
-    application_context = string.pack(">B B s2", 0x10, 0x0, application_context_name)
+    local called_ae_title_val  = pad16(called_aet  or stdnse.get_script_args("dicom.called_aet")  or "ANY-SCP")
+    local calling_ae_title_val = pad16(calling_aet or stdnse.get_script_args("dicom.calling_aet") or "ECHOSCU")
 
-    local abstract_syntax_name = "1.2.840.10008.1.1"
-    local transfer_syntax_name = "1.2.840.10008.1.2"
-    presentation_context = string.pack(">B B I2 B B B B B B s2 B B s2", 0x20, 0x0, 0x2e, 0x1, 0x0,0x0,0x0, 0x30, 0x0, abstract_syntax_name, 0x40, 0x0, transfer_syntax_name)
+    -- Identify ourselves (client); using DCMTK-style identifiers is fine for a scanner client
+    local implementation_id      = "1.2.276.0.7230010.3.0.3.6.2"
+    local implementation_version = "OFFIS_DCMTK_362"
+    local max_pdu_len            = 16384
 
-    local implementation_id = "1.2.276.0.7230010.3.0.3.6.2" -- Client info
-    local implementation_version = "OFFIS_DCMTK_362"      -- Client info
-    userinfo_context = string.pack(">B B I2 B B I2 I4 B B s2 B B s2", 0x50, 0x0, 0x3a, 0x51, 0x0, 0x04, 0x4000, 0x52, 0x0, implementation_id, 0x55, 0x0, implementation_version)
+    local application_context  = item_application_context(application_context_name)
+    local presentation_context = item_presentation_context(1, abstract_syntax_name, transfer_syntax_name)
+    local userinfo_context     = item_user_information(implementation_id, implementation_version, max_pdu_len)
 
-    local called_ae_title_val = called_aet or stdnse.get_script_args("dicom.called_aet") or "ANY-SCP"
-    local calling_ae_title_val = calling_aet or stdnse.get_script_args("dicom.calling_aet") or "ECHOSCU"
-    if #called_ae_title_val > 16 or #calling_ae_title_val > 16 then
-      error("Calling/Called Application Entity Title must be less than 16 bytes")
-    end
-    called_ae_title_val = ("%-16s"):format(called_ae_title_val)
-    calling_ae_title_val = ("%-16s"):format(calling_ae_title_val)
+    -- Fixed part of A-ASSOCIATE-RQ:
+    -- protocol version (I2=0x0001), reserved (I2=0),
+    -- called AE (16), calling AE (16), 32 reserved zero bytes
+    local fixed = string.pack(">I2 I2 c16 c16 c32",
+      0x0001, 0x0000, called_ae_title_val, calling_ae_title_val, string.rep("\0", 32))
 
-    -- ASSOCIATE request body
-    assoc_request = string.pack(">I2 I2 c16 c16 c32", 0x1, 0x0, called_ae_title_val, calling_ae_title_val, "")
-                       .. application_context
-                       .. presentation_context
-                       .. userinfo_context
+    local assoc_body = fixed .. application_context .. presentation_context .. userinfo_context
 
-    local header_status
-    header_status, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"], #assoc_request)
-    if header_status == false then error("Failed to encode PDU header: " .. header) end
-    assoc_request = header .. assoc_request
+    local header_ok, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"], #assoc_body)
+    if header_ok == false then error("Failed to encode PDU header: " .. header) end
+    local assoc_request = header .. assoc_body
 
-    stdnse.debug2("PDU len minus header:%d", #assoc_request-#header)
+    stdnse.debug2("PDU len minus header:%d", #assoc_request - #header)
     if #assoc_request < MIN_SIZE_ASSOC_REQ then
-      error(string.format("ASSOCIATE request PDU must be at least %d bytes and we tried to send %d.", MIN_SIZE_ASSOC_REQ, #assoc_request))
+      error(string.format("ASSOCIATE request PDU must be at least %d bytes and we tried to send %d.",
+            MIN_SIZE_ASSOC_REQ, #assoc_request))
     end
 
     local send_status, send_err = send(dcm, assoc_request)
-    if send_status == false then
+    if not send_status then
       stdnse.debug1("DICOM Associate: send() failed immediately inside pcall. Error: %s", tostring(send_err))
-      error(string.format("Couldn't send ASSOCIATE request:%s", send_err)) -- Re-throw error
+      error(string.format("Couldn't send ASSOCIATE request:%s", send_err))
     else
-        stdnse.debug1("DICOM Associate: send() call completed successfully inside pcall.")
+      stdnse.debug1("DICOM Associate: send() call completed successfully inside pcall.")
     end
 
-    local receive_status, receive_data = receive(dcm)
-    if receive_status == false then error(string.format("Couldn't read ASSOCIATE response:%s", receive_data)) end
-    local response_data = receive_data
+    local receive_status, response_data = receive(dcm)
+    if not receive_status then error(string.format("Couldn't read ASSOCIATE response:%s", response_data)) end
 
     if #response_data < MIN_HEADER_LEN then error("Received response too short for PDU header") end
-    resp_type, _, resp_length = string.unpack(">B B I4", response_data)
+    local resp_type, _, resp_length = string.unpack(">B B I4", response_data)
     stdnse.debug1("PDU Type:%d Length:%d", resp_type, resp_length)
 
     if resp_type ~= PDU_CODES["ASSOCIATE_ACCEPT"] then
       if resp_type == PDU_CODES["ASSOCIATE_REJECT"] then
-         stdnse.debug1("ASSOCIATE REJECT message found!")
-         error("ASSOCIATE REJECT received")
+        stdnse.debug1("ASSOCIATE REJECT message found!")
+        error("ASSOCIATE REJECT received")
       else
-         stdnse.debug1("Received unexpected PDU type: %d", resp_type)
-         error("Received unexpected response PDU type")
+        stdnse.debug1("Received unexpected PDU type: %d", resp_type)
+        error("Received unexpected response PDU type")
       end
     end
 
     stdnse.debug1("ASSOCIATE ACCEPT message found! Parsing User Information.")
-    received_version_str, received_uid_str = parse_implementation_version(response_data)
+    local received_version_str, received_uid_str = parse_implementation_version(response_data)
 
-    -- Initialize parsed_vendor and parsed_clean_version
-    parsed_vendor = nil
-    parsed_clean_version = nil -- This will hold the final cleaned version
-
+    local parsed_vendor, parsed_clean_version = nil, nil
     if received_uid_str then
       local vendor_result = identify_vendor_from_uid(received_uid_str)
       if vendor_result then parsed_vendor = vendor_result end
@@ -595,36 +646,30 @@ function associate(host, port, calling_aet, called_aet)
         stdnse.debug1("Using received_version_str ('%s') for cleaning. Result: %s",
                       received_version_str, parsed_clean_version or "nil")
       end
-
     elseif received_version_str then
-      -- No (useful) UID vendor — try the version string
-      if vendor == nil then
-        local v = (received_version_str or ""):lower()
-        if     v:find("dcm4che",   1, true) then vendor = "dcm4che"
-        elseif v:find("dcmtk",     1, true) then vendor = "DCMTK"
-        elseif v:find("pynetdicom",1, true) then vendor = "pynetdicom"
-        elseif v:find("orthanc",   1, true) then vendor = "Orthanc"
-        end
+      local guess_vendor
+      local v = (received_version_str or ""):lower()
+      if     v:find("dcm4che",   1, true) then guess_vendor = "dcm4che"
+      elseif v:find("dcmtk",     1, true) then guess_vendor = "DCMTK"
+      elseif v:find("pynetdicom",1, true) then guess_vendor = "pynetdicom"
+      elseif v:find("orthanc",   1, true) then guess_vendor = "Orthanc"
       end
-      parsed_clean_version = extract_clean_version(received_version_str, vendor)
+      parsed_clean_version = extract_clean_version(received_version_str, guess_vendor)
+      parsed_vendor = guess_vendor
       stdnse.debug1("Only received_version_str ('%s') available for cleaning. Result: %s",
                     received_version_str, parsed_clean_version or "nil")
     end
 
-
-    -- Final debug log before returning from pcall's function
     stdnse.debug1("Parsed values - Clean Version: %s, Raw UID: %s, Vendor: %s",
                   parsed_clean_version or "nil",
                   received_uid_str or "nil",
                   parsed_vendor or "nil")
 
-    -- Return the results needed by the outer part of associate
-    -- Order: clean_version, vendor, uid_str (uid_str might be useful later)
+    -- Return: clean_version, vendor, uid_str (outer keeps signature)
     return parsed_clean_version, parsed_vendor, received_uid_str
+  end) -- pcall
 
-  end) -- end pcall
-
-  -- *** Manual "finally" block: always close the socket ***
+  -- Always close socket
   if dcm and dcm['socket'] then
     stdnse.debug1("Closing socket after association attempt.")
     dcm['socket']:close()
@@ -635,17 +680,15 @@ function associate(host, port, calling_aet, called_aet)
     stdnse.debug1("Error during association (pcall failed): %s", err_msg)
     return false, err_msg
   else
-    -- pcall returned: clean_version, vendor, uid_str  (keep original NSE signature)
     local clean_version = pcall_ret1
     local vendor        = pcall_ret2
-    local uid_str       = pcall_ret3 
-
+    local uid_str       = pcall_ret3
     stdnse.debug1("Association successful. Final Version: %s, Vendor: %s",
                   clean_version or "nil", vendor or "nil")
-
     return true, nil, clean_version, vendor, uid_str
   end
 end
+
 
 function send_pdata(dicom, data)
   local status, header = pdu_header_encode(PDU_CODES["DATA"], #data)

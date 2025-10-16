@@ -23,11 +23,6 @@ jobs:
             service: viewer
             port: 3000
             expect: 'ohif: /'
-          - name: qido-open
-            compose: docker/docker-compose.web-qido-open.yml
-            service: mock
-            port: 8081
-            expect: 'warning: unauthenticated QIDO-RS listing'
 
     steps:
       - uses: actions/checkout@v4

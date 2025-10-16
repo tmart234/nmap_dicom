@@ -18,13 +18,14 @@ jobs:
             service: orthanc
             port: 8042
             expect: "Orthanc REST API: /system (version"
-            args: "--script-args dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc"
+            # just key=val list here
+            args_kv: "dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc"
           - name: ohif-viewer
             compose: docker/docker-compose.web.yml
             service: viewer
             port: 3000
             expect: "OHIF Viewer: detected at /"
-            args: ""
+            args_kv: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -34,38 +35,71 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nmap docker-compose curl netcat-openbsd
 
-      - name: Install NSE
+      - name: Install updated NSE into /usr/share
         run: |
+          set -euo pipefail
+          # Install our script into the system nmap dir
           sudo mkdir -p /usr/share/nmap/scripts
-          sudo cp scripts/dicom-web-info.nse /usr/share/nmap/scripts/
+          sudo cp -f scripts/dicom-web-info.nse /usr/share/nmap/scripts/dicom-web-info.nse
+          sudo chown root:root /usr/share/nmap/scripts/dicom-web-info.nse
+          sudo chmod 0644 /usr/share/nmap/scripts/dicom-web-info.nse
+
+          # Refresh the script DB so nmap knows about the latest copy
           sudo nmap --script-updatedb
+
+          # Sanity check: confirm categories include "version" (and no "vuln")
+          nmap --script-help dicom-web-info | sed -n '1,80p'
+          echo "---- SHA256 of installed script ----"
+          sha256sum /usr/share/nmap/scripts/dicom-web-info.nse
 
       - name: Up ${{ matrix.target.name }}
         run: |
           set -e
           docker-compose -f ${{ matrix.target.compose }} up -d ${{ matrix.target.service }}
-          # wait for port to be reachable
-          for i in {1..60}; do
-            nc -z localhost ${{ matrix.target.port }} && break
+
+          # Wait for TCP
+          for i in {1..120}; do
+            nc -z 127.0.0.1 ${{ matrix.target.port }} && break
             sleep 0.5
           done
-          nc -zv localhost ${{ matrix.target.port }}
+          nc -zv 127.0.0.1 ${{ matrix.target.port }}
+
+          # Wait for HTTP root to respond (some images take a bit after socket opens)
+          for i in {1..120}; do
+            if curl -fsS -o /dev/null "http://127.0.0.1:${{ matrix.target.port }}/"; then
+              break
+            fi
+            sleep 0.5
+          done
 
       - name: Scan ${{ matrix.target.name }}
         id: scan
+        env:
+          # Point Nmap at system share to avoid the "using /usr/share" warning
+          NMAPDIR: /usr/share/nmap
         run: |
           set -o pipefail
           OUT="nmap_http_${{ matrix.target.name }}.txt"
+
+          # Always enable legacy one-liners for CI greps, then append any matrix args
+          SA="dicom-web.legacy-lines=true"
+          EXTRA="${{ matrix.target.args_kv }}"
+          if [ -n "$EXTRA" ]; then
+            EXTRA="${EXTRA#,}"
+            SA="$SA,$EXTRA"
+          fi
+
           nmap \
             -p ${{ matrix.target.port }} \
-            --script dicom-web-info -d 2 ${{ matrix.target.args }} \
+            --script dicom-web-info \
+            --script-args "$SA" \
             127.0.0.1 | tee "$OUT"
+
           echo "out=$OUT" >> $GITHUB_OUTPUT
 
       - name: Assert ${{ matrix.target.name }} output
         run: |
           OUT="${{ steps.scan.outputs.out }}"
-          # robust match (no indentation assumptions)
           if ! grep -F '${{ matrix.target.expect }}' "$OUT"; then
             echo "::error::Missing expected: ${{ matrix.target.expect }}"
             sed -n '1,200p' "$OUT" || true

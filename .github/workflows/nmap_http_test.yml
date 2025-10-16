@@ -17,7 +17,6 @@ jobs:
             compose: docker/docker-compose.web.yml
             service: orthanc
             port: 8042
-            # match the structured output from the script (no legacy lines)
             expect: "path: /system"
           - name: ohif-viewer
             compose: docker/docker-compose.web.yml
@@ -41,28 +40,53 @@ jobs:
           sudo chown root:root /usr/share/nmap/scripts/dicom-web-info.nse
           sudo chmod 0644 /usr/share/nmap/scripts/dicom-web-info.nse
           sudo nmap --script-updatedb
-          # quick human-readable help (useful in job logs)
           nmap --script-help dicom-web-info | sed -n '1,60p' || true
 
       - name: Up ${{ matrix.target.name }}
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
           docker-compose -f ${{ matrix.target.compose }} up -d ${{ matrix.target.service }}
-          # wait for TCP
+
+          # Wait for TCP
           for i in {1..120}; do
             if nc -z 127.0.0.1 ${{ matrix.target.port }}; then break; fi
             sleep 0.5
           done
           nc -zv 127.0.0.1 ${{ matrix.target.port }}
 
-          # wait for HTTP to respond with any typical code (200/401/403/404)
-          for i in {1..120}; do
-            CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}/" || true)
-            if [ "$CODE" = "200" ] || [ "$CODE" = "401" ] || [ "$CODE" = "403" ] || [ "$CODE" = "404" ]; then
-              break
-            fi
-            sleep 0.5
-          done
+          if [ "${{ matrix.target.name }}" = "orthanc-web" ]; then
+            # 1) Wait for a real auth challenge on /system (401/403 + WWW-Authenticate)
+            for i in {1..120}; do
+              RESP="$(curl -sS -o /dev/null -w '%{http_code} %{www_authenticate}' --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}/system" || true)"
+              read -r CODE WAUTH <<< "$RESP"
+              if { [ "$CODE" = "401" ] || [ "$CODE" = "403" ]; } && [ -n "$WAUTH" ]; then
+                break
+              fi
+              sleep 0.5
+            done
+
+            # 2) Verify default creds succeed (stabilizes version reporting)
+            for i in {1..120}; do
+              CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 -u orthanc:orthanc "http://127.0.0.1:${{ matrix.target.port }}/system" || true)"
+              if [ "$CODE" = "200" ]; then
+                break
+              fi
+              sleep 0.5
+            done
+          else
+            # OHIF: look for a 200 on common mounts
+            for i in {1..120}; do
+              for p in "/" "/viewer/" "/ohif/"; do
+                CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}$p" || true)"
+                if [ "$CODE" = "200" ]; then
+                  break 2
+                fi
+              done
+              sleep 0.5
+            done
+          fi
 
       - name: Scan ${{ matrix.target.name }}
         id: scan
@@ -72,7 +96,7 @@ jobs:
           set -o pipefail
           OUT="nmap_http_${{ matrix.target.name }}.txt"
           nmap -p ${{ matrix.target.port }} --script dicom-web-info 127.0.0.1 | tee "$OUT"
-          echo "out=$OUT" >> $GITHUB_OUTPUT
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
 
       - name: Assert ${{ matrix.target.name }} output
         run: |

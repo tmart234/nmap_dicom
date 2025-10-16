@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Docker is already on hosted runners; install only the small tools
+      # Hosted runners already have Docker; install only small tools
       - name: Install tools
         run: |
           set -eux
@@ -25,7 +25,7 @@ jobs:
           set -eux
           sudo mkdir -p /usr/share/nmap/scripts /usr/share/nmap/nselib
           sudo cp scripts/dicom-ping.nse /usr/share/nmap/scripts/
-          sudo cp nselib/dicom.lua /usr/share/nmap/nselib/
+          sudo cp nselib/dicom.lua     /usr/share/nmap/nselib/
           sudo nmap --script-updatedb
 
       - name: Start Orthanc upstream (DIMSE 4242)
@@ -35,7 +35,7 @@ jobs:
             -p 4242:4242 -p 8042:8042 \
             -e ORTHANC__REMOTE_ACCESS_ALLOWED=true \
             orthancteam/orthanc:latest
-          # Wait until Orthanc DIMSE 4242 is accepting connections
+          # Wait until Orthanc DIMSE is accepting connections
           for i in {1..60}; do
             if nc -z 127.0.0.1 4242; then
               echo "Orthanc DIMSE is up"
@@ -95,14 +95,35 @@ jobs:
 
       - name: Nmap ping against Rust DIMSE (11116)
         id: nmap_ping
+        env:
+          NMAPDIR: /usr/share/nmap
         run: |
           set -euxo pipefail
           OUT="nmap_rust_dicom_ping.txt"
-          nmap -p 11116 \
+
+          # Fast + bounded run:
+          # -Pn: skip host discovery
+          # -n: no DNS
+          # --max-retries 0: no probe retries
+          # --host-timeout: bound the whole host scan
+          # --script-timeout: bound NSE runtime
+          nmap -Pn -n -p 11116 \
+            --max-retries 0 \
+            --host-timeout 45s \
+            --script-timeout 20s \
             --script dicom-ping \
             --script-args dicom-ping.ports=11116,dicom.called_aet=ORTHANC \
             localhost | tee "$OUT"
+
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: If Nmap failed, show proxy log + TCP state
+        if: failure()
+        run: |
+          echo "---- dicom-scpproxy.log (tail) ----"
+          tail -n +1 scpproxy.log || true
+          echo "---- Connections to :11116 ----"
+          ss -tnp state established '( sport = :11116 )' || true
 
       - name: Assert output (vendor/version present)
         run: |

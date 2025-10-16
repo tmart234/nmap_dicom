@@ -25,6 +25,7 @@
 --   dicom-web.ports=8042,3000,8080          (limit portrule)
 --   dicom-web.extra-bases=/pacs/dicom-web,/pacs/rs   (comma-separated extra base paths)
 --   dicom-web.aet=DCM4CHEE                  (AE title to try for dcm4chee AE-scoped base)
+--   dicom-web.legacy-lines=true|false       (default true; emit classic human-readable lines for CI greps)
 --
 -- Examples:
 --   nmap -p 8042,3000 --script dicom-web-info localhost
@@ -124,7 +125,6 @@ local function follow_redirect_once(host, port, resp, hdr)
       -- best-effort: if absolute URL to same host, extract path
       local scheme, hostpart, path = loc:match("^(https?)://([^/]+)(/.*)$")
       if hostpart and path then
-        -- ignore host mismatch; only follow if same target host
         if hostpart == host.targetname or hostpart == host.ip then
           return _generic(host, port, "GET", path, hdr)
         end
@@ -173,6 +173,11 @@ action = function(host, port)
   out.orthanc  = {}
   out.ui       = {}
   out.dicomweb = { bases = {} }
+
+  -- legacy single-line outputs for CI greps (default: true)
+  local legacy_lines = true
+  local arg_legacy = stdnse.get_script_args("dicom-web.legacy-lines")
+  if arg_legacy ~= nil then legacy_lines = truthy(arg_legacy) end
 
   -- TLS/HTTP hint
   local is_tls = (port.tunnel == "ssl")
@@ -235,6 +240,10 @@ action = function(host, port)
       if orthanc_auth == "no-auth" then
         table.insert(warn, "Insecure: Orthanc /system reachable without authentication")
       end
+      if legacy_lines then
+        local v = out.orthanc.version or "unknown"
+        table.insert(out, ("Orthanc REST API: /system (version %s)"):format(v))
+      end
     end
   end
 
@@ -285,14 +294,13 @@ action = function(host, port)
         if body_has(r2.body, "window.config") or body_has(r2.body, "getAppConfig") then
           ohif = true
         end
-        local csp2 = hget(r2.header, "Content-Security-Policy")
-        if ohif and not csp2 then
-          -- header may not exist on static .js, so only advisory if root also lacked CSP; already handled above
-        end
       end
     end
     if ohif then
       out.ui["ohif"] = "/"
+      if legacy_lines then
+        table.insert(out, "OHIF Viewer: detected at /")
+      end
     end
   end
 
@@ -369,7 +377,8 @@ action = function(host, port)
         ["Origin"] = "https://example.com",
         ["Access-Control-Request-Method"] = "GET",
       })
-      if r and r.header then
+      -- if OPTIONS not supported (405), skip CORS evaluation
+      if r and r.header and r.status ~= 405 then
         local acao = hget(r.header, "Access-Control-Allow-Origin")
         local acc  = hget(r.header, "Access-Control-Allow-Credentials")
         if (acao and lc(acao) == "*") and (acc and truthy(acc)) then
@@ -396,13 +405,6 @@ action = function(host, port)
     end
 
     table.insert(out.dicomweb.bases, base_info)
-  end
-
-  -- summarize Orthanc after base checks
-  if next(out.orthanc) ~= nil then
-    if out.orthanc.auth == "no-auth" then
-      -- already warned above
-    end
   end
 
   -- place warnings last

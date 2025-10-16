@@ -146,19 +146,39 @@ end
 -- ---------- lightweight memoization for GET/OPTIONS ----------
 
 local _cache = {}
-local function cache_key(method, path, hdr)
-  local a = ""
-  if hdr then
-    -- only include a couple of headers we vary on
-    local acc = hdr["Accept"] or hdr["accept"] or ""
-    local acrm = hdr["Access-Control-Request-Method"] or ""
-    local origin = hdr["Origin"] or ""
-    a = acc .. "|" .. acrm .. "|" .. origin
+
+local function header_fingerprint(hdr)
+  if not hdr then return "" end
+  -- Normalize and only keep headers we vary on
+  local wanted = {
+    "accept",
+    "authorization",
+    "origin",
+    "access-control-request-method",
+  }
+  local t = {}
+  local map = {}
+  for k, v in pairs(hdr) do
+    map[string.lower(k)] = v
   end
-  return method .. "|" .. path .. "|" .. a
+  for _, k in ipairs(wanted) do
+    local v = map[k]
+    if v then table.insert(t, k .. "=" .. tostring(v)) end
+  end
+  table.sort(t)
+  return table.concat(t, "&")
+end
+
+local function cache_key(method, path, hdr)
+  return method .. "|" .. path .. "|" .. header_fingerprint(hdr)
 end
 
 local function http_get_cached(host, port, path, hdr)
+  -- Do NOT cache auth’d requests
+  local h = hdr or {}
+  if h["Authorization"] or h["authorization"] then
+    return http_get(host, port, path, hdr)
+  end
   local k = cache_key("GET", path, hdr)
   if _cache[k] ~= nil then return _cache[k] end
   local r = http_get(host, port, path, hdr)

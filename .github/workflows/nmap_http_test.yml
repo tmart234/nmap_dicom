@@ -57,26 +57,29 @@ jobs:
           nc -zv 127.0.0.1 ${{ matrix.target.port }}
 
           if [ "${{ matrix.target.name }}" = "orthanc-web" ]; then
-            # 1) Wait for a real auth challenge on /system (401/403 + WWW-Authenticate)
+            # 1) Wait for a real auth challenge on /system: 401/403 + WWW-Authenticate header present
             for i in {1..120}; do
-              RESP="$(curl -sS -o /dev/null -w '%{http_code} %{www_authenticate}' --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}/system" || true)"
-              read -r CODE WAUTH <<< "$RESP"
-              if { [ "$CODE" = "401" ] || [ "$CODE" = "403" ]; } && [ -n "$WAUTH" ]; then
-                break
+              CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}/system" || true)"
+              if [ "$CODE" = "401" ] || [ "$CODE" = "403" ]; then
+                if curl -sS -I --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}/system" | grep -qi '^WWW-Authenticate:'; then
+                  break
+                fi
               fi
               sleep 0.5
             done
 
-            # 2) Verify default creds succeed (stabilizes version reporting)
+            # 2) Verify Orthanc default creds succeed — stabilizes 'version' parsing
             for i in {1..120}; do
-              CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 -u orthanc:orthanc "http://127.0.0.1:${{ matrix.target.port }}/system" || true)"
+              CODE="$(curl -sS -u orthanc:orthanc -H 'Accept: application/json' \
+                           -o /dev/null -w '%{http_code}' --max-time 2 \
+                           "http://127.0.0.1:${{ matrix.target.port }}/system" || true)"
               if [ "$CODE" = "200" ]; then
                 break
               fi
               sleep 0.5
             done
           else
-            # OHIF: look for a 200 on common mounts
+            # OHIF: wait for a 200 on common mounts
             for i in {1..120}; do
               for p in "/" "/viewer/" "/ohif/"; do
                 CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}$p" || true)"

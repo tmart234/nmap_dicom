@@ -18,7 +18,7 @@ jobs:
             service: orthanc
             port: 8042
             expect: "Orthanc REST API: /system (version"
-            # just key=val list here
+            # only key=val list here (no leading --script-args)
             args_kv: "dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc"
           - name: ohif-viewer
             compose: docker/docker-compose.web.yml
@@ -47,22 +47,29 @@ jobs:
           # Refresh the script DB so nmap knows about the latest copy
           sudo nmap --script-updatedb
 
-          # Sanity check: confirm categories include "version" (and no "vuln")
+          # Quick sanity check: categories + presence of legacy lines
           nmap --script-help dicom-web-info | sed -n '1,80p'
           echo "---- SHA256 of installed script ----"
           sha256sum /usr/share/nmap/scripts/dicom-web-info.nse
+
+          echo "---- Verify installed script contains legacy one-liners ----"
+          grep -q 'dicom-web\.legacy-lines' /usr/share/nmap/scripts/dicom-web-info.nse
+          grep -q 'OHIF Viewer: detected at /' /usr/share/nmap/scripts/dicom-web-info.nse
+          grep -q 'Orthanc REST API: /system (version %s)' /usr/share/nmap/scripts/dicom-web-info.nse || true
 
       - name: Up ${{ matrix.target.name }}
         run: |
           set -e
           docker-compose -f ${{ matrix.target.compose }} up -d ${{ matrix.target.service }}
-          # wait for TCP
+
+          # Wait for TCP
           for i in {1..120}; do
             nc -z 127.0.0.1 ${{ matrix.target.port }} && break
             sleep 0.5
           done
           nc -zv 127.0.0.1 ${{ matrix.target.port }}
-          # wait for HTTP to respond (ANY code, including 401)
+
+          # Wait for HTTP to respond (ANY status, including 401)
           for i in {1..120}; do
             if curl -sS -o /dev/null "http://127.0.0.1:${{ matrix.target.port }}/"; then
               break
@@ -73,16 +80,26 @@ jobs:
       - name: Scan ${{ matrix.target.name }}
         id: scan
         env:
-          NMAPDIR: /usr/share/nmap   # ensure system scripts path is primary
+          # Ensure system scripts path is primary (silences local-dir warning)
+          NMAPDIR: /usr/share/nmap
         run: |
           set -o pipefail
           OUT="nmap_http_${{ matrix.target.name }}.txt"
+
+          # Always enable legacy one-liners for CI greps, then append any matrix args
+          SA="dicom-web.legacy-lines=true"
+          EXTRA="${{ matrix.target.args_kv }}"
+          if [ -n "$EXTRA" ]; then
+            EXTRA="${EXTRA#,}"
+            SA="$SA,$EXTRA"
+          fi
+
           nmap \
             -p ${{ matrix.target.port }} \
             --script dicom-web-info \
-            --script-args "dicom-web.legacy-lines=true" \
-            ${{ matrix.target.args }} \
+            --script-args "$SA" \
             127.0.0.1 | tee "$OUT"
+
           echo "out=$OUT" >> $GITHUB_OUTPUT
 
       - name: Assert ${{ matrix.target.name }} output

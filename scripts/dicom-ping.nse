@@ -50,77 +50,69 @@ license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
 categories = {"discovery", "default", "safe"}
 
 local shortport = require "shortport"
-local dicom = require "dicom"
-local stdnse = require "stdnse"
-local nmap = require "nmap"
-local string = require "string"
+local dicom     = require "dicom"
+local stdnse    = require "stdnse"
+local nmap      = require "nmap"
+local string    = require "string"
 
--- Helper function to parse the ports argument into a table of numbers
+-- Parse a comma/space separated port list into a lookup set.
 local function parse_ports_arg(ports_str)
-  local ports_set = {}
   if not ports_str then return nil end
-  -- Use gmatch to find sequences of digits, ignoring non-digits/commas
-  for port_num_str in string.gmatch(ports_str, "%d+") do
-    local port_num = tonumber(port_num_str)
-    if port_num then
-      ports_set[port_num] = true -- Use table as a set for quick lookup
-    end
+  local set = {}
+  for num in string.gmatch(ports_str, "%d+") do
+    local n = tonumber(num)
+    if n then set[n] = true end
   end
-  -- Check if any ports were actually parsed
-  if next(ports_set) == nil then
-    return nil -- Return nil if parsing resulted in an empty set (e.g., bad input)
-  end
-  return ports_set
+  return (next(set) and set) or nil
 end
 
+-- Default/common DICOM ports:
+-- 104   = historical default
+-- 11112 = commonly used for DICOM over TCP
+-- 2761  = DICOM Upper Layer over TLS
+-- 2762  = DICOM over TLS (service)
+-- 4242  = Orthanc default (widely used in practice)
+local COMMON_DICOM_PORTS = {104, 11112, 2761, 2762, 4242}
+
 portrule = function(host, port)
-  -- Basic requirement: Port must be TCP and open.
+  -- TCP and open, as usual for NSE protocol probes.
   if not (port.protocol == "tcp" and port.state == "open") then
     return false
   end
 
-  -- Check for specific ports passed via script argument (for testing)
-  local ports_arg_str = stdnse.get_script_args("dicom-ping.ports")
-  if ports_arg_str then
-    local target_ports = parse_ports_arg(ports_arg_str)
-    if target_ports and target_ports[port.number] then
-      stdnse.debug(1, "dicom-ping: portrule returning true (matched port %d from script-arg 'dicom-ping.ports')", port.number)
+  -- Explicit override via --script-args
+  local arg_str = stdnse.get_script_args("dicom-ping.ports")
+  if arg_str then
+    local want = parse_ports_arg(arg_str)
+    if want and want[port.number] then
+      stdnse.debug(1, "dicom-ping: matched script-arg port %d", port.number)
       return true
-    elseif target_ports then
-      -- Argument was provided but didn't match this port, proceed to standard checks
-      stdnse.debug(2, "dicom-ping: port %d not in ports specified by script-arg", port.number)
-    else
-      -- Argument was provided but couldn't be parsed meaningfully, proceed to standard checks
-      stdnse.debug(1, "dicom-ping: could not parse 'dicom-ping.ports' argument: %s", ports_arg_str)
     end
   end
-  -- If ports_arg_str was nil, we also proceed to standard checks
 
-  -- Standard DICOM Check (for real-world use):
-  -- Run if the port is a common DICOM port OR if Nmap detected the service as 'dicom'.
-  -- Common ports: 104, 2345, 2761, 2762, 4242, 11112.
-  if shortport.port_or_service({104, 2345, 2761, 2762, 4242, 11112}, "dicom", "tcp")(host, port) then
-    stdnse.debug(1, "dicom-ping: portrule returning true (matched standard port or 'dicom' service) for port %d", port.number)
+  -- Otherwise, run for common DICOM ports or if service is already identified as "dicom"
+  if shortport.port_or_service(COMMON_DICOM_PORTS, "dicom", "tcp")(host, port) then
+    stdnse.debug(1, "dicom-ping: matched common DICOM port/service (%d)", port.number)
     return true
   end
 
-  stdnse.debug(1, "dicom-ping: portrule returning false for port %d", port.number)
   return false
 end
 
 action = function(host, port)
-  stdnse.debug(1, "dicom-ping: ACTION function started for %s:%d", host.ip, port.number)
-  local output = stdnse.output_table()
+  stdnse.debug(1, "dicom-ping: ACTION for %s:%d", host.ip, port.number)
+  local out = stdnse.output_table()
 
-  local called_aet_arg = stdnse.get_script_args("dicom.called_aet")
+  local called_aet  = stdnse.get_script_args("dicom.called_aet")
+  -- dicom.associate(host, port, calling_aet, called_aet)
+  -- returns: status, err, version, vendor, uid
+  local ok, err, version, vendor, uid = dicom.associate(host, port, nil, called_aet)
 
-  -- Expecting: status, err, version, vendor, uid (uid may be nil if peer didn't send it)
-  local dcm_status, err, version, vendor, uid = dicom.associate(host, port, nil, called_aet_arg)
+  if not ok then
+    stdnse.debug(1, "Association failed: %s", tostring(err or "Unknown error"))
 
-  -- association rejection handling
-  if dcm_status == false then
-    stdnse.debug(1, "Association failed: %s", err or "Unknown error")
-
+    -- Treat specific transport/early-close errors as discovery:
+    -- some implementations/proxies reset when no DIMSE follows AC.
     local e = tostring(err or "")
     local early_close =
          e:find("Couldn't read ASSOCIATE response:", 1, true)
@@ -129,52 +121,59 @@ action = function(host, port)
       or e:lower():find("connection reset by peer", 1, true)
 
     if early_close then
-      -- Treat as discovered even if the peer closed after our probe
       port.version.name = "dicom"
       nmap.set_port_version(host, port)
-      output.dicom  = "DICOM Service Provider discovered!"
-      output.config = "Association ended early by peer"
-    elseif e == "ASSOCIATE REJECT received" then
-      port.version.name = "dicom"
-      nmap.set_port_version(host, port)
-      output.dicom  = "DICOM Service Provider discovered!"
-      output.config = "Called AET check enabled (Rejected ANY-SCP)"
+      out.dicom  = "DICOM Service Provider discovered!"
+      out.config = "Association ended early by peer"
+      return out
     end
 
-    stdnse.debug(1, "Final output table contents (on failure):\n%s", stdnse.format_output(true, output))
-    if output.dicom then return output else return nil end
+    if e == "ASSOCIATE REJECT received" then
+      port.version.name = "dicom"
+      nmap.set_port_version(host, port)
+      out.dicom  = "DICOM Service Provider discovered!"
+      if not called_aet or called_aet == "ANY-SCP" then
+        out.config = "Called AET check enabled (Rejected ANY-SCP)"
+      else
+        out.config = string.format("Association Rejected (Tried AET: %s)", called_aet)
+      end
+      return out
+    end
+
+    -- Unknown failure: stay silent to avoid false positives.
+    return nil
   end
 
-  -- Association was successful
-  output.dicom = "DICOM Service Provider discovered!"
-  if not called_aet_arg or called_aet_arg == "ANY-SCP" then
-    output.config = "Any AET is accepted (Insecure)"
+  -- Success path: association accepted.
+  out.dicom = "DICOM Service Provider discovered!"
+  if not called_aet or called_aet == "ANY-SCP" then
+    out.config = "Any AET is accepted (Insecure)"
   end
 
-  -- Prefer vendor/version when present
+  -- Identity (prefer vendor/version; fall back to implementation UID).
   if vendor then
-    output.vendor = vendor
+    out.vendor = vendor
   end
   if version then
-    local clean_version = dicom.extract_clean_version and dicom.extract_clean_version(version, vendor) or version
-    output.version = clean_version or version
+    local clean = (dicom.extract_clean_version and dicom.extract_clean_version(version, vendor)) or version
+    out.version = clean or version
+  end
+  if uid then
+    -- Help users even when vendor/version are missing
+    if not out.vendor then
+      local root = (dicom.extract_uid_root and dicom.extract_uid_root(uid)) or uid
+      out.uid_root = root
+    end
+    if not out.version then
+      out.impl_uid = uid
+    end
   end
 
-  -- Fallbacks: if vendor missing -> show UID root; if version missing -> show raw UID
-  if (not vendor) and uid then
-    local root = dicom.extract_uid_root and dicom.extract_uid_root(uid) or uid
-    output.uid_root = root
-  end
-  if (not version) and uid then
-    output.impl_uid = uid
-  end
-
-  -- Populate Nmap version fields
+  -- Populate Nmap’s service fingerprint fields.
   port.version.name = "dicom"
-  if output.vendor then port.version.product = output.vendor end
-  if output.version then port.version.version = output.version end
+  if out.vendor  then port.version.product = out.vendor end
+  if out.version then port.version.version = out.version end
   nmap.set_port_version(host, port)
 
-  stdnse.debug(1, "Final output table contents (on success):\n%s", stdnse.format_output(true, output))
-  return output
+  return out
 end

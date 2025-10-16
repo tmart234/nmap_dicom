@@ -3,6 +3,7 @@
 
 ## Overview
 This pull request enhances Nmap's DICOM scanning capabilities by adding vendor detection, version identification
+As a fallback mechinism, we output UID root for lookup in a public OID registry (ex: https://oid-base.com/) when vendor is missing. We also output full UID if version extraction was unsucessful (version is encoded sometimes)
 
 
 This repo tests the following DICOM software in GitHub 

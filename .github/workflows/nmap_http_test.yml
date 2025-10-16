@@ -56,17 +56,15 @@ jobs:
         run: |
           set -e
           docker-compose -f ${{ matrix.target.compose }} up -d ${{ matrix.target.service }}
-
-          # Wait for TCP
+          # wait for TCP
           for i in {1..120}; do
             nc -z 127.0.0.1 ${{ matrix.target.port }} && break
             sleep 0.5
           done
           nc -zv 127.0.0.1 ${{ matrix.target.port }}
-
-          # Wait for HTTP root to respond (some images take a bit after socket opens)
+          # wait for HTTP to respond (ANY code, including 401)
           for i in {1..120}; do
-            if curl -fsS -o /dev/null "http://127.0.0.1:${{ matrix.target.port }}/"; then
+            if curl -sS -o /dev/null "http://127.0.0.1:${{ matrix.target.port }}/"; then
               break
             fi
             sleep 0.5
@@ -75,26 +73,16 @@ jobs:
       - name: Scan ${{ matrix.target.name }}
         id: scan
         env:
-          # Point Nmap at system share to avoid the "using /usr/share" warning
-          NMAPDIR: /usr/share/nmap
+          NMAPDIR: /usr/share/nmap   # ensure system scripts path is primary
         run: |
           set -o pipefail
           OUT="nmap_http_${{ matrix.target.name }}.txt"
-
-          # Always enable legacy one-liners for CI greps, then append any matrix args
-          SA="dicom-web.legacy-lines=true"
-          EXTRA="${{ matrix.target.args_kv }}"
-          if [ -n "$EXTRA" ]; then
-            EXTRA="${EXTRA#,}"
-            SA="$SA,$EXTRA"
-          fi
-
           nmap \
             -p ${{ matrix.target.port }} \
             --script dicom-web-info \
-            --script-args "$SA" \
+            --script-args "dicom-web.legacy-lines=true" \
+            ${{ matrix.target.args }} \
             127.0.0.1 | tee "$OUT"
-
           echo "out=$OUT" >> $GITHUB_OUTPUT
 
       - name: Assert ${{ matrix.target.name }} output

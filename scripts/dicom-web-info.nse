@@ -1,39 +1,39 @@
--- dicom-web-info.nse
--- Detect DICOM-related HTTP endpoints and flag common DICOMweb misconfigurations.
+---
+-- @usage
+-- nmap -p 8042,3000 --script dicom-web-info <target>
+-- nmap -p 8042 --script dicom-web-info \
+--      --script-args dicom-web.try-defaults=true,dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc <target>
 --
--- Finds:
---   - Orthanc REST API (/system) + (best-effort) version
---   - DICOMweb bases (Orthanc: /dicom-web, dcm4chee: /dcm4chee-arc/rs, dcm4chee AE-scoped: /dcm4chee-arc/aets/<AET>/rs)
---   - OHIF viewer
+-- @args dicom-web.qido-test       (bool)   Enable unauth QIDO probe (default: true)
+-- @args dicom-web.cors-test       (bool)   Enable CORS preflight probe (default: true)
+-- @args dicom-web.stow-test       (bool)   Enable STOW OPTIONS advisory (default: false)
+-- @args dicom-web.try-defaults    (bool)   Try Orthanc default creds (default: false)
+-- @args dicom-web.orthanc.user    (string) Username for Orthanc /system
+-- @args dicom-web.orthanc.pass    (string) Password for Orthanc /system
+-- @args dicom-web.ports           (string) Comma-list of ports to limit portrule
+-- @args dicom-web.extra-bases     (string) Comma-list of extra DICOMweb base paths
+-- @args dicom-web.aet             (string) AE title for dcm4chee AE-scoped route (default: DCM4CHEE)
+-- @args dicom-web.legacy-lines    (bool)   Emit human-readable one-liners (default: true)
 --
--- Security checks (non-intrusive):
---   - HTTP used instead of HTTPS
---   - Unauthenticated QIDO-RS listing (/studies?limit=1) with DICOM JSON (tries application/dicom+json, then application/json on 406)
---   - Risky CORS (ACAO: * with credentials=true)
---   - (Advisory) STOW-RS appears allowed via OPTIONS without auth
---   - (Opt-in) Orthanc default creds accepted (orthanc:orthanc)
---   - (Advisory) Missing Content-Security-Policy on UIs
---   - (Info) Advertised auth scheme via WWW-Authenticate (e.g., Basic/Bearer) on 401
---
--- Script args (all optional):
---   dicom-web.qido-test=true|false          (default true)
---   dicom-web.cors-test=true|false          (default true)
---   dicom-web.stow-test=true|false          (default false)
---   dicom-web.try-defaults=true|false       (default false)
---   dicom-web.orthanc.user=<user>           (default none)
---   dicom-web.orthanc.pass=<pass>           (default none)
---   dicom-web.ports=8042,3000,8080          (limit portrule)
---   dicom-web.extra-bases=/pacs/dicom-web,/pacs/rs   (comma-separated extra base paths)
---   dicom-web.aet=DCM4CHEE                  (AE title to try for dcm4chee AE-scoped base)
---   dicom-web.legacy-lines=true|false       (default true; emit classic human-readable lines for CI greps)
---
--- Examples:
---   nmap -p 8042,3000 --script dicom-web-info localhost
---   nmap -p 8042 --script dicom-web-info --script-args dicom-web.try-defaults=true localhost
---   nmap -p 8081 --script dicom-web-info --script-args dicom-web.extra-bases=/pacs/dicom-web,/pacs/rs localhost
---
--- Note: This script is "safe": it only performs GET and OPTIONS requests and never uploads DICOM objects.
---
+-- @output
+-- PORT     STATE SERVICE
+-- 8042/tcp open  http
+-- | dicom-web-info:
+-- |   Orthanc REST API: /system (version 1.12.9)
+-- |   OHIF Viewer: detected at /
+-- |   orthanc:
+-- |     path: /system
+-- |     version: 1.12.9
+-- |     auth: auth-required
+-- |   dicomweb:
+-- |     bases:
+-- |       name: Orthanc DICOMweb
+-- |       base: /dicom-web
+-- |       qido_secured: true
+-- |   warnings:
+-- |_    Warning: HTTP (no TLS) detected
+
+
 author = "Tyler M"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
 categories = {"discovery", "safe", "version"}  -- removed "vuln" (misconfigs, not CVEs)

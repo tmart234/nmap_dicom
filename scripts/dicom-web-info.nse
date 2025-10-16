@@ -194,8 +194,9 @@ action = function(host, port)
         orthanc_seen = true
         orthanc_auth = "auth-required"
         orthanc_wa = hget(r_no.header, "WWW-Authenticate")
-        -- optional default creds probe
-        if not no_defs then
+        -- optional default creds probe: only if Basic is advertised
+        local wa_lc = lc(orthanc_wa or "")
+        if not no_defs and wa_lc:find("basic", 1, true) then
           local def_auth = make_basic_auth("orthanc","orthanc")
           if def_auth then
             local r_def = http_get(host, port, "/system", { ["Accept"]="application/json", ["Authorization"]=def_auth })
@@ -245,16 +246,22 @@ action = function(host, port)
     end
   end
 
-  -- -------- OHIF detection (tight) --------
+  -- -------- OHIF detection (tight; common mounts) --------
   do
     local ohif = false
-    local r = http_get(host, port, "/")
-    if r and r.status == 200 and r.body then
-      if body_has(r.body, "data-cy-root") or body_has(r.body, "ohif") or body_has(r.body, "app-config.js") then
-        ohif = true
-      end
-      if ohif and not hget(r.header, "Content-Security-Policy") then
-        addwarn("advisory: OHIF root missing Content-Security-Policy")
+    local mount = nil
+    local candidate_paths = { "/", "/viewer/", "/ohif/" }
+    for _, p in ipairs(candidate_paths) do
+      local r = http_get(host, port, p)
+      if r and r.status == 200 and r.body then
+        if body_has(r.body, "data-cy-root") or body_has(r.body, "ohif") or body_has(r.body, "app-config.js") then
+          ohif = true
+          mount = p
+          if not hget(r.header, "Content-Security-Policy") then
+            addwarn("advisory: OHIF root missing Content-Security-Policy")
+          end
+          break
+        end
       end
     end
     if not ohif then
@@ -262,11 +269,12 @@ action = function(host, port)
       if r2 and r2.status == 200 and r2.body and #r2.body > 0 then
         if body_has(r2.body, "window.config") or body_has(r2.body, "getAppConfig") then
           ohif = true
+          mount = "/"
         end
       end
     end
     if ohif then
-      out.ui["ohif"] = "/"
+      out.ui["ohif"] = mount or "/"
     end
   end
 
@@ -287,12 +295,21 @@ action = function(host, port)
         or body_has(r.body, '"MainDicomTags"')
   end
 
-  local function qido_try(host, port, path)
-    local r = http_get(host, port, path, { ["Accept"]="application/dicom+json" })
-    if r and r.status == 406 then
-      r = http_get(host, port, path, { ["Accept"]="application/json" })
+  local function qido_try_paths(host, port, base)
+    local candidates = {
+      base .. "/studies?limit=1",
+      base .. "/studies?offset=0&limit=1",
+    }
+    for _, path in ipairs(candidates) do
+      local r = http_get(host, port, path, { ["Accept"]="application/dicom+json" })
+      if r and r.status == 406 then
+        r = http_get(host, port, path, { ["Accept"]="application/json" })
+      end
+      if r then
+        return r, path
+      end
     end
-    return r
+    return nil, nil
   end
 
   for _, b in ipairs(bases) do
@@ -312,12 +329,11 @@ action = function(host, port)
 
     -- QIDO (set only when meaningful)
     if do_qido then
-      local path = b.base .. "/studies?limit=1"
-      local rq = qido_try(host, port, path)
+      local rq, used_path = qido_try_paths(host, port, b.base)
       if rq then
         if is_dicom_json(rq) then
           info.qido = "open"
-          addwarn(("warning: unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.base, path))
+          addwarn(("warning: unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.base, used_path))
         elseif rq.status == 401 or rq.status == 403 then
           info.qido = "secured"
           local wa = hget(rq.header, "WWW-Authenticate")
@@ -363,7 +379,9 @@ action = function(host, port)
     table.insert(out.dicomweb.bases, info)
   end
 
-  out.warnings = warn
+  if #warn > 0 then
+    out.warnings = warn
+  end
 
   if (next(out.orthanc) == nil) and (next(out.ui) == nil) and (#out.dicomweb.bases == 0) and (#warn == 0) then
     return nil

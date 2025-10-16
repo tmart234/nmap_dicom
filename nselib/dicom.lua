@@ -638,12 +638,12 @@ function associate(host, port, calling_aet, called_aet)
     -- pcall returned: clean_version, vendor, uid_str  (keep original NSE signature)
     local clean_version = pcall_ret1
     local vendor        = pcall_ret2
-    -- local uid_str    = pcall_ret3  -- keep if you later want to expose it
+    local uid_str       = pcall_ret3 
 
     stdnse.debug1("Association successful. Final Version: %s, Vendor: %s",
                   clean_version or "nil", vendor or "nil")
 
-    return true, nil, clean_version, vendor
+    return true, nil, clean_version, vendor, uid_str
   end
 end
 
@@ -657,6 +657,13 @@ function send_pdata(dicom, data)
   if status == false then
     return false, err
   end
+end
+
+function extract_uid_root(uid)
+  if not uid then return nil end
+  local trimmed = uid:gsub("%z",""):match("^%s*(.-)%s*$")
+  if trimmed == "" then return nil end
+  return trimmed:match("^([%d%.]+)%.[^%.]+$") or trimmed
 end
 
 return _ENV

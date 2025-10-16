@@ -1,9 +1,9 @@
 --[[
 Attempts to discover DICOM servers (DICOM Service Provider) through a partial C-ECHO request.
- It also detects if the server allows any called Application Entity Title or not.
+It also detects if the server allows any called Application Entity Title or not.
 
 The script responds with the message "Called AET check enabled" when the association request
- is rejected due configuration. This value can be bruteforced using dicom-brute.
+is rejected due configuration. This value can be bruteforced using dicom-brute.
 
 The UID tells you who made it (Vendor), the dedicated Version Name field tells you which version it is.
 
@@ -17,7 +17,7 @@ Normally, a 'DICOM ping' is formed as follows:
 * Server -> A-RELEASE response -> Client
 
 For this script we only send the A-ASSOCIATE request and look for the success code
- in the response as it seems to be a reliable way of detecting DICOM servers.
+in the response as it seems to be a reliable way of detecting DICOM servers.
 ]]
 
 ---
@@ -91,14 +91,14 @@ portrule = function(host, port)
       stdnse.debug(2, "dicom-ping: port %d not in ports specified by script-arg", port.number)
     else
       -- Argument was provided but couldn't be parsed meaningfully, proceed to standard checks
-       stdnse.debug(1, "dicom-ping: could not parse 'dicom-ping.ports' argument: %s", ports_arg_str)
+      stdnse.debug(1, "dicom-ping: could not parse 'dicom-ping.ports' argument: %s", ports_arg_str)
     end
   end
   -- If ports_arg_str was nil, we also proceed to standard checks
 
   -- Standard DICOM Check (for real-world use):
   -- Run if the port is a common DICOM port OR if Nmap detected the service as 'dicom'.
-  -- Common ports: 104, 2761, 2762, 4242, 11112. Added 2345 from dicom-brute's rule.
+  -- Common ports: 104, 2345, 2761, 2762, 4242, 11112.
   if shortport.port_or_service({104, 2345, 2761, 2762, 4242, 11112}, "dicom", "tcp")(host, port) then
     stdnse.debug(1, "dicom-ping: portrule returning true (matched standard port or 'dicom' service) for port %d", port.number)
     return true
@@ -113,11 +113,13 @@ action = function(host, port)
   local output = stdnse.output_table()
 
   local called_aet_arg = stdnse.get_script_args("dicom.called_aet")
-  local dcm_status, err, version, vendor = dicom.associate(host, port, nil, called_aet_arg) -- Pass nil for calling_aet override unless needed
+
+  -- Expecting: status, err, version, vendor, uid (uid may be nil if peer didn't send it)
+  local dcm_status, err, version, vendor, uid = dicom.associate(host, port, nil, called_aet_arg)
 
   -- Handle association rejection
   if dcm_status == false then
-    stdnse.debug(level1, "Association failed: %s", err or "Unknown error")
+    stdnse.debug(1, "Association failed: %s", err or "Unknown error")
     -- Check if the failure was specifically due to AET rejection
     if err == "ASSOCIATE REJECT received" then
       -- Set service name to dicom even on failure if reject is received
@@ -129,9 +131,9 @@ action = function(host, port)
         output.config = "Called AET check enabled (Rejected ANY-SCP)"
       else
         output.config = string.format("Association Rejected (Tried AET: %s)", called_aet_arg)
-      end   
+      end
     end
-    stdnse.debug(level1, "Final output table contents (on failure):\n%s", stdnse.format_output(true, output))
+    stdnse.debug(1, "Final output table contents (on failure):\n%s", stdnse.format_output(true, output))
     if output.dicom then return output else return nil end
   end
 
@@ -141,24 +143,30 @@ action = function(host, port)
     output.config = "Any AET is accepted (Insecure)"
   end
 
-  -- Version first
-  if version then
-    local clean_version = dicom.extract_clean_version(version, vendor)
-    output.version = clean_version or version
-  end
-
-  -- Vendor next
+  -- Prefer vendor/version when present
   if vendor then
     output.vendor = vendor
   end
+  if version then
+    local clean_version = dicom.extract_clean_version and dicom.extract_clean_version(version, vendor) or version
+    output.version = clean_version or version
+  end
 
-  -- Now populate Nmap's fields and commit
+  -- Fallbacks: if vendor missing -> show UID root; if version missing -> show raw UID
+  if (not vendor) and uid then
+    local root = dicom.extract_uid_root and dicom.extract_uid_root(uid) or uid
+    output.uid_root = root
+  end
+  if (not version) and uid then
+    output.impl_uid = uid
+  end
+
+  -- Populate Nmap version fields
   port.version.name = "dicom"
-  if vendor then port.version.product = vendor end
+  if output.vendor then port.version.product = output.vendor end
   if output.version then port.version.version = output.version end
   nmap.set_port_version(host, port)
 
-  stdnse.debug(level1, "Final output table contents (on success):\n%s", stdnse.format_output(true, output))
-
+  stdnse.debug(1, "Final output table contents (on success):\n%s", stdnse.format_output(true, output))
   return output
 end

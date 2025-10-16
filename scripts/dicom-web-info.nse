@@ -7,7 +7,7 @@
 --   - OHIF viewer
 --
 -- Security checks (non-intrusive):
---   - http instead of https
+--   - http instead of https (suppressed if cleanly upgraded to same-host https)
 --   - Unauthenticated QIDO-RS listing (/studies?limit=1) with DICOM JSON
 --     (tries Accept: application/dicom+json, then falls back to application/json on 406)
 --   - risky CORS (ACAO: * with credentials=true)
@@ -143,6 +143,37 @@ local function http_options(host, port, path, hdr)
   return follow_redirect_once(host, port, r, hdr)
 end
 
+-- ---------- lightweight memoization for GET/OPTIONS ----------
+
+local _cache = {}
+local function cache_key(method, path, hdr)
+  local a = ""
+  if hdr then
+    -- only include a couple of headers we vary on
+    local acc = hdr["Accept"] or hdr["accept"] or ""
+    local acrm = hdr["Access-Control-Request-Method"] or ""
+    local origin = hdr["Origin"] or ""
+    a = acc .. "|" .. acrm .. "|" .. origin
+  end
+  return method .. "|" .. path .. "|" .. a
+end
+
+local function http_get_cached(host, port, path, hdr)
+  local k = cache_key("GET", path, hdr)
+  if _cache[k] ~= nil then return _cache[k] end
+  local r = http_get(host, port, path, hdr)
+  _cache[k] = r
+  return r
+end
+
+local function http_options_cached(host, port, path, hdr)
+  local k = cache_key("OPTIONS", path, hdr)
+  if _cache[k] ~= nil then return _cache[k] end
+  local r = http_options(host, port, path, hdr)
+  _cache[k] = r
+  return r
+end
+
 -- -------------------- portrule --------------------
 
 portrule = function(host, port)
@@ -173,9 +204,22 @@ action = function(host, port)
   out.dicomweb = stdnse.output_table()
   out.dicomweb.bases = {}
 
+  -- Reduce false positives: treat clean HTTP→HTTPS redirect to same host as acceptable
+  local function is_https_redirect()
+    local r = http_get_cached(host, port, "/")
+    if not (r and (r.status == 301 or r.status == 302)) then return false end
+    local loc = hget(r.header, "Location")
+    if not loc then return false end
+    local scheme, hostpart = loc:match("^(https?)://([^/]+)")
+    if scheme ~= "https" then return false end
+    return (hostpart == host.targetname or hostpart == host.ip)
+  end
+
   -- TLS hint
   if port.tunnel ~= "ssl" then
-    addwarn("warning: http (no TLS) detected")
+    if not is_https_redirect() then
+      addwarn("warning: http (no TLS) detected")
+    end
   end
 
   -- -------- Orthanc detection --------
@@ -183,7 +227,7 @@ action = function(host, port)
   local orthanc_wa = nil
   do
     local hdr_json = { ["Accept"] = "application/json" }
-    local r_no = http_get(host, port, "/system", hdr_json)
+    local r_no = http_get_cached(host, port, "/system", hdr_json)
     if r_no and r_no.status then
       if r_no.status == 200 and r_no.body and (body_has(r_no.body, '"name"') and body_has(r_no.body, "orthanc")) then
         orthanc_seen = true
@@ -194,12 +238,12 @@ action = function(host, port)
         orthanc_seen = true
         orthanc_auth = "auth-required"
         orthanc_wa = hget(r_no.header, "WWW-Authenticate")
-        -- optional default creds probe: only if Basic is advertised
+        -- default creds probe only if Basic is advertised
         local wa_lc = lc(orthanc_wa or "")
         if not no_defs and wa_lc:find("basic", 1, true) then
           local def_auth = make_basic_auth("orthanc","orthanc")
           if def_auth then
-            local r_def = http_get(host, port, "/system", { ["Accept"]="application/json", ["Authorization"]=def_auth })
+            local r_def = http_get_cached(host, port, "/system", { ["Accept"]="application/json", ["Authorization"]=def_auth })
             if r_def and r_def.status == 200 and r_def.body then
               addwarn("warning: Orthanc accepts default credentials (orthanc:orthanc)")
               orthanc_version = r_def.body:match('"version"%s*:%s*"([^"]+)"') or
@@ -224,7 +268,7 @@ action = function(host, port)
   do
     local paths = {"/dcm4chee-arc/ui2/index.html", "/dcm4chee-arc/ui2/"}
     for _, pth in ipairs(paths) do
-      local r = http_get(host, port, pth)
+      local r = http_get_cached(host, port, pth)
       if r and r.status and r.body then
         local server = lc(hget(r.header, "Server") or "")
         local loc    = lc(hget(r.header, "Location") or "")
@@ -252,7 +296,7 @@ action = function(host, port)
     local mount = nil
     local candidate_paths = { "/", "/viewer/", "/ohif/" }
     for _, p in ipairs(candidate_paths) do
-      local r = http_get(host, port, p)
+      local r = http_get_cached(host, port, p)
       if r and r.status == 200 and r.body then
         if body_has(r.body, "data-cy-root") or body_has(r.body, "ohif") or body_has(r.body, "app-config.js") then
           ohif = true
@@ -265,7 +309,7 @@ action = function(host, port)
       end
     end
     if not ohif then
-      local r2 = http_get(host, port, "/app-config.js")
+      local r2 = http_get_cached(host, port, "/app-config.js")
       if r2 and r2.status == 200 and r2.body and #r2.body > 0 then
         if body_has(r2.body, "window.config") or body_has(r2.body, "getAppConfig") then
           ohif = true
@@ -284,6 +328,8 @@ action = function(host, port)
     {impl="dcm4chee",  base="/dcm4chee-arc/rs"},
     {impl="dcm4chee",  base="/dcm4chee-arc/aets/DCM4CHEE/rs"}, -- common AET route; ok if 404
   }
+  -- stable CI diffs
+  table.sort(bases, function(a,b) return a.base < b.base end)
 
   local function is_dicom_json(r)
     if not (r and r.status == 200 and r.body) then return false end
@@ -295,15 +341,15 @@ action = function(host, port)
         or body_has(r.body, '"MainDicomTags"')
   end
 
-  local function qido_try_paths(host, port, base)
+  local function qido_try_paths(base)
     local candidates = {
       base .. "/studies?limit=1",
       base .. "/studies?offset=0&limit=1",
     }
     for _, path in ipairs(candidates) do
-      local r = http_get(host, port, path, { ["Accept"]="application/dicom+json" })
+      local r = http_get_cached(host, port, path, { ["Accept"]="application/dicom+json" })
       if r and r.status == 406 then
-        r = http_get(host, port, path, { ["Accept"]="application/json" })
+        r = http_get_cached(host, port, path, { ["Accept"]="application/json" })
       end
       if r then
         return r, path
@@ -319,7 +365,7 @@ action = function(host, port)
     info.impl = b.impl
 
     -- Reachability (+ Orthanc plugin index hint)
-    local r = http_get(host, port, b.base .. "/")
+    local r = http_get_cached(host, port, b.base .. "/")
     if r and (r.status == 200 or r.status == 204 or r.status == 401 or r.status == 403) then
       info.reachable = true
       if b.base == "/dicom-web" and r.status == 200 then
@@ -327,9 +373,9 @@ action = function(host, port)
       end
     end
 
-    -- QIDO (set only when meaningful)
+    -- QIDO (set only when meaningful; include 429/503)
     if do_qido then
-      local rq, used_path = qido_try_paths(host, port, b.base)
+      local rq, used_path = qido_try_paths(b.base)
       if rq then
         if is_dicom_json(rq) then
           info.qido = "open"
@@ -340,6 +386,16 @@ action = function(host, port)
           if wa then info["www-authenticate"] = wa end
         elseif rq.status == 404 then
           info.qido = "not-found"
+        elseif rq.status == 429 then
+          info.qido = "rate-limited"
+          local ra = hget(rq.header, "Retry-After")
+          if ra then
+            addwarn(("advisory: QIDO-RS rate limited at %s (Retry-After: %s)"):format(b.base, ra))
+          else
+            addwarn(("advisory: QIDO-RS rate limited at %s"):format(b.base))
+          end
+        elseif rq.status == 503 then
+          info.qido = "unavailable"
         end
         -- omit qido entirely if indeterminate
       end
@@ -347,7 +403,7 @@ action = function(host, port)
 
     -- CORS (skip if OPTIONS 405)
     if do_cors then
-      local rc = http_options(host, port, b.base .. "/studies?limit=0", {
+      local rc = http_options_cached(host, port, b.base .. "/studies?limit=0", {
         ["Origin"] = "https://example.com",
         ["Access-Control-Request-Method"] = "GET",
       })
@@ -363,7 +419,7 @@ action = function(host, port)
 
     -- STOW (advisory)
     if do_stow then
-      local rs = http_options(host, port, b.base .. "/studies", {
+      local rs = http_options_cached(host, port, b.base .. "/studies", {
         ["Access-Control-Request-Method"] = "POST",
         ["Origin"] = "https://example.com",
       })
@@ -377,6 +433,14 @@ action = function(host, port)
     end
 
     table.insert(out.dicomweb.bases, info)
+  end
+
+  -- Broader flavor awareness: WADO-URI presence (safe check)
+  do
+    local r = http_get_cached(host, port, "/wado")
+    if r and (r.status == 200 or r.status == 400 or r.status == 401 or r.status == 403) then
+      out.dicomweb.wado_uri = true
+    end
   end
 
   if #warn > 0 then

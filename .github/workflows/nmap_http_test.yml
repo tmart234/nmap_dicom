@@ -17,15 +17,13 @@ jobs:
             compose: docker/docker-compose.web.yml
             service: orthanc
             port: 8042
-            expect: "Orthanc REST API: /system (version"
-            # only key=val list here (no leading --script-args)
-            args_kv: "dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc"
+            # match the structured output from the script (no legacy lines)
+            expect: "path: /system"
           - name: ohif-viewer
             compose: docker/docker-compose.web.yml
             service: viewer
             port: 3000
-            expect: "OHIF Viewer: detected at /"
-            args_kv: ""
+            expect: "ohif: /"
 
     steps:
       - uses: actions/checkout@v4
@@ -38,40 +36,29 @@ jobs:
       - name: Install updated NSE into /usr/share
         run: |
           set -euo pipefail
-          # Install our script into the system nmap dir
           sudo mkdir -p /usr/share/nmap/scripts
           sudo cp -f scripts/dicom-web-info.nse /usr/share/nmap/scripts/dicom-web-info.nse
           sudo chown root:root /usr/share/nmap/scripts/dicom-web-info.nse
           sudo chmod 0644 /usr/share/nmap/scripts/dicom-web-info.nse
-
-          # Refresh the script DB so nmap knows about the latest copy
           sudo nmap --script-updatedb
-
-          # Quick sanity check: categories + presence of legacy lines
-          nmap --script-help dicom-web-info | sed -n '1,80p'
-          echo "---- SHA256 of installed script ----"
-          sha256sum /usr/share/nmap/scripts/dicom-web-info.nse
-
-          echo "---- Verify installed script contains legacy one-liners ----"
-          grep -q 'dicom-web\.legacy-lines' /usr/share/nmap/scripts/dicom-web-info.nse
-          grep -q 'OHIF Viewer: detected at /' /usr/share/nmap/scripts/dicom-web-info.nse
-          grep -q 'Orthanc REST API: /system (version %s)' /usr/share/nmap/scripts/dicom-web-info.nse || true
+          # quick human-readable help (useful in job logs)
+          nmap --script-help dicom-web-info | sed -n '1,60p' || true
 
       - name: Up ${{ matrix.target.name }}
         run: |
           set -e
           docker-compose -f ${{ matrix.target.compose }} up -d ${{ matrix.target.service }}
-
-          # Wait for TCP
+          # wait for TCP
           for i in {1..120}; do
-            nc -z 127.0.0.1 ${{ matrix.target.port }} && break
+            if nc -z 127.0.0.1 ${{ matrix.target.port }}; then break; fi
             sleep 0.5
           done
           nc -zv 127.0.0.1 ${{ matrix.target.port }}
 
-          # Wait for HTTP to respond (ANY status, including 401)
+          # wait for HTTP to respond with any typical code (200/401/403/404)
           for i in {1..120}; do
-            if curl -sS -o /dev/null "http://127.0.0.1:${{ matrix.target.port }}/"; then
+            CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}/" || true)
+            if [ "$CODE" = "200" ] || [ "$CODE" = "401" ] || [ "$CODE" = "403" ] || [ "$CODE" = "404" ]; then
               break
             fi
             sleep 0.5
@@ -80,26 +67,11 @@ jobs:
       - name: Scan ${{ matrix.target.name }}
         id: scan
         env:
-          # Ensure system scripts path is primary (silences local-dir warning)
           NMAPDIR: /usr/share/nmap
         run: |
           set -o pipefail
           OUT="nmap_http_${{ matrix.target.name }}.txt"
-
-          # Always enable legacy one-liners for CI greps, then append any matrix args
-          SA="dicom-web.legacy-lines=true"
-          EXTRA="${{ matrix.target.args_kv }}"
-          if [ -n "$EXTRA" ]; then
-            EXTRA="${EXTRA#,}"
-            SA="$SA,$EXTRA"
-          fi
-
-          nmap \
-            -p ${{ matrix.target.port }} \
-            --script dicom-web-info \
-            --script-args "$SA" \
-            127.0.0.1 | tee "$OUT"
-
+          nmap -p ${{ matrix.target.port }} --script dicom-web-info 127.0.0.1 | tee "$OUT"
           echo "out=$OUT" >> $GITHUB_OUTPUT
 
       - name: Assert ${{ matrix.target.name }} output

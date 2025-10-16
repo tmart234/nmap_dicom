@@ -1,42 +1,55 @@
 ---
+-- Detect DICOM-related HTTP endpoints and flag common DICOMweb misconfigurations.
+--
+-- Finds:
+--   - Orthanc REST API (/system) and (best-effort) version
+--   - DICOMweb bases (Orthanc: /dicom-web; dcm4chee: /dcm4chee-arc/rs; dcm4chee AET: /dcm4chee-arc/aets/DCM4CHEE/rs)
+--   - OHIF viewer
+--
+-- Security checks (non-intrusive):
+--   - HTTP instead of HTTPS
+--   - Unauthenticated QIDO-RS listing (/studies?limit=1) with DICOM JSON (tries application/dicom+json, then application/json on 406)
+--   - Risky CORS (ACAO: * with credentials=true)
+--   - (Advisory) STOW-RS appears allowed via OPTIONS without auth
+--   - (Default) Orthanc default creds accepted (orthanc:orthanc) — disable via dicom-web.no-defaults=true
+--   - (Advisory) Missing Content-Security-Policy on known UIs
+--   - (Info) WWW-Authenticate (e.g., Basic/Bearer) when 401
+--
 -- @usage
 -- nmap -p 8042,3000 --script dicom-web-info <target>
--- nmap -p 8042 --script dicom-web-info \
---      --script-args dicom-web.try-defaults=true,dicom-web.orthanc.user=orthanc,dicom-web.orthanc.pass=orthanc <target>
 --
--- @args dicom-web.qido-test       (bool)   Enable unauth QIDO probe (default: true)
--- @args dicom-web.cors-test       (bool)   Enable CORS preflight probe (default: true)
--- @args dicom-web.stow-test       (bool)   Enable STOW OPTIONS advisory (default: false)
--- @args dicom-web.try-defaults    (bool)   Try Orthanc default creds (default: false)
--- @args dicom-web.orthanc.user    (string) Username for Orthanc /system
--- @args dicom-web.orthanc.pass    (string) Password for Orthanc /system
--- @args dicom-web.ports           (string) Comma-list of ports to limit portrule
--- @args dicom-web.extra-bases     (string) Comma-list of extra DICOMweb base paths
--- @args dicom-web.aet             (string) AE title for dcm4chee AE-scoped route (default: DCM4CHEE)
--- @args dicom-web.legacy-lines    (bool)   Emit human-readable one-liners (default: true)
+-- @args dicom-web.qido-test     (bool)  Probe QIDO unauth listing (default: true)
+-- @args dicom-web.cors-test     (bool)  Probe CORS preflight (default: true)
+-- @args dicom-web.stow-test     (bool)  Probe STOW via OPTIONS (advisory) (default: false)
+-- @args dicom-web.no-defaults   (bool)  Do NOT try Orthanc default creds (default: false)
+-- @args dicom-web.ports         (str)   Comma-list to limit portrule (e.g., "8042,3000,8080")
 --
 -- @output
 -- PORT     STATE SERVICE
 -- 8042/tcp open  http
 -- | dicom-web-info:
--- |   Orthanc REST API: /system (version 1.12.9)
--- |   OHIF Viewer: detected at /
 -- |   orthanc:
 -- |     path: /system
 -- |     version: 1.12.9
 -- |     auth: auth-required
+-- |     www-authenticate:
+-- |       Basic realm="Orthanc Secure Area"
+-- |   ui:
+-- |     ohif: /
 -- |   dicomweb:
 -- |     bases:
--- |       name: Orthanc DICOMweb
--- |       base: /dicom-web
--- |       qido_secured: true
+-- |       - base: /dicom-web
+-- |         impl: orthanc
+-- |         qido: secured
+-- |       - base: /dcm4chee-arc/rs
+-- |         impl: dcm4chee
+-- |         qido: secured
 -- |   warnings:
 -- |_    Warning: HTTP (no TLS) detected
-
-
+--
 author = "Tyler M"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
-categories = {"discovery", "safe", "version"}  -- removed "vuln" (misconfigs, not CVEs)
+categories = {"discovery", "safe", "version"}
 
 local shortport = require "shortport"
 local http      = require "http"
@@ -54,18 +67,6 @@ local function parse_ports_arg(s)
   local t = {}
   for p in string.gmatch(s, "%d+") do t[tonumber(p)] = true end
   return next(t) and t or nil
-end
-
-local function split_csv_paths(s)
-  if not s or s == "" then return {} end
-  local out = {}
-  for p in string.gmatch(s, "[^,%s]+") do
-    if p:sub(1,1) ~= "/" then p = "/" .. p end
-    -- trim trailing slashes (except root)
-    if #p > 1 and p:sub(-1) == "/" then p = p:sub(1, -2) end
-    table.insert(out, p)
-  end
-  return out
 end
 
 local function to_s(v)
@@ -93,7 +94,6 @@ local function body_has(b, needle)
   return b and string.find(lc(b), lc(needle), 1, true) ~= nil
 end
 
--- Build Authorization: Basic ... (avoid undeclared globals)
 local function make_basic_auth(user, pass)
   if not (user and pass) then return nil end
   if base64_ok and base64 then
@@ -118,12 +118,10 @@ local function follow_redirect_once(host, port, resp, hdr)
   if resp.status == 301 or resp.status == 302 or resp.status == 307 or resp.status == 308 then
     local loc = hget(resp.header, "Location")
     if loc then
-      -- simple same-host absolute-path follow; ignore external hosts
       if loc:sub(1,1) == "/" then
         return _generic(host, port, "GET", loc, hdr)
       end
-      -- best-effort: if absolute URL to same host, extract path
-      local scheme, hostpart, path = loc:match("^(https?)://([^/]+)(/.*)$")
+      local _, hostpart, path = loc:match("^(https?)://([^/]+)(/.*)$")
       if hostpart and path then
         if hostpart == host.targetname or hostpart == host.ip then
           return _generic(host, port, "GET", path, hdr)
@@ -159,29 +157,19 @@ action = function(host, port)
   local out   = stdnse.output_table()
   local warn  = {}
 
-  -- toggles
-  local do_qido  = truthy(stdnse.get_script_args("dicom-web.qido-test") or "true")
-  local do_cors  = truthy(stdnse.get_script_args("dicom-web.cors-test") or "true")
-  local do_stow  = truthy(stdnse.get_script_args("dicom-web.stow-test") or "false")
-  local try_defs = truthy(stdnse.get_script_args("dicom-web.try-defaults") or "false")
+  -- toggles (kept minimal)
+  local do_qido   = truthy(stdnse.get_script_args("dicom-web.qido-test") or "true")
+  local do_cors   = truthy(stdnse.get_script_args("dicom-web.cors-test") or "true")
+  local do_stow   = truthy(stdnse.get_script_args("dicom-web.stow-test") or "false")
+  local no_defs   = truthy(stdnse.get_script_args("dicom-web.no-defaults") or "false")
 
-  -- extras
-  local extra_bases = split_csv_paths(stdnse.get_script_args("dicom-web.extra-bases"))
-  local aet = stdnse.get_script_args("dicom-web.aet") or "DCM4CHEE"
-
-  -- structure result keys for CI-friendliness
+  -- structures
   out.orthanc  = {}
   out.ui       = {}
   out.dicomweb = { bases = {} }
 
-  -- legacy single-line outputs for CI greps (default: true)
-  local legacy_lines = true
-  local arg_legacy = stdnse.get_script_args("dicom-web.legacy-lines")
-  if arg_legacy ~= nil then legacy_lines = truthy(arg_legacy) end
-
-  -- TLS/HTTP hint
-  local is_tls = (port.tunnel == "ssl")
-  if not is_tls then
+  -- TLS hint
+  if port.tunnel ~= "ssl" then
     table.insert(warn, "Warning: HTTP (no TLS) detected")
   end
 
@@ -200,31 +188,17 @@ action = function(host, port)
       elseif r_no.status == 401 or r_no.status == 403 then
         orthanc_seen = true
         orthanc_auth = "auth-required"
-        -- collect advertised auth scheme(s)
         local wa = hget(r_no.header, "WWW-Authenticate")
         if wa then table.insert(orthanc_auth_schemes, wa) end
-        -- user-supplied creds
-        local u = stdnse.get_script_args("dicom-web.orthanc.user")
-        local p = stdnse.get_script_args("dicom-web.orthanc.pass")
-        local auth = make_basic_auth(u, p)
-        if auth then
-          local r_yes = http_get(host, port, "/system", { ["Accept"]="application/json", ["Authorization"]=auth })
-          if r_yes and r_yes.status == 200 and r_yes.body then
-            orthanc_version = r_yes.body:match('"version"%s*:%s*"([^"]+)"') or
-                              r_yes.body:match('"Version"%s*:%s*"([^"]+)"')
-          end
-        end
         -- optional default creds probe
-        if try_defs then
+        if not no_defs then
           local def_auth = make_basic_auth("orthanc","orthanc")
           if def_auth then
             local r_def = http_get(host, port, "/system", { ["Accept"]="application/json", ["Authorization"]=def_auth })
-            if r_def and r_def.status == 200 then
+            if r_def and r_def.status == 200 and r_def.body then
               table.insert(warn, "Insecure: Orthanc accepts default credentials (orthanc:orthanc)")
-              if not orthanc_version and r_def.body then
-                orthanc_version = r_def.body:match('"version"%s*:%s*"([^"]+)"') or
-                                  r_def.body:match('"Version"%s*:%s*"([^"]+)"')
-              end
+              orthanc_version = r_def.body:match('"version"%s*:%s*"([^"]+)"') or
+                                r_def.body:match('"Version"%s*:%s*"([^"]+)"') or orthanc_version
             end
           end
         end
@@ -239,10 +213,6 @@ action = function(host, port)
       end
       if orthanc_auth == "no-auth" then
         table.insert(warn, "Insecure: Orthanc /system reachable without authentication")
-      end
-      if legacy_lines then
-        local v = out.orthanc.version or "unknown"
-        table.insert(out, ("Orthanc REST API: /system (version %s)"):format(v))
       end
     end
   end
@@ -264,9 +234,7 @@ action = function(host, port)
           loc:find("/auth", 1, true)
         if looks then
           out.ui["dcm4chee-arc-ui"] = "/dcm4chee-arc/ui2/"
-          -- CSP advisory
-          local csp = hget(r.header, "Content-Security-Policy")
-          if not csp then
+          if not hget(r.header, "Content-Security-Policy") then
             table.insert(warn, "Advisory: DCM4CHEE UI missing Content-Security-Policy")
           end
           break
@@ -275,7 +243,7 @@ action = function(host, port)
     end
   end
 
-  -- -------- OHIF detection (tightened) --------
+  -- -------- OHIF detection (tight) --------
   do
     local ohif = false
     local r = http_get(host, port, "/")
@@ -283,8 +251,7 @@ action = function(host, port)
       if body_has(r.body, "data-cy-root") or body_has(r.body, "ohif") or body_has(r.body, "app-config.js") then
         ohif = true
       end
-      local csp = hget(r.header, "Content-Security-Policy")
-      if ohif and not csp then
+      if ohif and not hget(r.header, "Content-Security-Policy") then
         table.insert(warn, "Advisory: OHIF root missing Content-Security-Policy")
       end
     end
@@ -298,29 +265,20 @@ action = function(host, port)
     end
     if ohif then
       out.ui["ohif"] = "/"
-      if legacy_lines then
-        table.insert(out, "OHIF Viewer: detected at /")
-      end
     end
   end
 
   -- -------- DICOMweb checks --------
   local bases = {
-    {name="Orthanc DICOMweb", base="/dicom-web"},
-    {name="dcm4chee DICOMweb", base="/dcm4chee-arc/rs"},
-    {name="dcm4chee DICOMweb (AET)", base=("/dcm4chee-arc/aets/" .. aet .. "/rs")},
+    {impl="orthanc",   base="/dicom-web"},
+    {impl="dcm4chee",  base="/dcm4chee-arc/rs"},
+    {impl="dcm4chee",  base="/dcm4chee-arc/aets/DCM4CHEE/rs"}, -- common AET route; ok if 404
   }
-
-  -- merge user-specified extra bases
-  for _, p in ipairs(extra_bases) do
-    table.insert(bases, { name="Custom DICOMweb", base=p })
-  end
 
   local function is_dicom_json(r)
     if not (r and r.status == 200 and r.body) then return false end
     local ct = lc(hget(r.header, "Content-Type") or "")
     if ct:find("application/dicom%+json", 1, false) then return true end
-    -- heuristic tags commonly present in DICOM JSON
     return body_has(r.body, '"StudyInstanceUID"')
         or body_has(r.body, '"SeriesInstanceUID"')
         or body_has(r.body, '"SOPInstanceUID"')
@@ -328,7 +286,6 @@ action = function(host, port)
   end
 
   local function qido_try(host, port, path)
-    -- try dicom+json, then json on 406
     local r = http_get(host, port, path, { ["Accept"]="application/dicom+json" })
     if r and r.status == 406 then
       r = http_get(host, port, path, { ["Accept"]="application/json" })
@@ -336,81 +293,74 @@ action = function(host, port)
     return r
   end
 
-  -- Track discovered bases and per-base findings
   for _, b in ipairs(bases) do
-    local base_info = { name=b.name, base=b.base }
-    -- Base reachability (and Orthanc plugin "enabled" index page is often HTML/200)
-    do
-      local r = http_get(host, port, b.base .. "/")
-      if r and (r.status == 200 or r.status == 401 or r.status == 403) then
-        base_info.reachable = true
-        -- A small nicety for Orthanc: if HTML index is returned on /dicom-web/, mark plugin-enabled
-        if b.base == "/dicom-web" and r.status == 200 then
-          base_info["orthanc-plugin-enabled"] = true
-        end
+    local info = { base=b.base, impl=b.impl }
+
+    -- Reachability (+ Orthanc plugin index hint)
+    local r = http_get(host, port, b.base .. "/")
+    if r and (r.status == 200 or r.status == 401 or r.status == 403) then
+      info.reachable = true
+      if b.base == "/dicom-web" and r.status == 200 then
+        info["orthanc-plugin-enabled"] = true
       end
     end
 
-    -- QIDO listing probe
+    -- QIDO
     if do_qido then
       local path = b.base .. "/studies?limit=1"
-      local r = qido_try(host, port, path)
-      if r then
-        if is_dicom_json(r) then
-          base_info.qido_open = true
-          table.insert(warn, ("Insecure: Unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.name, path))
-        elseif r.status == 401 or r.status == 403 then
-          base_info.qido_secured = true
-          -- record auth scheme if available
-          local wa = hget(r.header, "WWW-Authenticate")
-          if wa then base_info["www-authenticate"] = wa end
-        elseif r.status == 404 then
-          base_info.qido_not_found = true
+      local rq = qido_try(host, port, path)
+      if rq then
+        if is_dicom_json(rq) then
+          info.qido = "open"
+          table.insert(warn, ("Insecure: Unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.base, path))
+        elseif rq.status == 401 or rq.status == 403 then
+          info.qido = "secured"
+          local wa = hget(rq.header, "WWW-Authenticate")
+          if wa then info["www-authenticate"] = wa end
+        elseif rq.status == 404 then
+          info.qido = "not-found"
+        else
+          info.qido = "unknown"
         end
       end
     end
 
-    -- CORS preflight on GET
+    -- CORS (skip if OPTIONS 405)
     if do_cors then
-      local path = b.base .. "/studies?limit=0"
-      local r = http_options(host, port, path, {
+      local rc = http_options(host, port, b.base .. "/studies?limit=0", {
         ["Origin"] = "https://example.com",
         ["Access-Control-Request-Method"] = "GET",
       })
-      -- if OPTIONS not supported (405), skip CORS evaluation
-      if r and r.header and r.status ~= 405 then
-        local acao = hget(r.header, "Access-Control-Allow-Origin")
-        local acc  = hget(r.header, "Access-Control-Allow-Credentials")
+      if rc and rc.header and rc.status ~= 405 then
+        local acao = hget(rc.header, "Access-Control-Allow-Origin")
+        local acc  = hget(rc.header, "Access-Control-Allow-Credentials")
         if (acao and lc(acao) == "*") and (acc and truthy(acc)) then
-          base_info.cors_risky = true
+          info.cors_risky = true
           table.insert(warn, ("Warning: Risky CORS at %s (ACAO: * with credentials=true)"):format(b.base))
         end
       end
     end
 
-    -- STOW advisory via OPTIONS
+    -- STOW (advisory)
     if do_stow then
-      local path = b.base .. "/studies"
-      local r = http_options(host, port, path, {
+      local rs = http_options(host, port, b.base .. "/studies", {
         ["Access-Control-Request-Method"] = "POST",
         ["Origin"] = "https://example.com",
       })
-      if r and r.header then
-        local allow = (hget(r.header, "Allow") or "") .. "," .. (hget(r.header, "Access-Control-Allow-Methods") or "")
-        if lc(allow):find("post", 1, true) and not (r.status == 401 or r.status == 403) then
-          base_info.stow_maybe_allowed = true
-          table.insert(warn, ("Advisory: STOW-RS may allow POST (unauthenticated?) at %s (via OPTIONS)"):format(path))
+      if rs and rs.header then
+        local allow = (hget(rs.header, "Allow") or "") .. "," .. (hget(rs.header, "Access-Control-Allow-Methods") or "")
+        if lc(allow):find("post", 1, true) and not (rs.status == 401 or rs.status == 403) then
+          info.stow_maybe = true
+          table.insert(warn, ("Advisory: STOW-RS may allow POST (unauthenticated?) at %s (via OPTIONS)"):format(b.base .. "/studies"))
         end
       end
     end
 
-    table.insert(out.dicomweb.bases, base_info)
+    table.insert(out.dicomweb.bases, info)
   end
 
-  -- place warnings last
   out.warnings = warn
 
-  -- Nmap pretty-prints nested tables; return nil if truly nothing interesting
   if (next(out.orthanc) == nil) and (next(out.ui) == nil) and (#out.dicomweb.bases == 0) and (#warn == 0) then
     return nil
   end

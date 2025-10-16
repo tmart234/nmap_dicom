@@ -7,22 +7,23 @@
 --   - OHIF viewer
 --
 -- Security checks (non-intrusive):
---   - HTTP instead of HTTPS
---   - Unauthenticated QIDO-RS listing (/studies?limit=1) with DICOM JSON (tries application/dicom+json, then application/json on 406)
---   - Risky CORS (ACAO: * with credentials=true)
---   - (Advisory) STOW-RS appears allowed via OPTIONS without auth
---   - (Default) Orthanc default creds accepted (orthanc:orthanc) — disable via dicom-web.no-defaults=true
---   - (Advisory) Missing Content-Security-Policy on known UIs
---   - (Info) WWW-Authenticate (e.g., Basic/Bearer) when 401
+--   - http instead of https
+--   - Unauthenticated QIDO-RS listing (/studies?limit=1) with DICOM JSON
+--     (tries Accept: application/dicom+json, then falls back to application/json on 406)
+--   - risky CORS (ACAO: * with credentials=true)
+--   - (advisory) STOW-RS appears allowed via OPTIONS without auth
+--   - (advisory) missing Content-Security-Policy on known UIs
+--   - (info) WWW-Authenticate scheme on 401 (e.g., Basic/Bearer)
+--   - (default) Orthanc default creds accepted (orthanc:orthanc); disable with dicom-web.no-defaults=true
 --
 -- @usage
 -- nmap -p 8042,3000 --script dicom-web-info <target>
 --
--- @args dicom-web.qido-test     (bool)  Probe QIDO unauth listing (default: true)
--- @args dicom-web.cors-test     (bool)  Probe CORS preflight (default: true)
--- @args dicom-web.stow-test     (bool)  Probe STOW via OPTIONS (advisory) (default: false)
--- @args dicom-web.no-defaults   (bool)  Do NOT try Orthanc default creds (default: false)
--- @args dicom-web.ports         (str)   Comma-list to limit portrule (e.g., "8042,3000,8080")
+-- @args dicom-web.qido-test    (bool)  Probe QIDO unauth listing (default: true)
+-- @args dicom-web.cors-test    (bool)  Probe CORS preflight (default: true)
+-- @args dicom-web.stow-test    (bool)  Probe STOW via OPTIONS (advisory) (default: false)
+-- @args dicom-web.no-defaults  (bool)  Do NOT try Orthanc default creds (default: false)
+-- @args dicom-web.ports        (str)   Comma-list to limit portrule (e.g., "8042,3000,8080")
 --
 -- @output
 -- PORT     STATE SERVICE
@@ -32,8 +33,7 @@
 -- |     path: /system
 -- |     version: 1.12.9
 -- |     auth: auth-required
--- |     www-authenticate:
--- |       Basic realm="Orthanc Secure Area"
+-- |     www-authenticate: Basic realm="Orthanc Secure Area"
 -- |   ui:
 -- |     ohif: /
 -- |   dicomweb:
@@ -45,7 +45,8 @@
 -- |         impl: dcm4chee
 -- |         qido: secured
 -- |   warnings:
--- |_    Warning: HTTP (no TLS) detected
+-- |     warning: http (no TLS) detected
+-- |_    advisory: OHIF root missing Content-Security-Policy
 --
 author = "Tyler M"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
@@ -170,12 +171,12 @@ action = function(host, port)
 
   -- TLS hint
   if port.tunnel ~= "ssl" then
-    table.insert(warn, "Warning: HTTP (no TLS) detected")
+    table.insert(warn, "warning: http (no TLS) detected")
   end
 
   -- -------- Orthanc detection --------
   local orthanc_seen, orthanc_auth, orthanc_version = false, "unknown", nil
-  local orthanc_auth_schemes = {}
+  local orthanc_wa = nil
   do
     local hdr_json = { ["Accept"] = "application/json" }
     local r_no = http_get(host, port, "/system", hdr_json)
@@ -188,15 +189,14 @@ action = function(host, port)
       elseif r_no.status == 401 or r_no.status == 403 then
         orthanc_seen = true
         orthanc_auth = "auth-required"
-        local wa = hget(r_no.header, "WWW-Authenticate")
-        if wa then table.insert(orthanc_auth_schemes, wa) end
+        orthanc_wa = hget(r_no.header, "WWW-Authenticate")
         -- optional default creds probe
         if not no_defs then
           local def_auth = make_basic_auth("orthanc","orthanc")
           if def_auth then
             local r_def = http_get(host, port, "/system", { ["Accept"]="application/json", ["Authorization"]=def_auth })
             if r_def and r_def.status == 200 and r_def.body then
-              table.insert(warn, "Insecure: Orthanc accepts default credentials (orthanc:orthanc)")
+              table.insert(warn, "warning: Orthanc accepts default credentials (orthanc:orthanc)")
               orthanc_version = r_def.body:match('"version"%s*:%s*"([^"]+)"') or
                                 r_def.body:match('"Version"%s*:%s*"([^"]+)"') or orthanc_version
             end
@@ -208,16 +208,14 @@ action = function(host, port)
       out.orthanc.path    = "/system"
       out.orthanc.version = orthanc_version or "unknown"
       out.orthanc.auth    = orthanc_auth
-      if #orthanc_auth_schemes > 0 then
-        out.orthanc["www-authenticate"] = orthanc_auth_schemes
-      end
+      if orthanc_wa then out.orthanc["www-authenticate"] = orthanc_wa end
       if orthanc_auth == "no-auth" then
-        table.insert(warn, "Insecure: Orthanc /system reachable without authentication")
+        table.insert(warn, "warning: Orthanc /system reachable without authentication")
       end
     end
   end
 
-  -- -------- dcm4chee UI best-effort --------
+  -- -------- dcm4chee UI (best-effort) --------
   do
     local paths = {"/dcm4chee-arc/ui2/index.html", "/dcm4chee-arc/ui2/"}
     for _, pth in ipairs(paths) do
@@ -235,7 +233,7 @@ action = function(host, port)
         if looks then
           out.ui["dcm4chee-arc-ui"] = "/dcm4chee-arc/ui2/"
           if not hget(r.header, "Content-Security-Policy") then
-            table.insert(warn, "Advisory: DCM4CHEE UI missing Content-Security-Policy")
+            table.insert(warn, "advisory: DCM4CHEE UI missing Content-Security-Policy")
           end
           break
         end
@@ -252,7 +250,7 @@ action = function(host, port)
         ohif = true
       end
       if ohif and not hget(r.header, "Content-Security-Policy") then
-        table.insert(warn, "Advisory: OHIF root missing Content-Security-Policy")
+        table.insert(warn, "advisory: OHIF root missing Content-Security-Policy")
       end
     end
     if not ohif then
@@ -312,7 +310,7 @@ action = function(host, port)
       if rq then
         if is_dicom_json(rq) then
           info.qido = "open"
-          table.insert(warn, ("Insecure: Unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.base, path))
+          table.insert(warn, ("warning: unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.base, path))
         elseif rq.status == 401 or rq.status == 403 then
           info.qido = "secured"
           local wa = hget(rq.header, "WWW-Authenticate")
@@ -336,7 +334,7 @@ action = function(host, port)
         local acc  = hget(rc.header, "Access-Control-Allow-Credentials")
         if (acao and lc(acao) == "*") and (acc and truthy(acc)) then
           info.cors_risky = true
-          table.insert(warn, ("Warning: Risky CORS at %s (ACAO: * with credentials=true)"):format(b.base))
+          table.insert(warn, ("warning: risky CORS at %s (ACAO: * with credentials=true)"):format(b.base))
         end
       end
     end
@@ -351,7 +349,7 @@ action = function(host, port)
         local allow = (hget(rs.header, "Allow") or "") .. "," .. (hget(rs.header, "Access-Control-Allow-Methods") or "")
         if lc(allow):find("post", 1, true) and not (rs.status == 401 or rs.status == 403) then
           info.stow_maybe = true
-          table.insert(warn, ("Advisory: STOW-RS may allow POST (unauthenticated?) at %s (via OPTIONS)"):format(b.base .. "/studies"))
+          table.insert(warn, ("advisory: STOW-RS may allow POST (unauthenticated?) at %s (via OPTIONS)"):format(b.base .. "/studies"))
         end
       end
     end

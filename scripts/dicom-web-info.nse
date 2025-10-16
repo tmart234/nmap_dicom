@@ -227,7 +227,9 @@ action = function(host, port)
   -- Reduce false positives: treat clean HTTP→HTTPS redirect to same host as acceptable
   local function is_https_redirect()
     local r = http_get_cached(host, port, "/")
-    if not (r and (r.status == 301 or r.status == 302)) then return false end
+    if not (r and (r.status == 301 or r.status == 302 or r.status == 307 or r.status == 308)) then
+      return false
+    end
     local loc = hget(r.header, "Location")
     if not loc then return false end
     local scheme, hostpart = loc:match("^(https?)://([^/]+)")

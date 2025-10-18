@@ -7,14 +7,14 @@
 --   - OHIF viewer
 --
 -- Security checks (non-intrusive):
---   - http instead of https (suppressed if cleanly upgraded to same-host https)
---   - Unauthenticated QIDO-RS listing (/studies?limit=1) with DICOM JSON
+--   - http instead of https (suppressed if cleanly upgraded to same-host https)  [advisory]
+--   - Unauthenticated QIDO-RS listing (/studies?limit=1) with DICOM JSON         [vuln]
 --     (tries Accept: application/dicom+json, then falls back to application/json on 406)
---   - risky CORS (ACAO: * with credentials=true)
+--   - risky CORS (ACAO: * with credentials=true)                                 [advisory]
 --   - (advisory) STOW-RS appears allowed via OPTIONS without auth
 --   - (advisory) missing Content-Security-Policy on known UIs
 --   - (info) WWW-Authenticate scheme on 401 (e.g., Basic/Bearer)
---   - (default) Orthanc default creds accepted (orthanc:orthanc); disable with dicom-web.no-defaults=true
+--   - (vuln) Orthanc default creds accepted (orthanc:orthanc); disable with dicom-web.no-defaults=true
 --
 -- @usage
 -- nmap -p 8042,3000 --script dicom-web-info <target>
@@ -45,8 +45,8 @@
 -- |         impl: dcm4chee
 -- |         qido: secured
 -- |   warnings:
--- |     warning: http (no TLS) detected
--- |_    advisory: OHIF root missing Content-Security-Policy
+-- |     warning [DWI-003]: http (no TLS) detected
+-- |_    advisory [DWI-005]: OHIF root missing Content-Security-Policy
 --
 author = "Tyler M"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
@@ -57,6 +57,7 @@ local http      = require "http"
 local stdnse    = require "stdnse"
 local string    = require "string"
 local table     = require "table"
+local vulns     = require "vulns"
 
 -- optional base64 module provided by Nmap (nselib/base64.lua)
 local base64_ok, base64 = pcall(require, "base64")
@@ -208,11 +209,28 @@ end
 action = function(host, port)
   local out   = stdnse.output_table()
 
-  -- stable, pretty warnings
+  -- Nmap 'vulns' integration (initialized inside action for host/port)
+  local vuln_report = vulns.Report:new(SCRIPT_NAME, host, port)
+  local function add_vuln(args)
+    local v = {
+      title       = args.title,
+      state       = args.state or vulns.STATE.VULN,
+      risk_factor = args.risk or "High",
+      description = args.desc,
+      references  = args.refs or {},
+      IDS         = args.ids  or {},
+      extra_info  = args.evidence and ("evidence: " .. args.evidence) or nil,
+    }
+    vuln_report:add(v)
+  end
+
+  -- stable, pretty warnings with short codes (non-vuln)
   local warn = stdnse.output_table()
   local function addwarn(s) table.insert(warn, s) end
+  local function warn_code(code, msg) addwarn(("warning [%s]: %s"):format(code, msg)) end
+  local function adv_code(code, msg)  addwarn(("advisory [%s]: %s"):format(code, msg)) end
 
-  -- toggles (kept minimal)
+  -- toggles
   local do_qido   = truthy(stdnse.get_script_args("dicom-web.qido-test") or "true")
   local do_cors   = truthy(stdnse.get_script_args("dicom-web.cors-test") or "true")
   local do_stow   = truthy(stdnse.get_script_args("dicom-web.stow-test") or "false")
@@ -237,10 +255,10 @@ action = function(host, port)
     return (hostpart == host.targetname or hostpart == host.ip)
   end
 
-  -- TLS hint
+  -- TLS (advisory only)
   if port.tunnel ~= "ssl" then
     if not is_https_redirect() then
-      addwarn("warning: http (no TLS) detected")
+      warn_code("DWI-003", "http (no TLS) detected")
     end
   end
 
@@ -267,7 +285,16 @@ action = function(host, port)
           if def_auth then
             local r_def = http_get_cached(host, port, "/system", { ["Accept"]="application/json", ["Authorization"]=def_auth })
             if r_def and r_def.status == 200 and r_def.body then
-              addwarn("warning: Orthanc accepts default credentials (orthanc:orthanc)")
+              warn_code("DWI-002", "Orthanc accepts default credentials (orthanc:orthanc)")
+              -- Report as a true vuln
+              add_vuln{
+                title = "Orthanc default credentials accepted (orthanc:orthanc)",
+                risk  = "High",
+                desc  = "The Orthanc REST API accepted factory default credentials.",
+                refs  = { "Orthanc Security Recommendations" },
+                ids   = { CWE = "CWE-521" },
+                evidence = "GET /system → 200 with Basic auth (redacted)",
+              }
               orthanc_version = r_def.body:match('"version"%s*:%s*"([^"]+)"') or
                                 r_def.body:match('"Version"%s*:%s*"([^"]+)"') or orthanc_version
             end
@@ -281,7 +308,7 @@ action = function(host, port)
       out.orthanc.auth    = orthanc_auth
       if orthanc_wa then out.orthanc["www-authenticate"] = orthanc_wa end
       if orthanc_auth == "no-auth" then
-        addwarn("warning: Orthanc /system reachable without authentication")
+        adv_code("DWI-006", "Orthanc /system reachable without authentication")
       end
     end
   end
@@ -304,7 +331,7 @@ action = function(host, port)
         if looks then
           out.ui["dcm4chee-arc-ui"] = "/dcm4chee-arc/ui2/"
           if not hget(r.header, "Content-Security-Policy") then
-            addwarn("advisory: DCM4CHEE UI missing Content-Security-Policy")
+            adv_code("DWI-007", "DCM4CHEE UI missing Content-Security-Policy")
           end
           break
         end
@@ -312,7 +339,7 @@ action = function(host, port)
     end
   end
 
-  -- -------- OHIF detection (tight; common mounts) --------
+  -- -------- OHIF detection + version (best-effort) --------
   do
     local ohif = false
     local mount = nil
@@ -324,7 +351,7 @@ action = function(host, port)
           ohif = true
           mount = p
           if not hget(r.header, "Content-Security-Policy") then
-            addwarn("advisory: OHIF root missing Content-Security-Policy")
+            adv_code("DWI-005", "OHIF root missing Content-Security-Policy")
           end
           break
         end
@@ -341,6 +368,18 @@ action = function(host, port)
     end
     if ohif then
       out.ui["ohif"] = mount or "/"
+      -- Best-effort OHIF version from app-config.js (no warning if missing)
+      local rjs = http_get_cached(host, port, (mount or "/") .. "app-config.js")
+      if rjs and rjs.status == 200 and rjs.body and #rjs.body > 0 then
+        local body = rjs.body
+        local v =
+          body:match("appVersion[%s%:%=]['\"]([^'\"]+)['\"]") or
+          body:match("window%.config%s*=%s*{.-appVersion%s*:%s*['\"]([^'\"]+)['\"]") or
+          body:match("process%.env%.APP_VERSION%s*=%s*['\"]([^'\"]+)['\"]")
+        if v then
+          out.ui["ohif_version"] = v
+        end
+      end
     end
   end
 
@@ -350,7 +389,6 @@ action = function(host, port)
     {impl="dcm4chee",  base="/dcm4chee-arc/rs"},
     {impl="dcm4chee",  base="/dcm4chee-arc/aets/DCM4CHEE/rs"}, -- common AET route; ok if 404
   }
-  -- stable CI diffs
   table.sort(bases, function(a,b) return a.base < b.base end)
 
   local function is_dicom_json(r)
@@ -381,12 +419,10 @@ action = function(host, port)
   end
 
   for _, b in ipairs(bases) do
-    -- Ordered per-base output
     local info = stdnse.output_table()
     info.base = b.base
     info.impl = b.impl
 
-    -- Reachability (+ Orthanc plugin index hint)
     local r = http_get_cached(host, port, b.base .. "/")
     if r and (r.status == 200 or r.status == 204 or r.status == 401 or r.status == 403) then
       info.reachable = true
@@ -395,13 +431,21 @@ action = function(host, port)
       end
     end
 
-    -- QIDO (set only when meaningful; include 429/503)
     if do_qido then
       local rq, used_path = qido_try_paths(b.base)
       if rq then
         if is_dicom_json(rq) then
           info.qido = "open"
-          addwarn(("warning: unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.base, used_path))
+          -- True vulnerability: unauthenticated QIDO returns DICOM JSON
+          add_vuln{
+            title = "DICOMweb QIDO-RS accessible without authentication",
+            risk  = "High",
+            desc  = "QIDO-RS returns study/series/instance metadata without authentication.",
+            refs  = { "DICOM PS3.18 Web Services – QIDO-RS security" },
+            ids   = { CWE = "CWE-200" },
+            evidence = ("GET %s → %s, %s"):format(used_path, rq.status, hget(rq.header,"Content-Type") or "no CT"),
+          }
+          warn_code("DWI-001", ("unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.base, used_path))
         elseif rq.status == 401 or rq.status == 403 then
           info.qido = "secured"
           local wa = hget(rq.header, "WWW-Authenticate")
@@ -412,18 +456,16 @@ action = function(host, port)
           info.qido = "rate-limited"
           local ra = hget(rq.header, "Retry-After")
           if ra then
-            addwarn(("advisory: QIDO-RS rate limited at %s (Retry-After: %s)"):format(b.base, ra))
+            adv_code("DWI-008", ("QIDO-RS rate limited at %s (Retry-After: %s)"):format(b.base, ra))
           else
-            addwarn(("advisory: QIDO-RS rate limited at %s"):format(b.base))
+            adv_code("DWI-008", ("QIDO-RS rate limited at %s"):format(b.base))
           end
         elseif rq.status == 503 then
           info.qido = "unavailable"
         end
-        -- omit qido entirely if indeterminate
       end
     end
 
-    -- CORS (skip if OPTIONS 405)
     if do_cors then
       local rc = http_options_cached(host, port, b.base .. "/studies?limit=0", {
         ["Origin"] = "https://example.com",
@@ -434,12 +476,12 @@ action = function(host, port)
         local acc  = hget(rc.header, "Access-Control-Allow-Credentials")
         if (acao and lc(acao) == "*") and (acc and truthy(acc)) then
           info.cors_risky = true
-          addwarn(("warning: risky CORS at %s (ACAO: * with credentials=true)"):format(b.base))
+          -- advisory only (not a vuln record)
+          warn_code("DWI-004", ("risky CORS at %s (ACAO: * with credentials=true)"):format(b.base))
         end
       end
     end
 
-    -- STOW (advisory)
     if do_stow then
       local rs = http_options_cached(host, port, b.base .. "/studies", {
         ["Access-Control-Request-Method"] = "POST",
@@ -449,7 +491,7 @@ action = function(host, port)
         local allow = (hget(rs.header, "Allow") or "") .. "," .. (hget(rs.header, "Access-Control-Allow-Methods") or "")
         if lc(allow):find("post", 1, true) and not (rs.status == 401 or rs.status == 403) then
           info.stow_maybe = true
-          addwarn(("advisory: STOW-RS may allow POST (unauthenticated?) at %s (via OPTIONS)"):format(b.base .. "/studies"))
+          adv_code("DWI-009", ("STOW-RS may allow POST (unauthenticated?) at %s (via OPTIONS)"):format(b.base .. "/studies"))
         end
       end
     end
@@ -457,7 +499,7 @@ action = function(host, port)
     table.insert(out.dicomweb.bases, info)
   end
 
-  -- Broader flavor awareness: WADO-URI presence (safe check)
+  -- WADO-URI presence (safe check)
   do
     local r = http_get_cached(host, port, "/wado")
     if r and (r.status == 200 or r.status == 400 or r.status == 401 or r.status == 403) then
@@ -469,7 +511,12 @@ action = function(host, port)
     out.warnings = warn
   end
 
-  if (next(out.orthanc) == nil) and (next(out.ui) == nil) and (#out.dicomweb.bases == 0) and (#warn == 0) then
+  local vuln_out = vuln_report:make_output()
+  if vuln_out then
+    out.vulnerabilities = vuln_out
+  end
+
+  if (next(out.orthanc) == nil) and (next(out.ui) == nil) and (#out.dicomweb.bases == 0) and (#warn == 0) and (not vuln_out) then
     return nil
   end
   return out

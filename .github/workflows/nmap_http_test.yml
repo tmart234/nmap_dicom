@@ -27,7 +27,8 @@ jobs:
             compose: docker/docker-compose.web-mocks.yml
             service: qido_open
             port: 8081
-            expect: 'warning: unauthenticated QIDO-RS listing'
+            # Match a stable substring (script prints: "warning [DWI-001]: unauthenticated QIDO-RS listing ...")
+            expect: 'unauthenticated QIDO-RS listing'
           - name: qido-secured
             compose: docker/docker-compose.web-mocks.yml
             service: qido_secured
@@ -66,7 +67,7 @@ jobs:
           done
           nc -zv 127.0.0.1 ${{ matrix.target.port }}
 
-          # Generic: wait for *any* typical HTTP response on root
+          # Generic: wait for typical HTTP response on root
           for i in {1..200}; do
             CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}/" || true)
             case "$CODE" in
@@ -105,7 +106,7 @@ jobs:
               done
               ;;
             qido-open)
-              # Mock QIDO-open: ensure the studies endpoint is answering with a 200 (open)
+              # Mock QIDO-open: ensure the studies endpoint answers with a 200
               for i in {1..200}; do
                 CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}/dicom-web/studies?limit=1" || true)"
                 [ "$CODE" = "200" ] && break

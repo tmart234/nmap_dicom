@@ -57,7 +57,9 @@ local http      = require "http"
 local stdnse    = require "stdnse"
 local string    = require "string"
 local table     = require "table"
-local vulns     = require "vulns"
+
+-- Optional: nselib/vulns.lua (not available in all builds)
+local have_vulns, vulns = pcall(require, "vulns")
 
 -- optional base64 module provided by Nmap (nselib/base64.lua)
 local base64_ok, base64 = pcall(require, "base64")
@@ -209,19 +211,24 @@ end
 action = function(host, port)
   local out   = stdnse.output_table()
 
-  -- Nmap 'vulns' integration (initialized inside action for host/port)
-  local vuln_report = vulns.Report:new(SCRIPT_NAME, host, port)
-  local function add_vuln(args)
-    local v = {
-      title       = args.title,
-      state       = args.state or vulns.STATE.VULN,
-      risk_factor = args.risk or "High",
-      description = args.desc,
-      references  = args.refs or {},
-      IDS         = args.ids  or {},
-      extra_info  = args.evidence and ("evidence: " .. args.evidence) or nil,
-    }
-    vuln_report:add(v)
+  -- Safe/optional Nmap 'vulns' integration (no-op if missing)
+  local add_vuln = function(_) end
+  local vuln_report = nil
+  if have_vulns and vulns and vulns.Report and vulns.Report.new and vulns.STATE then
+    vuln_report = vulns.Report:new(SCRIPT_NAME, host, port)
+    if vuln_report and vuln_report.add then
+      add_vuln = function(args)
+        vuln_report:add{
+          title       = args.title,
+          state       = args.state or vulns.STATE.VULN,   -- or .LIKELY_VULN / .POTENTIAL
+          risk_factor = args.risk or "High",
+          description = args.desc,
+          references  = args.refs or {},
+          IDS         = args.ids  or {},
+          extra_info  = args.evidence and ("evidence: " .. args.evidence) or nil,
+        }
+      end
+    end
   end
 
   -- stable, pretty warnings with short codes (non-vuln)
@@ -511,12 +518,14 @@ action = function(host, port)
     out.warnings = warn
   end
 
-  local vuln_out = vuln_report:make_output()
-  if vuln_out then
-    out.vulnerabilities = vuln_out
+  if vuln_report and vuln_report.make_output then
+    local vuln_out = vuln_report:make_output()
+    if vuln_out then
+      out.vulnerabilities = vuln_out
+    end
   end
 
-  if (next(out.orthanc) == nil) and (next(out.ui) == nil) and (#out.dicomweb.bases == 0) and (#warn == 0) and (not vuln_out) then
+  if (next(out.orthanc) == nil) and (next(out.ui) == nil) and (#out.dicomweb.bases == 0) and (#warn == 0) and (out.vulnerabilities == nil) then
     return nil
   end
   return out

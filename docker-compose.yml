@@ -83,8 +83,8 @@ services:
       start_period: 45s
 
   stunnel:
-    image: stunnel/stunnel:latest   # change if you prefer another stunnel image
-    container_name: dicom_stunnel_test
+    image: stunnel/stunnel:latest
+    container_name: stunnel
     depends_on:
       orthanc:
         condition: service_healthy

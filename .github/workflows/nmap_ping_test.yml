@@ -13,19 +13,19 @@ jobs:
       fail-fast: false
       matrix:
         dicom_server:
-          - name: orthanc # Port 11112 is in standard portrule check
+          - name: orthanc
             host_port: 11112
             service_name: orthanc
             compose_services: "orthanc"
             nmap_args: ""
             expect_vendor_version: "true"
-          - name: pynetdicom-scp # Port 11114 needs explicit allowance via portrule arg
+          - name: pynetdicom-scp
             host_port: 11114
             service_name: pynetdicom-scp
             compose_services: "pynetdicom-scp"
             nmap_args: "--script-args dicom-ping.ports=11114"
             expect_vendor_version: "true"
-          - name: dcm4che-scp # Port 11115 needs explicit allowance via portrule arg
+          - name: dcm4che-scp
             host_port: 11115
             service_name: dcm4che-scp
             compose_services: "dcm4che-scp"
@@ -37,12 +37,12 @@ jobs:
             compose_services: "conquest"
             nmap_args: "--script-args dicom-ping.ports=5678,dicom.called_aet=CONQUESTSRV1"
             expect_vendor_version: "true"
-          - name: dicom-tls      # NEW: TLS listener on 2762 via stunnel -> Orthanc 4242
+          - name: dicom-tls
             host_port: 2762
             service_name: stunnel
             compose_services: "orthanc stunnel"
             nmap_args: "--script-args dicom-ping.ports=2762"
-            expect_vendor_version: "false"
+            expect_vendor_version: "false"   # plaintext NSE won't extract vendor/version over TLS
 
     steps:
       - name: Checkout repository
@@ -53,36 +53,26 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y \
-            nmap \
-            tcpdump \
-            tshark \
-            docker-compose \
-            netcat-openbsd
+            nmap tcpdump tshark docker-compose netcat-openbsd openssl
 
       - name: Copy custom Nmap files
         run: |
           NMAP_SCRIPT_SRC="scripts/dicom-ping.nse"
           NMAP_LIB_SRC="nselib/dicom.lua"
-          NMAP_DEFAULT_PATH="/usr/share/nmap"
-          echo "Checking for Nmap script at: $PWD/$NMAP_SCRIPT_SRC"
-          [ -f "$NMAP_SCRIPT_SRC" ] || { echo "::error::Nmap script file not found at '$NMAP_SCRIPT_SRC'."; exit 1; }
-          echo "Checking for Nmap library at: $PWD/$NMAP_LIB_SRC"
-          [ -f "$NMAP_LIB_SRC" ] || { echo "::error::Nmap library file not found at '$NMAP_LIB_SRC'."; exit 1; }
-          echo "Using standard Nmap path: $NMAP_DEFAULT_PATH"
-          sudo mkdir -p "${NMAP_DEFAULT_PATH}/scripts/" "${NMAP_DEFAULT_PATH}/nselib/"
-          sudo cp "$NMAP_SCRIPT_SRC" "${NMAP_DEFAULT_PATH}/scripts/"
-          sudo cp "$NMAP_LIB_SRC" "${NMAP_DEFAULT_PATH}/nselib/"
+          NMAP_DIR="/usr/share/nmap"
+          [ -f "$NMAP_SCRIPT_SRC" ] || { echo "::error::Missing $NMAP_SCRIPT_SRC"; exit 1; }
+          [ -f "$NMAP_LIB_SRC" ] || { echo "::error::Missing $NMAP_LIB_SRC"; exit 1; }
+          sudo mkdir -p "$NMAP_DIR/scripts" "$NMAP_DIR/nselib"
+          sudo cp "$NMAP_SCRIPT_SRC" "$NMAP_DIR/scripts/"
+          sudo cp "$NMAP_LIB_SRC" "$NMAP_DIR/nselib/"
           sudo nmap --script-updatedb
-          echo "Nmap script database updated."
 
       - name: Build pynetdicom SCP image
         if: matrix.dicom_server.name == 'pynetdicom-scp'
         run: |
-          echo "Building pynetdicom SCP image..."
           docker build -t my-pynetdicom-scp:latest -f docker/pynetdicom/Dockerfile .
-          echo "Image build complete."
 
-      # NEW: Create stunnel config + throwaway self-signed certs for TLS test
+      # Prepare stunnel config & throwaway self-signed certs
       - name: Prepare stunnel config and certs
         if: matrix.dicom_server.name == 'dicom-tls'
         run: |
@@ -104,83 +94,73 @@ jobs:
           cert = /etc/stunnel/certs/server.pem
           verify = 0
           CONF
-
-          # throwaway keypair for CI
           openssl req -x509 -newkey rsa:2048 -nodes \
             -keyout docker/stunnel/certs/server.key \
             -out    docker/stunnel/certs/server.crt \
             -subj "/CN=localhost" -days 1
           cat docker/stunnel/certs/server.key docker/stunnel/certs/server.crt \
             > docker/stunnel/certs/server.pem
-          echo "Prepared docker/stunnel/stunnel.conf and certs."
 
       - name: Start DICOM Server Stack (${{ matrix.dicom_server.name }})
         id: start_stack
         run: |
-          echo "Starting Docker services: ${{ matrix.dicom_server.compose_services }}"
+          echo "Starting: ${{ matrix.dicom_server.compose_services }}"
           docker-compose up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}
-          UP_EXIT_CODE=$?
-          if [ $UP_EXIT_CODE -ne 0 ]; then
-            echo "::error::'docker-compose up' failed (exit $UP_EXIT_CODE)."
+          UP_EXIT=$?
+          if [ $UP_EXIT -ne 0 ]; then
+            echo "::error:: docker-compose up failed (exit $UP_EXIT)"
             docker ps -a
             docker-compose logs --no-color || true
             echo "startup_success=false" >> $GITHUB_OUTPUT
-            exit $UP_EXIT_CODE
+            exit $UP_EXIT
           fi
 
-          if [ "${{ matrix.dicom_server.name }}" = "dcm4chee-arc" ]; then
-            WAIT_TIME=120
-          else
-            WAIT_TIME=30
-          fi
-          echo "Waiting ${WAIT_TIME}s for ${{ matrix.dicom_server.name }} to initialize..."
-          sleep ${WAIT_TIME}
+          # Give services time to initialize
+          case "${{ matrix.dicom_server.name }}" in
+            dcm4chee-arc) WAIT=120 ;;
+            *)             WAIT=30  ;;
+          esac
+          echo "Waiting ${WAIT}s for init..."
+          sleep ${WAIT}
 
-          SERVICE_STATUS=$(docker-compose ps -q ${{ matrix.dicom_server.service_name }} | xargs -r docker inspect --format='{{.State.Status}}' 2>/dev/null || echo "notfound")
-          if [ "$SERVICE_STATUS" != "running" ]; then
-            echo "::error:: Service '${{ matrix.dicom_server.service_name }}' not running (Status: $SERVICE_STATUS)."
+          STATUS=$(docker-compose ps -q ${{ matrix.dicom_server.service_name }} | xargs -r docker inspect --format='{{.State.Status}}' 2>/dev/null || echo "notfound")
+          if [ "$STATUS" != "running" ]; then
+            echo "::error:: Service ${{ matrix.dicom_server.service_name }} not running (status: $STATUS)."
             docker ps -a
             docker-compose logs --no-color || true
             echo "startup_success=false" >> $GITHUB_OUTPUT
             exit 1
           fi
 
-          echo "Checking if host port ${{ matrix.dicom_server.host_port }} is listening..."
-          PORT_OPEN=false
-          for i in {1..5}; do
+          # Check listening port on host
+          for i in {1..8}; do
             if nc -z localhost ${{ matrix.dicom_server.host_port }}; then
-              echo "Port ${{ matrix.dicom_server.host_port }} is open."
-              PORT_OPEN=true
-              break
+              echo "Port ${{ matrix.dicom_server.host_port }} open."
+              echo "startup_success=true" >> $GITHUB_OUTPUT
+              exit 0
             fi
-            echo "Port not open yet, retrying in 5s..."
             sleep 5
           done
-          if [ "$PORT_OPEN" != "true" ]; then
-            echo "::error:: Host port ${{ matrix.dicom_server.host_port }} is not open."
-            docker ps -a
-            docker-compose logs --no-color || true
-            echo "startup_success=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-          echo "startup_success=true" >> $GITHUB_OUTPUT
+          echo "::error:: Port ${{ matrix.dicom_server.host_port }} never opened."
+          docker-compose logs --no-color || true
+          echo "startup_success=false" >> $GITHUB_OUTPUT
+          exit 1
 
       - name: Start tcpdump capture (${{ matrix.dicom_server.name }})
         id: start_tcpdump
+        if: steps.start_stack.outputs.startup_success == 'true'
         run: |
-          TARGET_PORT=${{ matrix.dicom_server.host_port }}
-          PCAP_FILE="dicom_capture_${{ matrix.dicom_server.name }}.pcap"
-          echo "Starting tcpdump capture for port $TARGET_PORT..."
-          sudo tcpdump -i any -s 0 "port $TARGET_PORT" -w "$PCAP_FILE" &
+          TARGET=${{ matrix.dicom_server.host_port }}
+          PCAP="dicom_capture_${{ matrix.dicom_server.name }}.pcap"
+          sudo tcpdump -i any -s 0 "port $TARGET" -w "$PCAP" &
           echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
-          echo "pcap_file=$PCAP_FILE" >> $GITHUB_OUTPUT
-          echo "Tcpdump started (PID: $!), capturing to $PCAP_FILE"
+          echo "pcap_file=$PCAP" >> $GITHUB_OUTPUT
+          echo "Started tcpdump PID $!"
 
       - name: Run Nmap Test (${{ matrix.dicom_server.name }})
         id: test_script
         if: steps.start_stack.outputs.startup_success == 'true'
         run: |
-          echo "--- Testing ${{ matrix.dicom_server.name }} on host port ${{ matrix.dicom_server.host_port }} ---"
           OUT="nmap_${{ matrix.dicom_server.name }}.out"
           nmap -p ${{ matrix.dicom_server.host_port }} \
                -dd \
@@ -190,75 +170,81 @@ jobs:
                localhost | tee "$OUT"
           echo "nmap_out=$OUT" >> $GITHUB_OUTPUT
 
-      - name: Assert vendor and version are present (${{ matrix.dicom_server.name }})
+      # Strict assertion for non-TLS rows
+      - name: Assert vendor+version (${{ matrix.dicom_server.name }})
         if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.expect_vendor_version != 'false'
         run: |
           OUT="${{ steps.test_script.outputs.nmap_out }}"
-          if ! grep -E '^[|]_?\s*vendor:\s*\S' "$OUT" && ! grep -E '^[|]\s+vendor:\s*\S' "$OUT"; then
-            echo "::error::Missing 'vendor:' in Nmap output for ${{ matrix.dicom_server.name }}."
-            tail -n 200 "$OUT" || true
-            exit 1
-          fi
-          if ! grep -E '^[|]_?\s*version:\s*\S' "$OUT" && ! grep -E '^[|]\s+version:\s*\S' "$OUT"; then
-            echo "::error::Missing 'version:' in Nmap output for ${{ matrix.dicom_server.name }}."
-            tail -n 200 "$OUT" || true
-            exit 1
-          fi
-          if ! grep -E '^[|]_?\s*version:\s*.*[0-9]' "$OUT" && ! grep -E '^[|]\s+version:\s*.*[0-9]' "$OUT"; then
-            echo "::error::'version:' line found but does not contain digits for ${{ matrix.dicom_server.name }}."
-            exit 1
+          grep -E '^[|]_?\s*vendor:\s*\S' "$OUT" || grep -E '^[|]\s+vendor:\s*\S' "$OUT" || {
+            echo "::error::Missing vendor in $OUT"; tail -n 200 "$OUT" || true; exit 1; }
+          grep -E '^[|]_?\s*version:\s*\S' "$OUT" || grep -E '^[|]\s+version:\s*\S' "$OUT" || {
+            echo "::error::Missing version in $OUT"; tail -n 200 "$OUT" || true; exit 1; }
+          grep -E '^[|]_?\s*version:\s*.*[0-9]' "$OUT" || grep -E '^[|]\s+version:\s*.*[0-9]' "$OUT" || {
+            echo "::error::Non-numeric version in $OUT"; exit 1; }
+
+      # Relaxed assertion for TLS row: just prove the script ran / port reachable
+      - name: Assert TLS row behavior (no vendor/version required)
+        if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.expect_vendor_version == 'false'
+        run: |
+          OUT="${{ steps.test_script.outputs.nmap_out }}"
+          # Accept any script output (or even none) — primary goal is CI path and port wiring
+          if ! grep -E '\| dicom-ping:' "$OUT"; then
+            echo "Note: dicom-ping may not print on TLS (plaintext probe). Checking that port was scanned OK."
+            grep -E '^[0-9]+/tcp\s+open' "$OUT" || { echo "::error::Port not shown open in Nmap output"; exit 1; }
           fi
 
       - name: Show Server Logs (${{ matrix.dicom_server.name }})
         if: always()
         run: |
-          echo "--- ${{ matrix.dicom_server.name }} server logs (Tail) ---"
-          docker-compose logs --tail="50" ${{ matrix.dicom_server.service_name }} || echo "Failed to get logs."
-          echo "--- ${{ matrix.dicom_server.name }} server logs (DICOM Filter) ---"
-          docker-compose logs ${{ matrix.dicom_server.service_name }} | grep -A 5 -B 5 -E "DICOM|DIMSE|Association" || echo "No relevant mentions."
+          echo "--- ${{ matrix.dicom_server.name }} logs (tail 50) ---"
+          docker-compose logs --tail="50" ${{ matrix.dicom_server.service_name }} || echo "No logs."
 
       - name: Stop tcpdump capture (${{ matrix.dicom_server.name }})
         if: always()
         run: |
-          TCPDUMP_PID="${{ steps.start_tcpdump.outputs.tcpdump_pid }}"
-          echo "Stopping tcpdump PID: $TCPDUMP_PID"
-          if [ -n "$TCPDUMP_PID" ]; then
-            sudo kill "$TCPDUMP_PID" 2>/dev/null || true
+          if [ -n "${{ steps.start_tcpdump.outputs.tcpdump_pid }}" ]; then
+            sudo kill "${{ steps.start_tcpdump.outputs.tcpdump_pid }}" 2>/dev/null || true
             sleep 2
-            sudo kill -0 "$TCPDUMP_PID" 2>/dev/null && sudo kill -9 "$TCPDUMP_PID" || true
+            sudo kill -0 "${{ steps.start_tcpdump.outputs.tcpdump_pid }}" 2>/dev/null && sudo kill -9 "${{ steps.start_tcpdump.outputs.tcpdump_pid }}" || true
           else
-            echo "No tcpdump PID found."
+            echo "tcpdump was not started."
           fi
-          sleep 2
 
       - name: Print PCAP Info (${{ matrix.dicom_server.name }})
         if: always()
         continue-on-error: true
         run: |
-          PCAP_FILE="${{ steps.start_tcpdump.outputs.pcap_file }}"
-          echo "Checking PCAP file: $PCAP_FILE"
-          if [[ -f "$PCAP_FILE" && -s "$PCAP_FILE" ]]; then
-            echo "--- PCAP Info for $PCAP_FILE ---"
-            tshark -r "$PCAP_FILE" -c 100 -Y dicom || echo "No DICOM packets found or tshark error."
-            echo "--- End PCAP Info ---"
-          elif [[ -f "$PCAP_FILE" ]]; then
-            echo "PCAP file $PCAP_FILE exists but is empty."
+          PCAP="${{ steps.start_tcpdump.outputs.pcap_file }}"
+          if [ -n "$PCAP" ] && [ -s "$PCAP" ]; then
+            echo "--- tshark summary for $PCAP ---"
+            tshark -r "$PCAP" -c 100 -Y dicom || echo "No DICOM packets or tshark error."
           else
-            echo "PCAP file $PCAP_FILE not found."
+            echo "No PCAP to summarize (file missing or empty)."
           fi
+
+      - name: Collect artifacts (${{ matrix.dicom_server.name }})
+        if: always()
+        run: |
+          mkdir -p artifacts
+          # Nmap output
+          if [ -n "${{ steps.test_script.outputs.nmap_out }}" ] && [ -f "${{ steps.test_script.outputs.nmap_out }}" ]; then
+            cp "${{ steps.test_script.outputs.nmap_out }}" "artifacts/"
+          fi
+          # PCAP
+          if [ -n "${{ steps.start_tcpdump.outputs.pcap_file }}" ] && [ -f "${{ steps.start_tcpdump.outputs.pcap_file }}" ]; then
+            cp "${{ steps.start_tcpdump.outputs.pcap_file }}" "artifacts/"
+          fi
+          ls -lah artifacts || true
 
       - name: Upload artifacts (${{ matrix.dicom_server.name }})
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: nmap-${{ matrix.dicom_server.name }}-artifacts
-          path: |
-            ${{ steps.test_script.outputs.nmap_out }}
-            ${{ steps.start_tcpdump.outputs.pcap_file }}
+          path: artifacts
           if-no-files-found: ignore
 
       - name: Stop DICOM Server Stack (${{ matrix.dicom_server.name }})
         if: always()
         run: |
-          echo "Stopping all docker services..."
           docker-compose down --volumes --remove-orphans

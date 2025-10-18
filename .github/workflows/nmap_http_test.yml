@@ -132,7 +132,10 @@ jobs:
         run: |
           set -o pipefail
           OUT="nmap_http_${{ matrix.target.name }}.txt"
-          nmap -d -p ${{ matrix.target.port }} --script dicom-web-info 127.0.0.1 | tee "$OUT"
+          nmap -d -p ${{ matrix.target.port }} \
+              --script dicom-web-info \
+              --script-args "dicom-web.ports=${{ matrix.target.port }},dicom-web.qido-test=true" \
+              127.0.0.1 | tee "$OUT"
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
 
       - name: Assert ${{ matrix.target.name }} output

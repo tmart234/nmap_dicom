@@ -24,13 +24,13 @@ jobs:
             port: 3000
             expect: 'ohif: /'
           - name: qido-open
-            compose: docker/docker-compose.web-mocks.yml
+            compose: docker/docker-compose.web.yml
             service: qido_open
             port: 8081
             # Match a stable substring (script prints: "warning [DWI-001]: unauthenticated QIDO-RS listing ...")
             expect: 'unauthenticated QIDO-RS listing'
           - name: qido-secured
-            compose: docker/docker-compose.web-mocks.yml
+            compose: docker/docker-compose.web.yml
             service: qido_secured
             port: 8082
             expect: 'qido: secured'

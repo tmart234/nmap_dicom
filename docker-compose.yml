@@ -83,17 +83,24 @@ services:
       start_period: 45s
 
   stunnel:
-    image: dicom-stunnel:latest
-    container_name: dicom_tls_proxy
+    image: stunnel/stunnel:latest   # change if you prefer another stunnel image
+    container_name: dicom_stunnel_test
     depends_on:
-      - orthanc
-    environment:
-      - UPSTREAM_HOST=orthanc
-      - UPSTREAM_PORT=4242
-      - LISTEN_PORT=2762
+      orthanc:
+        condition: service_healthy
     ports:
       - "2762:2762"
+    volumes:
+      - ./docker/stunnel/stunnel.conf:/etc/stunnel/stunnel.conf:ro
+      - ./docker/stunnel/certs:/etc/stunnel/certs:ro
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2762 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
 
 # Only define volumes needed by the services above
 volumes:

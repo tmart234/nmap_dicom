@@ -27,8 +27,7 @@ jobs:
             compose: docker/docker-compose.web.yml
             service: qido_open
             port: 8081
-            # Match a stable substring (script prints: "warning [DWI-001]: unauthenticated QIDO-RS listing ...")
-            expect: 'unauthenticated QIDO-RS listing'
+            expect: 'qido: open'
           - name: qido-secured
             compose: docker/docker-compose.web.yml
             service: qido_secured

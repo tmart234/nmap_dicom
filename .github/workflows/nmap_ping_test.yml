@@ -33,7 +33,13 @@ jobs:
               service_name: conquest
               compose_services: "conquest"
               nmap_args: "--script-args dicom-ping.ports=5678,dicom.called_aet=CONQUESTSRV1"
-  
+            - name: dicom-tls      # NEW: TLS listener on 2762 via stunnel -> Orthanc 4242
+              host_port: 2762
+              service_name: stunnel
+              compose_services: "orthanc stunnel"
+              nmap_args: "--script-args dicom-ping.ports=2762"
+              expect_vendor_version: "false"
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -76,6 +82,11 @@ jobs:
             # Adjust path to Dockerfile (-f) and context (.) if they are elsewhere
             docker build -t my-pynetdicom-scp:latest -f docker/pynetdicom/Dockerfile .
             echo "Image build complete."
+
+      - name: Build stunnel TLS proxy image
+        if: matrix.dicom_server.name == 'dicom-tls'
+        run: |
+          docker build -t dicom-stunnel:latest docker/stunnel
 
       - name: Start DICOM Server Stack (${{ matrix.dicom_server.name }})
         id: start_stack # Give the step an ID

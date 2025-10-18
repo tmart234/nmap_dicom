@@ -132,14 +132,15 @@ local VENDOR_UID_PATTERNS = {
 ---
 function start_connection(host, port)
   local dcm = {}
-  local status, err
   dcm['socket'] = nmap.new_socket()
 
-  status, err = dcm['socket']:connect(host, port, "tcp")
-
-  if(status == false) then
+  local ok, err = dcm['socket']:connect(host, port, "tcp")
+  if ok == false then
     return false, "DICOM: Failed to connect to host: " .. err
   end
+
+  local t = tonumber(stdnse.get_script_args("dicom.timeout_ms")) or 3000
+  dcm['socket']:set_timeout(t)  -- milliseconds
 
   return true, dcm
 end

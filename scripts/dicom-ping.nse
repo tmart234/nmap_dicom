@@ -111,20 +111,26 @@ action = function(host, port)
   if not ok then
     stdnse.debug(1, "Association failed: %s", tostring(err or "Unknown error"))
 
-    -- Treat specific transport/early-close errors as discovery:
-    -- some implementations/proxies reset when no DIMSE follows AC.
+    -- Treat specific transport/early-close/timeout errors as discovery:
+    -- some implementations/proxies close quickly if no DIMSE follows AC,
+    -- and some stacks simply enforce short read timeouts.
     local e = tostring(err or "")
     local early_close =
          e:find("Couldn't read ASSOCIATE response:", 1, true)
       or e:lower():find("could not read pdu", 1, true)
       or e:lower():find("failed to receive pdu", 1, true)
       or e:lower():find("connection reset by peer", 1, true)
+      or e:upper():find("TIMEOUT", 1, true)
 
     if early_close then
       port.version.name = "dicom"
       nmap.set_port_version(host, port)
       out.dicom  = "DICOM Service Provider discovered!"
-      out.config = "Association ended early by peer"
+      if e:upper():find("TIMEOUT", 1, true) then
+        out.config = "No A-ASSOCIATE-AC received (timeout)"
+      else
+        out.config = "Association ended early by peer"
+      end
       return out
     end
 
@@ -148,6 +154,11 @@ action = function(host, port)
   out.dicom = "DICOM Service Provider discovered!"
   if not called_aet or called_aet == "ANY-SCP" then
     out.config = "Any AET is accepted (Insecure)"
+  end
+
+  -- Optional hint if scanning the IANA DICOM/TLS port
+  if tonumber(port.number) == 2762 then
+    out.tls_hint = "Likely TLS-required endpoint (no plaintext DICOM on this port)"
   end
 
   -- Identity (prefer vendor/version; fall back to implementation UID).

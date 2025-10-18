@@ -82,6 +82,19 @@ services:
       retries: 5
       start_period: 45s
 
+  stunnel:
+    image: dicom-stunnel:latest
+    container_name: dicom_tls_proxy
+    depends_on:
+      - orthanc
+    environment:
+      - UPSTREAM_HOST=orthanc
+      - UPSTREAM_PORT=4242
+      - LISTEN_PORT=2762
+    ports:
+      - "2762:2762"
+    restart: unless-stopped
+
 # Only define volumes needed by the services above
 volumes:
   orthanc_db:

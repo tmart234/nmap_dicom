@@ -23,6 +23,16 @@ jobs:
             service: viewer
             port: 3000
             expect: 'ohif: /'
+          - name: qido-open
+            compose: docker/docker-compose.web-mocks.yml
+            service: qido_open
+            port: 8081
+            expect: 'warning: unauthenticated QIDO-RS listing'
+          - name: qido-secured
+            compose: docker/docker-compose.web-mocks.yml
+            service: qido_secured
+            port: 8082
+            expect: 'qido: secured'
 
     steps:
       - uses: actions/checkout@v4
@@ -95,11 +105,19 @@ jobs:
               done
               ;;
             qido-open)
-              # Mock QIDO-open: ensure the studies endpoint is answering
+              # Mock QIDO-open: ensure the studies endpoint is answering with a 200 (open)
+              for i in {1..200}; do
+                CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}/dicom-web/studies?limit=1" || true)"
+                [ "$CODE" = "200" ] && break
+                sleep 0.3
+              done
+              ;;
+            qido-secured)
+              # Mock QIDO-secured: ensure the studies endpoint challenges (401/403)
               for i in {1..200}; do
                 CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${{ matrix.target.port }}/dicom-web/studies?limit=1" || true)"
                 case "$CODE" in
-                  200|401|403) break ;;
+                  401|403) break ;;
                 esac
                 sleep 0.3
               done
@@ -113,7 +131,7 @@ jobs:
         run: |
           set -o pipefail
           OUT="nmap_http_${{ matrix.target.name }}.txt"
-          nmap -p ${{ matrix.target.port }} --script dicom-web-info 127.0.0.1 | tee "$OUT"
+          nmap -d -p ${{ matrix.target.port }} --script dicom-web-info 127.0.0.1 | tee "$OUT"
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
 
       - name: Assert ${{ matrix.target.name }} output

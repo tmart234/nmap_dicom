@@ -96,8 +96,8 @@ services:
       STUNNEL_CONNECT: "orthanc:4242"
       STUNNEL_DEBUG: "7"
     volumes:
-      - ./stunnel/certs/server.pem:/etc/stunnel/stunnel.pem:ro
-      - ./stunnel/certs/server.pem:/etc/stunnel/stunnel.key:ro 
+      - ./stunnel/certs/server.crt:/etc/stunnel/stunnel.pem:ro
+      - ./stunnel/certs/server.key:/etc/stunnel/stunnel.key:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 2762 || exit 1"]

@@ -84,15 +84,14 @@ services:
 
   stunnel:
     image: flitbit/alpine-stunnel:latest
-    container_name: stunnel
     depends_on:
       orthanc:
         condition: service_healthy
     ports:
       - "2762:2762"
     volumes:
-      - ./docker/stunnel/stunnel.conf:/etc/stunnel/stunnel.conf:ro
-      - ./docker/stunnel/certs/server.pem:/etc/stunnel/server.pem:ro
+      - ./stunnel/stunnel.conf:/etc/stunnel/stunnel.conf:ro
+      - ./stunnel/certs/server.pem:/etc/stunnel/server.pem:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 2762 || exit 1"]

@@ -74,32 +74,34 @@ jobs:
           set -eux
           docker build -t my-pynetdicom-scp:latest -f docker/pynetdicom/Dockerfile .
 
-      - name: Prepare stunnel config and certs (TLS row only)
+      - name: Prepare stunnel certs (TLS row only)
         if: matrix.dicom_server.name == 'dicom-tls'
         run: |
           set -eux
           mkdir -p docker/stunnel/certs
-          # Ensure config exists in repo (fail if missing)
-          test -f docker/stunnel/stunnel.conf
-          # Generate throwaway self-signed certs
           openssl req -x509 -newkey rsa:2048 -nodes \
             -keyout docker/stunnel/certs/server.key \
             -out    docker/stunnel/certs/server.crt \
             -subj "/CN=localhost" -days 1
-          cat docker/stunnel/certs/server.key docker/stunnel/certs/server.crt \
-            > docker/stunnel/certs/server.pem
+          cat docker/stunnel/certs/server.key docker/stunnel/certs/server.crt > docker/stunnel/certs/server.pem
 
       - name: Start DICOM Server Stack (${{ matrix.dicom_server.name }})
         id: start_stack
+        working-directory: docker
         run: |
           set -eux
+          echo "Validating compose file..."
+          docker-compose config >/dev/null
+
           echo "Starting: ${{ matrix.dicom_server.compose_services }}"
-          docker-compose -f docker/docker-compose.yml up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}
+          docker-compose up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}
+
           # Warm up
           sleep 30
-          STATUS=$(docker-compose -f docker/docker-compose.yml ps -q ${{ matrix.dicom_server.service_name }} | xargs -r docker inspect --format='{{.State.Status}}' || echo "notfound")
+          STATUS=$(docker-compose ps -q ${{ matrix.dicom_server.service_name }} | xargs -r docker inspect --format='{{.State.Status}}' || echo "notfound")
           echo "Service status: $STATUS"
           test "$STATUS" = "running"
+
           # Host port listening?
           for i in {1..10}; do
             if nc -z localhost ${{ matrix.dicom_server.host_port }}; then
@@ -110,7 +112,7 @@ jobs:
             sleep 3
           done
           echo "::error:: Port ${{ matrix.dicom_server.host_port }} never opened."
-          docker-compose -f docker/docker-compose.yml logs --no-color || true
+          docker-compose logs --no-color || true
           echo "startup_success=false" >> $GITHUB_OUTPUT
           exit 1
 
@@ -164,8 +166,9 @@ jobs:
 
       - name: Show Server Logs (${{ matrix.dicom_server.name }})
         if: always()
+        working-directory: docker
         run: |
-          docker-compose -f docker/docker-compose.yml logs --tail="80" ${{ matrix.dicom_server.service_name }} || true
+          docker-compose logs --tail="80" ${{ matrix.dicom_server.service_name }} || true
 
       - name: Stop tcpdump capture (${{ matrix.dicom_server.name }})
         if: always()
@@ -197,5 +200,6 @@ jobs:
 
       - name: Stop DICOM Server Stack (${{ matrix.dicom_server.name }})
         if: always()
+        working-directory: docker
         run: |
-          docker-compose -f docker/docker-compose.yml down --volumes --remove-orphans
+          docker-compose down --volumes --remove-orphans

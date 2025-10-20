@@ -166,30 +166,48 @@ function send(dcm, data)
   return true
 end
 
+
 ---
--- receive(dcm) Reads DICOM packets over an established socket
+-- receive(dcm) Reads DICOM PDUs over an established socket.
+-- Normalizes any socket timeout into the literal string "TIMEOUT"
+-- so callers (e.g., the NSE script) can classify it as a discovery.
 --
 -- @param dcm DICOM object
--- @return (status, data) Returns data if status true, otherwise data is the error message.
+-- @return (status, data_or_err) True + full PDU bytes, or False + error ("TIMEOUT" on timeout)
 ---
 function receive(dcm)
   local sock = dcm['socket']
   if not sock then return false, "No socket" end
 
-  -- Read at least 6 bytes (header). Nsock may return more.
+  local function is_timeout(err)
+    local e = tostring(err or ""):lower()
+    -- nsock errors vary a bit; catch the common phrasings
+    return e:find("timed out", 1, true)
+        or e:find("timeout",   1, true)
+        or e:find("time out",  1, true)
+  end
+
+  -- Read at least 6 bytes (PDU header)
   local ok1, chunk = sock:receive_bytes(6)
-  if ok1 == false then return false, chunk end
+  if ok1 == false then
+    if is_timeout(chunk) then return false, "TIMEOUT" end
+    return false, chunk
+  end
   if #chunk < 6 then return false, "Short PDU header" end
 
   local header = chunk:sub(1, 6)
   local pdu_type, _, pdu_length = string.unpack(">B B I4", header)
 
-  -- Anything past the first 6 bytes is already part of the body
+  -- Anything beyond the first 6 is already part of the body
   local body = chunk:sub(7)
   local need = pdu_length - #body
+
   while need > 0 do
     local ok2, more = sock:receive_bytes(need)
-    if ok2 == false then return false, more end
+    if ok2 == false then
+      if is_timeout(more) then return false, "TIMEOUT" end
+      return false, more
+    end
     body = body .. more
     need = pdu_length - #body
   end
@@ -197,7 +215,6 @@ function receive(dcm)
   stdnse.debug1("DICOM: receive() read %d bytes", 6 + #body)
   return true, header .. body
 end
-
 
 ---
 -- pdu_header_encode(pdu_type, length) encodes the DICOM PDU header

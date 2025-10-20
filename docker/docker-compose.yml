@@ -83,15 +83,17 @@ services:
       start_period: 45s
 
   stunnel:
-    image: flitbit/alpine-stunnel:latest
+    image: dweomer/stunnel:latest
+    container_name: stunnel
     depends_on:
       orthanc:
         condition: service_healthy
+    command: ["stunnel", "/etc/stunnel/stunnel.conf"]  
     ports:
       - "2762:2762"
     volumes:
       - ./stunnel/stunnel.conf:/etc/stunnel/stunnel.conf:ro
-      - ./stunnel/certs/server.pem:/etc/stunnel/server.pem:ro
+      - ./stunnel/certs/server.pem:/etc/stunnel/certs/server.pem:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 2762 || exit 1"]

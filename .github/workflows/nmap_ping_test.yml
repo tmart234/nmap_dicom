@@ -84,6 +84,8 @@ jobs:
             -out    docker/stunnel/certs/server.crt \
             -subj "/CN=localhost" -days 1
           cat docker/stunnel/certs/server.key docker/stunnel/certs/server.crt > docker/stunnel/certs/server.pem
+          chmod 600 docker/stunnel/certs/server.key docker/stunnel/certs/server.pem
+          sudo chown 65532:65532 docker/stunnel/certs/server.key docker/stunnel/certs/server.pem
 
       - name: Start DICOM Server Stack (${{ matrix.dicom_server.name }})
         id: start_stack

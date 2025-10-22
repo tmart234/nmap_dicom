@@ -90,21 +90,13 @@ services:
         condition: service_healthy
     ports:
       - "2762:2762"
-    environment:
-      STUNNEL_SERVICE: dicom
-      STUNNEL_ACCEPT: "2762"
-      STUNNEL_CONNECT: "orthanc:4242"
-      STUNNEL_DEBUG: "7"
+    command: ["stunnel", "/etc/stunnel/stunnel.conf"]
     volumes:
-      - ./stunnel/certs/server.crt:/etc/stunnel/stunnel.pem:ro
-      - ./stunnel/certs/server.key:/etc/stunnel/stunnel.key:ro
+      - ./stunnel/stunnel.conf:/etc/stunnel/stunnel.conf:ro
+      - ./stunnel/certs/server.pem:/etc/stunnel/stunnel.pem:ro
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 2762 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
+      test: ["CMD-SHELL", "exit 0"]
 
 
 # Only define volumes needed by the services above

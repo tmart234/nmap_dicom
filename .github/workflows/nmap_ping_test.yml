@@ -114,7 +114,12 @@ jobs:
             sleep 3
           done
           echo "::error:: Port ${{ matrix.dicom_server.host_port }} never opened."
-          docker-compose logs --no-color || true
+          docker-compose ps
+          docker-compose logs --no-color ${{ matrix.dicom_server.service_name }} || true
+          # For TLS row, show health:
+          if [ "${{ matrix.dicom_server.name }}" = "dicom-tls" ]; then
+            docker inspect stunnel --format='{{json .State.Health}}' || true
+          fi
           echo "startup_success=false" >> $GITHUB_OUTPUT
           exit 1
 

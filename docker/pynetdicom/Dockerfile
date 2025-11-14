@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir pynetdicom
 
-COPY pynetdicom_echo_scp.py .
+COPY /docker/pynetdicom/pynetdicom_echo_scp.py .
 
 EXPOSE 11114
 

@@ -36,8 +36,8 @@ way of detecting DICOM servers.
 --                              the script runs on common DICOM ports or when
 --                              the service is already identified as "dicom".
 -- @args dicom-ping.extended    If set, prints additional identification fields
---                              (vendor, version, and when useful the implementation
---                              class UID) from the A-ASSOCIATE-AC.
+--                              (implementation class UID and implementation
+--                              version name) from the A-ASSOCIATE-AC.
 -- @args dicom-ping.oids        If set together with dicom-ping.extended and a
 --                              known vendor/version, also prints impl_class_uid
 --                              even when vendor/version are already present.
@@ -71,6 +71,7 @@ local dicom     = require "dicom"
 local stdnse    = require "stdnse"
 local nmap      = require "nmap"
 local string    = require "string"
+local tonumber  = tonumber
 
 -- Parse a comma/space separated port list into a lookup set.
 local function parse_ports_arg(ports_str)
@@ -125,8 +126,9 @@ action = function(host, port)
   local show_oids   = stdnse.get_script_args("dicom-ping.oids")     ~= nil
 
   -- dicom.associate(host, port, calling_aet, called_aet)
-  -- returns: status, err, version, vendor, uid
-  local ok, err, version, vendor, uid = dicom.associate(host, port, nil, called_aet)
+  -- returns: status, err, version, vendor, uid, impl_version_name (last may be nil)
+  local ok, err, version, vendor, uid, impl_version_name =
+    dicom.associate(host, port, nil, called_aet)
 
   if not ok then
     stdnse.debug1("Association failed: %s", tostring(err or "Unknown error"))
@@ -153,8 +155,11 @@ action = function(host, port)
 
   -- Success path: association accepted.
   out.dicom = "DICOM Service Provider discovered!"
+
   if not called_aet or called_aet == "ANY-SCP" then
     out.config = "Any AET is accepted (Insecure)"
+  else
+    out.config = string.format("Called AET enforced (used: %s)", called_aet)
   end
 
   -- Optional hint if scanning the IANA DICOM/TLS port.
@@ -162,35 +167,31 @@ action = function(host, port)
     out.tls_hint = "Likely TLS-required endpoint (no plaintext DICOM on this port)"
   end
 
-  -- Feed version info into Nmap's service fingerprint regardless of script output.
+  ----------------------------------------------------------------
+  -- Always feed version info to both Nmap and script output.
+  ----------------------------------------------------------------
   if vendor then
+    out.vendor = vendor
     port.version.product = vendor
   end
   if version then
+    out.version = version
     port.version.version = version
   end
   port.version.name = "dicom"
   nmap.set_port_version(host, port)
 
-  -- Extended output: prefer human-facing vendor/version.
+  ----------------------------------------------------------------
+  -- Extended output: UIDs + Implementation Version Name
+  ----------------------------------------------------------------
   if extended then
-    if vendor then
-      out.vendor = vendor
-    end
-    if version then
-      out.version = version
-    end
-
-    -- UID handling:
-    -- A) If vendor/version are known: only show impl_class_uid when user explicitly
-    --    asks for OIDs via dicom-ping.oids.
-    -- B) If vendor/version are not known but UID is present: always show impl_class_uid
-    --    and a short note explaining how to use it.
     if uid then
-      local root = dicom.extract_uid_root and dicom.extract_uid_root(uid)
       local label = uid
-      if root and root ~= uid then
-        label = string.format("%s (root: %s)", uid, root)
+      if dicom.extract_uid_root then
+        local root = dicom.extract_uid_root(uid)
+        if root and root ~= uid then
+          label = string.format("%s (root: %s)", uid, root)
+        end
       end
 
       if vendor or version then
@@ -203,6 +204,11 @@ action = function(host, port)
         out.impl_class_uid = label
         out.note = "Look up impl_class_uid in a DICOM OID registry for implementation details"
       end
+    end
+
+    if impl_version_name then
+      -- Raw Implementation Version Name from User Info (0x55), e.g. PYNETDICOM_304, OFFIS_DCMTK_369.
+      out.impl_version_name = impl_version_name
     end
   end
 

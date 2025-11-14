@@ -589,9 +589,9 @@ function associate(host, port, calling_aet, called_aet)
   -- =============================================================
 
   -- Variables to hold results from pcall
-  local success, pcall_ret1, pcall_ret2, pcall_ret3
+  local success, pcall_ret1, pcall_ret2, pcall_ret3, pcall_ret4
 
-  success, pcall_ret1, pcall_ret2, pcall_ret3 = pcall(function()
+  success, pcall_ret1, pcall_ret2, pcall_ret3, pcall_ret4 = pcall(function()
     -- Build A-ASSOCIATE-RQ items properly (no magic lengths)
     local application_context_name = "1.2.840.10008.3.1.1.1"   -- Application Context Name
     local abstract_syntax_name     = "1.2.840.10008.1.1"       -- Verification SOP Class
@@ -654,11 +654,14 @@ function associate(host, port, calling_aet, called_aet)
 
     stdnse.debug1("ASSOCIATE ACCEPT message found! Parsing User Information.")
     local received_version_str, received_uid_str = parse_implementation_version(response_data)
+    local impl_version_name = received_version_str  -- raw DICOM Implementation Version Name
 
     local parsed_vendor, parsed_clean_version = nil, nil
+
     if received_uid_str then
       local vendor_result = identify_vendor_from_uid(received_uid_str)
       if vendor_result then parsed_vendor = vendor_result end
+
       if received_version_str then
         parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
         stdnse.debug1("Using received_version_str ('%s') for cleaning. Result: %s",
@@ -683,8 +686,11 @@ function associate(host, port, calling_aet, called_aet)
                   received_uid_str or "nil",
                   parsed_vendor or "nil")
 
-    -- Return: clean_version, vendor, uid_str (outer keeps signature)
-    return parsed_clean_version, parsed_vendor, received_uid_str
+    -- final_version is either cleaned, or falls back to the raw Implementation Version Name
+    local final_version = parsed_clean_version or impl_version_name
+
+    -- Return: final_version, vendor, uid_str, impl_version_name (raw)
+    return final_version, parsed_vendor, received_uid_str, impl_version_name
   end) -- pcall
 
   -- Always close socket
@@ -698,14 +704,18 @@ function associate(host, port, calling_aet, called_aet)
     stdnse.debug1("Error during association (pcall failed): %s", err_msg)
     return false, err_msg
   else
-    local clean_version = pcall_ret1
-    local vendor        = pcall_ret2
-    local uid_str       = pcall_ret3
+    local final_version     = pcall_ret1
+    local final_vendor      = pcall_ret2
+    local final_uid         = pcall_ret3
+    local impl_version_name = pcall_ret4
+
     stdnse.debug1("Association successful. Final Version: %s, Vendor: %s",
-                  clean_version or "nil", vendor or "nil")
-    return true, nil, clean_version, vendor, uid_str
+                  final_version or "nil", final_vendor or "nil")
+
+    return true, nil, final_version, final_vendor, final_uid, impl_version_name
   end
 end
+
 
 
 function send_pdata(dicom, data)

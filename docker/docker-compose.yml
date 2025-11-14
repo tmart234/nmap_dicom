@@ -83,21 +83,19 @@ services:
       start_period: 45s
 
   stunnel:
-    image: chainguard/stunnel:latest    # or cgr.dev/chainguard/stunnel:latest
+    image: chainguard/stunnel:latest
     container_name: stunnel
     depends_on:
       orthanc:
         condition: service_healthy
     ports:
       - "2762:2762"
-    command: ["stunnel", "/etc/stunnel/stunnel.conf"]
+    command: ["/etc/stunnel/stunnel.conf"]
     user: "65532:65532"
     volumes:
       - ./stunnel/stunnel.conf:/etc/stunnel/stunnel.conf:ro
       - ./stunnel/certs/server.pem:/etc/stunnel/stunnel.pem:ro
     restart: unless-stopped
-    healthcheck:
-      disable: true
 
 
 # Only define volumes needed by the services above

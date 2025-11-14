@@ -550,9 +550,13 @@ end
 -- @param port Port object
 -- @param calling_aet Optional Calling Application Entity Title override
 -- @param called_aet Optional Called Application Entity Title override
--- @return (status, dcm_or_error, version, vendor) If status is true, version and vendor info is returned.
---                                                If status is false, dcm_or_error is the error message.
+-- @return (status, dcm_or_error, version, vendor, uid, impl_version_name)
+--         If status is true, a cleaned version string (when derivable), a
+--         vendor name (when recognizable), the Implementation Class UID
+--         and the raw Implementation Version Name (if present) are returned.
+--         If status is false, dcm_or_error is the error message string.
 ---
+
 function associate(host, port, calling_aet, called_aet)
   local status, dcm = start_connection(host, port)
   if status == false then

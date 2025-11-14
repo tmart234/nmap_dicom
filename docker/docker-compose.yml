@@ -23,12 +23,6 @@ services:
     volumes:
       - orthanc_db:/var/lib/orthanc/db
     restart: unless-stopped
-    healthcheck: # Optional: Check if web UI is up
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8042/app/explorer.html"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
 
   # --- pynetdicom Echo SCP ---
   # Runs a minimal Python SCP using pynetdicom, handles C-ECHO.
@@ -86,8 +80,7 @@ services:
     image: chainguard/stunnel:latest
     container_name: stunnel
     depends_on:
-      orthanc:
-        condition: service_healthy
+      - orthanc
     ports:
       - "2762:2762"
     user: "65532:65532"
@@ -96,7 +89,11 @@ services:
       - ./stunnel/certs/server.pem:/etc/stunnel/stunnel.pem:ro
     restart: unless-stopped
     healthcheck:
-      test: ["NONE"]
+      test: ["CMD", "true"]
+      interval: 30s
+      timeout: 5s
+      retries: 1
+      start_period: 5s
 
 
 # Only define volumes needed by the services above

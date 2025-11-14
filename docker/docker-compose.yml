@@ -84,6 +84,7 @@ services:
     ports:
       - "2762:2762"
     user: "65532:65532"
+    command: ["/etc/stunnel/stunnel.conf"]
     volumes:
       - ./stunnel/stunnel.conf:/etc/stunnel/stunnel.conf:ro
       - ./stunnel/certs/server.pem:/etc/stunnel/stunnel.pem:ro

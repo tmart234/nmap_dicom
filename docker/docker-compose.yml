@@ -96,11 +96,7 @@ services:
       - ./stunnel/certs/server.pem:/etc/stunnel/stunnel.pem:ro
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "true"]
-      interval: 30s
-      timeout: 5s
-      retries: 1
-      start_period: 5s
+      test: ["NONE"]
 
 
 # Only define volumes needed by the services above

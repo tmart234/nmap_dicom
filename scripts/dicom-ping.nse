@@ -5,7 +5,9 @@ It also detects if the server allows any called Application Entity Title or not.
 The script responds with the message "Called AET check enabled" when the association request
 is rejected due configuration. This value can be bruteforced using dicom-brute.
 
-The UID tells you who made it (Vendor), the dedicated Version Name field tells you which version it is.
+The Implementation Class UID identifies the implementation (often enough to infer
+the toolkit or vendor), and the Implementation Version Name can often be used to
+extract a meaningful version string.
 
 C-ECHO requests are commonly known as DICOM ping as they are used to test connectivity.
 Normally, a 'DICOM ping' is formed as follows:
@@ -17,13 +19,28 @@ Normally, a 'DICOM ping' is formed as follows:
 * Server -> A-RELEASE response -> Client
 
 For this script we only send the A-ASSOCIATE request and look for the success code
-in the response as it seems to be a reliable way of detecting DICOM servers.
+(or an explicit A-ASSOCIATE-REJECT) in the response as it seems to be a reliable
+way of detecting DICOM servers.
 ]]
 
 ---
 -- @usage nmap -p4242 --script dicom-ping <target>
 -- @usage nmap -sV --script dicom-ping <target>
 -- @usage nmap --script dicom-ping --script-args dicom-ping.ports=11114,11115 <target>
+-- @usage nmap --script dicom-ping --script-args dicom-ping.extended <target>
+-- @usage nmap --script dicom-ping --script-args dicom-ping.extended,dicom-ping.oids <target>
+--
+-- @args dicom.called_aet       Called Application Entity Title. Default: ANY-SCP
+-- @args dicom-ping.ports       Optional comma-separated list of ports to probe
+--                              (e.g. "104,11112,2761,2762,4242"). By default,
+--                              the script runs on common DICOM ports or when
+--                              the service is already identified as "dicom".
+-- @args dicom-ping.extended    If set, prints additional identification fields
+--                              (vendor, version, and when useful the implementation
+--                              class UID) from the A-ASSOCIATE-AC.
+-- @args dicom-ping.oids        If set together with dicom-ping.extended and a
+--                              known vendor/version, also prints impl_class_uid
+--                              even when vendor/version are already present.
 --
 -- @output
 -- PORT     STATE SERVICE REASON
@@ -47,7 +64,7 @@ in the response as it seems to be a reliable way of detecting DICOM servers.
 
 author = "Paulino Calderon <calderon()calderonpale.com>, Tyler M <tmart234()gmail.com>"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
-categories = {"discovery", "default", "safe"}
+categories = {"discovery", "default", "safe", "auth"}
 
 local shortport = require "shortport"
 local dicom     = require "dicom"
@@ -85,14 +102,14 @@ portrule = function(host, port)
   if arg_str then
     local want = parse_ports_arg(arg_str)
     if want and want[port.number] then
-      stdnse.debug(1, "dicom-ping: matched script-arg port %d", port.number)
+      stdnse.debug1("dicom-ping: matched script-arg port %d", port.number)
       return true
     end
   end
 
   -- Otherwise, run for common DICOM ports or if service is already identified as "dicom"
   if shortport.port_or_service(COMMON_DICOM_PORTS, "dicom", "tcp")(host, port) then
-    stdnse.debug(1, "dicom-ping: matched common DICOM port/service (%d)", port.number)
+    stdnse.debug1("dicom-ping: matched common DICOM port/service (%d)", port.number)
     return true
   end
 
@@ -100,53 +117,37 @@ portrule = function(host, port)
 end
 
 action = function(host, port)
-  stdnse.debug(1, "dicom-ping: ACTION for %s:%d", host.ip, port.number)
+  stdnse.debug1("dicom-ping: ACTION for %s:%d", host.ip, port.number)
   local out = stdnse.output_table()
 
   local called_aet  = stdnse.get_script_args("dicom.called_aet")
+  local extended    = stdnse.get_script_args("dicom-ping.extended") ~= nil
+  local show_oids   = stdnse.get_script_args("dicom-ping.oids")     ~= nil
+
   -- dicom.associate(host, port, calling_aet, called_aet)
   -- returns: status, err, version, vendor, uid
   local ok, err, version, vendor, uid = dicom.associate(host, port, nil, called_aet)
 
   if not ok then
-    stdnse.debug(1, "Association failed: %s", tostring(err or "Unknown error"))
+    stdnse.debug1("Association failed: %s", tostring(err or "Unknown error"))
 
-    -- Treat specific transport/early-close/timeout errors as discovery:
-    -- some implementations/proxies close quickly if no DIMSE follows AC,
-    -- and some stacks simply enforce short read timeouts.
     local e = tostring(err or "")
-    local early_close =
-         e:find("Couldn't read ASSOCIATE response:", 1, true)
-      or e:lower():find("could not read pdu", 1, true)
-      or e:lower():find("failed to receive pdu", 1, true)
-      or e:lower():find("connection reset by peer", 1, true)
-      or e:upper():find("TIMEOUT", 1, true)
 
-    if early_close then
-      port.version.name = "dicom"
-      nmap.set_port_version(host, port)
-      out.dicom  = "DICOM Service Provider discovered!"
-      if e:upper():find("TIMEOUT", 1, true) then
-        out.config = "No A-ASSOCIATE-AC received (timeout)"
-      else
-        out.config = "Association ended early by peer"
-      end
-      return out
-    end
-
+    -- Only treat a clearly signalled ASSOCIATE-REJECT as positive DICOM detection.
     if e == "ASSOCIATE REJECT received" then
       port.version.name = "dicom"
       nmap.set_port_version(host, port)
+
       out.dicom  = "DICOM Service Provider discovered!"
       if not called_aet or called_aet == "ANY-SCP" then
-        out.config = "Called AET check enabled (Rejected ANY-SCP)"
+        out.config = "Called AET check enabled"
       else
         out.config = string.format("Association Rejected (Tried AET: %s)", called_aet)
       end
       return out
     end
 
-    -- Unknown failure: stay silent to avoid false positives.
+    -- Unknown failure or timeout: stay silent to avoid false positives.
     return nil
   end
 
@@ -156,35 +157,54 @@ action = function(host, port)
     out.config = "Any AET is accepted (Insecure)"
   end
 
-  -- Optional hint if scanning the IANA DICOM/TLS port
+  -- Optional hint if scanning the IANA DICOM/TLS port.
   if tonumber(port.number) == 2762 then
     out.tls_hint = "Likely TLS-required endpoint (no plaintext DICOM on this port)"
   end
 
-  -- Identity (prefer vendor/version; fall back to implementation UID).
+  -- Feed version info into Nmap's service fingerprint regardless of script output.
   if vendor then
-    out.vendor = vendor
+    port.version.product = vendor
   end
   if version then
-    local clean = (dicom.extract_clean_version and dicom.extract_clean_version(version, vendor)) or version
-    out.version = clean or version
+    port.version.version = version
   end
-  if uid then
-    -- Help users even when vendor/version are missing
-    if not out.vendor then
-      local root = (dicom.extract_uid_root and dicom.extract_uid_root(uid)) or uid
-      out.uid_root = root
-    end
-    if not out.version then
-      out.impl_uid = uid
-    end
-  end
-
-  -- Populate Nmap’s service fingerprint fields.
   port.version.name = "dicom"
-  if out.vendor  then port.version.product = out.vendor end
-  if out.version then port.version.version = out.version end
   nmap.set_port_version(host, port)
+
+  -- Extended output: prefer human-facing vendor/version.
+  if extended then
+    if vendor then
+      out.vendor = vendor
+    end
+    if version then
+      out.version = version
+    end
+
+    -- UID handling:
+    -- A) If vendor/version are known: only show impl_class_uid when user explicitly
+    --    asks for OIDs via dicom-ping.oids.
+    -- B) If vendor/version are not known but UID is present: always show impl_class_uid
+    --    and a short note explaining how to use it.
+    if uid then
+      local root = dicom.extract_uid_root and dicom.extract_uid_root(uid)
+      local label = uid
+      if root and root ~= uid then
+        label = string.format("%s (root: %s)", uid, root)
+      end
+
+      if vendor or version then
+        -- We already have human-ish identity; only show UID if explicitly requested.
+        if show_oids then
+          out.impl_class_uid = label
+        end
+      else
+        -- No vendor/version, but we do have a UID: this is where it's genuinely useful.
+        out.impl_class_uid = label
+        out.note = "Look up impl_class_uid in a DICOM OID registry for implementation details"
+      end
+    end
+  end
 
   return out
 end

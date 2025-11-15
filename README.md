@@ -16,7 +16,7 @@ In the A-ASSOCIATE-AC PDU, the reliable “who/what” identifiers are:
 - dcm4che-tools (SCP),  
 - pynetdicom (SCP), 
 - conquest,
-- rsdicom
+- Orthanc with DICOM TLS (stunnel)
 ## DICOM Web script
 Detect DICOM-related HTTP endpoints
 ### Testing

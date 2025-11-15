@@ -21,6 +21,10 @@ Normally, a 'DICOM ping' is formed as follows:
 For this script we only send the A-ASSOCIATE request and look for the success code
 (or an explicit A-ASSOCIATE-REJECT) in the response as it seems to be a reliable
 way of detecting DICOM servers.
+
+On the IANA DICOM/TLS port (2762), if a plaintext A-ASSOCIATE fails with a characteristic
+"Short PDU header" error, this script reports a *possible* DICOM/TLS endpoint while
+intentionally omitting vendor/version information.
 ]]
 
 ---
@@ -50,6 +54,12 @@ way of detecting DICOM servers.
 -- |   config: Any AET is accepted (Insecure)
 -- |   vendor: Orthanc
 -- |_  version: 1.11.0
+--
+-- Example TLS endpoint (heuristic):
+-- 2762/tcp open  dicom-tls syn-ack
+-- | dicom-ping:
+-- |   dicom: Possible DICOM/TLS endpoint (plaintext A-ASSOCIATE not accepted)
+-- |_  tls_hint: Port 2762 is open, but DICOM associate could not be completed. This port often expects a TLS client handshake.
 --
 -- @xmloutput
 -- <script id="dicom-ping" output="&#xa;  dicom: DICOM Service Provider discovered!&#xa;
@@ -149,6 +159,15 @@ action = function(host, port)
       return out
     end
 
+    -- Heuristic for the IANA DICOM/TLS port (2762):
+    if tonumber(port.number) == 2762 and e:lower():match("short pdu header") then
+      out.dicom    = "Possible DICOM/TLS endpoint (plaintext A-ASSOCIATE not accepted)"
+      out.tls_hint = "Port 2762 is open, but DICOM associate could not be completed. This port often expects a TLS client handshake."
+      out.error    = e
+      -- Intentionally do NOT set port.version.product/version in this heuristic path.
+      return out
+    end
+
     -- Unknown failure or timeout: stay silent to avoid false positives.
     return nil
   end
@@ -167,9 +186,6 @@ action = function(host, port)
     out.tls_hint = "Likely TLS-required endpoint (no plaintext DICOM on this port)"
   end
 
-  ----------------------------------------------------------------
-  -- Always feed version info to both Nmap and script output.
-  ----------------------------------------------------------------
   if vendor then
     out.vendor = vendor
     port.version.product = vendor
@@ -181,9 +197,6 @@ action = function(host, port)
   port.version.name = "dicom"
   nmap.set_port_version(host, port)
 
-  ----------------------------------------------------------------
-  -- Extended output: UIDs + Implementation Version Name
-  ----------------------------------------------------------------
   if extended then
     if uid then
       local label = uid

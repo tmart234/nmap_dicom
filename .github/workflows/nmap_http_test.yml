@@ -140,8 +140,6 @@ jobs:
 
       - name: Scan ${{ matrix.target.name }}
         id: scan
-        env:
-          NMAPDIR: /usr/share/nmap
         run: |
           set -o pipefail
           OUT="nmap_http_${{ matrix.target.name }}.txt"

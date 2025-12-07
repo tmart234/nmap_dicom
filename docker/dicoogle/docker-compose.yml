@@ -1,6 +1,7 @@
 version: '3.3'
 services:
   dicoogle:
-    build: .
+    build: .                # Build from the Dockerfile in current dir
+    container_name: dicoogle
     ports:
       - "8080:8080"

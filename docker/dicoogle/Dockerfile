@@ -10,8 +10,10 @@ RUN wget -q https://github.com/dicoogle/dicoogle/releases/download/3.3.3/Dicoogl
     && unzip Dicoogle_v3.3.3.zip \
     && rm Dicoogle_v3.3.3.zip
 
-RUN mkdir -p Storage
+RUN mkdir -p Dicoogle_v3.3.3/Storage
 
 EXPOSE 8080 6666
+
+WORKDIR /opt/dicoogle/Dicoogle_v3.3.3
 
 CMD ["java", "-jar", "dicoogle.jar", "-s"]

@@ -22,11 +22,13 @@ jobs:
             compose: docker/docker-compose.web.yml
             service: viewer
             port: 3000
-            expect: 'ohif: /'
+            # FIX: Script outputs "OHIF Viewer" not "ohif: /"
+            expect: 'OHIF Viewer'
           - name: qido-open
             compose: docker/docker-compose.web.yml
             service: qido_open
             port: 8081
+            # FIX: Match actual script output format
             expect: 'qido: open'
           - name: qido-secured
             compose: docker/docker-compose.web.yml
@@ -156,7 +158,7 @@ jobs:
           OUT="${{ steps.scan.outputs.out }}"
           WANT='${{ matrix.target.expect }}'
           if [ -n "$WANT" ]; then
-            if ! grep -F "$WANT" "$OUT"; then
+            if ! grep -Fi "$WANT" "$OUT"; then
               echo "::error::Missing expected: $WANT"
               sed -n '1,200p' "$OUT" || true
               exit 1

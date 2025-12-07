@@ -111,7 +111,10 @@ local function _generic(host, port, method, path, hdr)
   local opts = { header = hdr or {}, timeout = 7000 }
   if port.tunnel == "ssl" then opts.ssl = true end -- explicit TLS
   local ok, resp = pcall(http.generic_request, host, port, method, path, opts)
-  if not ok then return nil end
+  if not ok then 
+    stdnse.debug1("Request failed: %s %s", method, path)
+    return nil 
+  end
   return resp
 end
 
@@ -198,10 +201,20 @@ end
 -- -------------------- portrule --------------------
 
 portrule = function(host, port)
-  if not (port.protocol == "tcp" and port.state == "open") then return false end
   local set = parse_ports_arg(stdnse.get_script_args("dicom-web.ports"))
-  if set then return set[port.number] == true end
-  return shortport.port_or_service({80, 443, 8042, 3000, 8080, 8443}, {"http","https"}, "tcp")(host, port)
+  if set and set[port.number] then return true end
+
+  if shortport.port_or_service({80, 443, 8042, 3000, 8080, 8443}, {"http","https","http-alt"}, "tcp")(host, port) then
+    return true
+  end
+  
+  -- Fallback: explicit ports even if service detection failed or claimed weird service
+  -- This fixes the "fs-agent" or "nagios-nsca" issue in CI
+  if port.number == 8042 or port.number == 8080 or port.number == 3000 then
+     return true
+  end
+  
+  return false
 end
 
 -- -------------------- action --------------------
@@ -273,6 +286,12 @@ action = function(host, port)
     local hdr_json = { ["Accept"] = "application/json" }
     local r_no = http_get_cached(host, port, "/system", hdr_json)
     if r_no and r_no.status then
+      stdnse.debug1("Orthanc check /system: %s. Body len: %d", r_no.status, #r_no.body)
+      -- DEBUG: Show body if we failed to match
+      if r_no.status == 200 and not (body_has(r_no.body, '"name"') and body_has(r_no.body, "orthanc")) then
+         stdnse.debug1("Orthanc 200 OK but mismatch. Body start: %s", r_no.body:sub(1,200))
+      end
+
       if r_no.status == 200 and r_no.body and (body_has(r_no.body, '"name"') and body_has(r_no.body, "orthanc")) then
         orthanc_seen = true
         orthanc_auth = "no-auth"
@@ -323,6 +342,7 @@ action = function(host, port)
   do
     local r_root = http_get_cached(host, port, "/")
     if r_root and r_root.status then 
+       stdnse.debug1("Root check /: %s. Server: %s", r_root.status, hget(r_root.header, "Server") or "nil")
        local srv = lc(hget(r_root.header, "Server") or "")
        local bdy = lc(r_root.body or "")
        local ttl = bdy:match("<title>([^<]+)</title>") or ""
@@ -374,7 +394,10 @@ action = function(host, port)
     for _, p in ipairs(candidate_paths) do
       local r = http_get_cached(host, port, p)
       if r and r.status == 200 and r.body then
-        if body_has(r.body, "data-cy-root") or body_has(r.body, "ohif") or body_has(r.body, "app-config.js") then
+        stdnse.debug1("OHIF check %s: 200. Body len %d", p, #r.body)
+        -- IMPROVED: Check for title tag as well
+        local b = lc(r.body)
+        if body_has(r.body, "data-cy-root") or body_has(r.body, "ohif") or body_has(r.body, "app-config.js") or b:find("<title>ohif", 1, true) then
           ohif = true
           mount = p
           if not hget(r.header, "Content-Security-Policy") then
@@ -423,6 +446,7 @@ action = function(host, port)
     if not (r and r.status == 200 and r.body) then return false end
     local ct = lc(hget(r.header, "Content-Type") or "")
     if ct:find("application/dicom%+json", 1, false) then return true end
+    -- Check for keys if header is missing/wrong
     return body_has(r.body, '"StudyInstanceUID"')
         or body_has(r.body, '"SeriesInstanceUID"')
         or body_has(r.body, '"SOPInstanceUID"')
@@ -480,6 +504,10 @@ action = function(host, port)
             qido_status = "rate-limited"
           elseif rq.status == 503 then
             qido_status = "unavailable"
+          else
+            -- DEBUG: Why did QIDO check fail?
+            stdnse.debug1("QIDO %s check failed. Status: %s. CT: %s. Body start: %s", 
+               b.base, rq.status, hget(rq.header,"Content-Type") or "nil", rq.body:sub(1,100))
           end
         end
       end

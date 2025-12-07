@@ -1,0 +1,7 @@
+version: '3.3'
+services:
+  dicoogle:
+    image: dicoogle/dicoogle:latest
+    ports:
+      - "8080:8080"
+    # Dicoogle starts fast, pure Java

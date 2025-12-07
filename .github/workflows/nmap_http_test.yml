@@ -33,6 +33,11 @@ jobs:
             service: qido_secured
             port: 8082
             expect: 'qido: secured'
+          - name: dicoogle-web
+            compose: docker/dicoogle/docker-compose.yml
+            service: dicoogle
+            port: 8080
+            expect: 'ui: dicoogle'
 
     steps:
       - uses: actions/checkout@v4
@@ -94,6 +99,15 @@ jobs:
                 sleep 0.3
               done
               ;;
+            dicoogle-web)
+               # Wait for Dicoogle to actually render HTML (it takes a moment after port open)
+               for i in {1..200}; do
+                 if curl -s "http://127.0.0.1:${{ matrix.target.port }}/" | grep -iq "dicoogle"; then
+                   break
+                 fi
+                 sleep 1
+               done
+               ;;
             ohif-viewer)
               # OHIF: look for a 200 on common mounts
               for i in {1..200}; do

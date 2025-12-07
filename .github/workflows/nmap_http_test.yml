@@ -145,7 +145,7 @@ jobs:
         run: |
           set -o pipefail
           OUT="nmap_http_${{ matrix.target.name }}.txt"
-          nmap -d -p ${{ matrix.target.port }} \
+          nmap -d -sV --version-all -p ${{ matrix.target.port }} \
               --script dicom-web-info \
               --script-args "dicom-web.ports=${{ matrix.target.port }},dicom-web.qido-test=true" \
               127.0.0.1 | tee "$OUT"

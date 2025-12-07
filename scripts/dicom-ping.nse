@@ -74,7 +74,7 @@ intentionally omitting vendor/version information.
 
 author = "Paulino Calderon <calderon()calderonpale.com>, Tyler M <tmart234()gmail.com>"
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
-categories = {"discovery", "default", "safe", "auth"}
+categories = {"discovery", "default", "version", "safe", "auth"}
 
 local shortport = require "shortport"
 local dicom     = require "dicom"

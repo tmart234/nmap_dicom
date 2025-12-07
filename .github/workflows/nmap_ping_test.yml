@@ -171,7 +171,7 @@ jobs:
             EXTRA="--max-retries 0 --host-timeout 12s --script-timeout 5s"
           fi
           nmap -p ${{ matrix.dicom_server.host_port }} \
-               -n -Pn -dd \
+               -n -Pn -dd -sV \
                --script dicom-ping \
                $EXTRA \
                ${{ matrix.dicom_server.nmap_args }} \

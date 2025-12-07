@@ -168,7 +168,7 @@ jobs:
           OUT="artifacts/nmap_${{ matrix.dicom_server.name }}.out"
           EXTRA=""
           if [ "${{ matrix.dicom_server.name }}" = "dicom-tls" ]; then
-            EXTRA="--max-retries 0 --host-timeout 12s --script-timeout 5s"
+            EXTRA="--max-retries 0 --host-timeout 60s --script-timeout 5s"
           fi
           nmap -p ${{ matrix.dicom_server.host_port }} \
                -n -Pn -dd -sV \

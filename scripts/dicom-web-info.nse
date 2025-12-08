@@ -248,7 +248,7 @@ action = function(host, port)
   end
 
   -- stable, pretty warnings with short codes (non-vuln)
-  local warn = stdnse.output_table()
+  local warn = {}
   local function addwarn(s) table.insert(warn, s) end
   local function warn_code(code, msg) addwarn(("warning [%s]: %s"):format(code, msg)) end
   local function adv_code(code, msg)  addwarn(("advisory [%s]: %s"):format(code, msg)) end
@@ -590,40 +590,60 @@ action = function(host, port)
     end
   end
 
-  -- Build final output
+  -- Build final output using stdnse.output_table for proper formatting
   local out = stdnse.output_table()
+  local has_output = false
   
-  if orthanc_info then out["Orthanc"] = orthanc_info end
+  if orthanc_info then 
+    out["Orthanc"] = orthanc_info 
+    has_output = true
+  end
   
-  if global_auth then out["Authentication"] = global_auth end
+  if global_auth then 
+    out["Authentication"] = global_auth 
+    has_output = true
+  end
   
-  if next(ui_found) then 
+  -- Check if ui_found has any entries
+  local ui_count = 0
+  for _ in pairs(ui_found) do ui_count = ui_count + 1 end
+  if ui_count > 0 then 
     out["Web Interfaces"] = ui_found 
-    stdnse.debug1("Web Interfaces being added to output: %d items", 0) -- count later
+    has_output = true
+    stdnse.debug1("Web Interfaces being added to output: %d items", ui_count)
   end
   
   if #endpoints_found > 0 then 
     out["DICOMweb Endpoints"] = endpoints_found 
+    has_output = true
     stdnse.debug1("DICOMweb Endpoints being added: %d", #endpoints_found)
   end
   
-  if next(features_found) then out["Features"] = features_found end
+  -- Check if features_found has any entries
+  local feat_count = 0
+  for _ in pairs(features_found) do feat_count = feat_count + 1 end
+  if feat_count > 0 then 
+    out["Features"] = features_found 
+    has_output = true
+  end
 
   if #warn > 0 then
     out.warnings = warn
+    has_output = true
   end
 
   if vuln_report and vuln_report.make_output then
     local vuln_out = vuln_report:make_output()
     if vuln_out then
       out.vulnerabilities = vuln_out
+      has_output = true
     end
   end
 
   -- Debug: show what we're returning
-  stdnse.debug1("Final output check: next(out)=%s", tostring(next(out)))
+  stdnse.debug1("Final output check: has_output=%s", tostring(has_output))
   
-  if next(out) == nil then return nil end
+  if not has_output then return nil end
 
   -- SERVICE DETECTION FIX
   -- If we found Orthanc, UI, or specific endpoints, we know this is DICOMweb

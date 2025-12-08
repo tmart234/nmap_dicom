@@ -366,17 +366,20 @@ action = function(host, port)
     local paths = {"/dcm4chee-arc/ui2/index.html", "/dcm4chee-arc/ui2/"}
     for _, pth in ipairs(paths) do
       local r = http_get_cached(host, port, pth)
-      if r and r.status and r.body then
+      -- Must be 200 OK and have body content
+      if r and r.status == 200 and r.body and #r.body > 100 then
         local server = lc(hget(r.header, "Server") or "")
         local loc    = lc(hget(r.header, "Location") or "")
         local bdy    = lc(r.body)
-        local looks =
+        -- Require dcm4chee-specific markers in the body or specific server
+        local has_dcm4chee_marker =
           bdy:find("dcm4chee%-arc", 1, true) or
-          bdy:find("dcm4che", 1, true) or
+          bdy:find("dcm4che", 1, true)
+        local has_dcm4chee_server =
           server:find("wildfly", 1, true) or
-          server:find("undertow", 1, true) or
-          loc:find("/auth", 1, true)
-        if looks then
+          server:find("undertow", 1, true)
+        -- Only match if we have body markers OR server markers with auth redirect
+        if has_dcm4chee_marker or (has_dcm4chee_server and loc:find("/auth", 1, true)) then
           ui_found["dcm4chee-arc-ui"] = "/dcm4chee-arc/ui2/"
           if not hget(r.header, "Content-Security-Policy") then
             adv_code("DWI-007", "DCM4CHEE UI missing Content-Security-Policy")
@@ -452,11 +455,26 @@ action = function(host, port)
   end
 
   -- -------- DICOMweb checks --------
+  -- Skip DICOMweb endpoint detection if this appears to be a frontend-only SPA
+  -- (SPA servers return 200 with HTML for all paths, causing false positives)
+  local skip_dicomweb_checks = false
+  if ui_found["OHIF Viewer"] then
+    -- Check if this server returns 200 with HTML for a known non-existent path
+    local probe = http_get_cached(host, port, "/__nmap_probe_nonexistent_12345__")
+    if probe and probe.status == 200 then
+      local ct = lc(hget(probe.header, "Content-Type") or "")
+      if ct:find("text/html", 1, true) then
+        stdnse.debug1("SPA catch-all detected (OHIF), skipping DICOMweb endpoint probes")
+        skip_dicomweb_checks = true
+      end
+    end
+  end
+
+  -- Note: Only include unique base paths. /dicom-web is generic (used by Orthanc, Dicoogle, etc.)
   local bases = {
-    {impl="orthanc",   base="/dicom-web"},
+    {impl="generic",   base="/dicom-web"},      -- Generic DICOMweb path (Orthanc, Dicoogle, others)
     {impl="dcm4chee",  base="/dcm4chee-arc/rs"},
-    {impl="dcm4chee",  base="/dcm4chee-arc/aets/DCM4CHEE/rs"}, -- common AET route; ok if 404
-    {impl="dicoogle",  base="/dicom-web"}, 
+    {impl="dcm4chee",  base="/dcm4chee-arc/aets/DCM4CHEE/rs"}, -- common AET route
     {impl="kheops",    base="/api"},  
   }
   table.sort(bases, function(a,b) return a.base < b.base end)
@@ -498,6 +516,12 @@ action = function(host, port)
   end
 
   for _, b in ipairs(bases) do
+    -- Skip if we detected this is a frontend-only SPA
+    if skip_dicomweb_checks then
+      stdnse.debug1("Skipping DICOMweb check for %s (SPA detected)", b.base)
+      break
+    end
+    
     local r = http_get_cached(host, port, b.base .. "/")
     stdnse.debug1("DICOMweb base check %s/: status=%s", b.base, r and r.status or "nil")
     
@@ -656,20 +680,34 @@ action = function(host, port)
         
      elseif ui_found["Dicoogle"] then
         port.version.product = "Dicoogle"
+        -- Extract version if we found one, otherwise leave blank (don't use server version)
+        local dicoogle_str = ui_found["Dicoogle"]
+        local v_match = dicoogle_str:match("Version ([%d%.]+)")
+        if v_match then 
+           port.version.version = v_match 
+        else
+           port.version.version = nil  -- Clear any server-detected version
+        end
         
      elseif ui_found["Kheops"] then
         port.version.product = "Kheops Proxy"
+        port.version.version = nil
         
      elseif ui_found["OHIF Viewer"] then
         port.version.product = "OHIF Viewer"
-        -- Try to extract version from the string "Path/ (Version: 1.2.3)"
+        -- Try to extract version from the string "/ (Version: 1.2.3)"
         local v_str = ui_found["OHIF Viewer"]
         local v_match = v_str:match("Version: ([%d%.]+)")
-        if v_match then port.version.version = v_match end
+        if v_match then 
+           port.version.version = v_match 
+        else
+           port.version.version = nil  -- Clear any server-detected version
+        end
 
      elseif #endpoints_found > 0 then
         -- We found valid QIDO endpoints (e.g. /studies), but no specific vendor signature
         port.version.product = "Standard DICOMweb"
+        port.version.version = nil
      end
      
      nmap.set_port_version(host, port)

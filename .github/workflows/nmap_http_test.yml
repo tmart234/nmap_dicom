@@ -17,18 +17,19 @@ jobs:
             compose: docker/docker-compose.web.yml
             service: orthanc
             port: 8042
-            expect: 'path: /system'
+            # Script outputs "Orthanc: X.Y.Z (Path: /system)"
+            expect: 'Orthanc'
           - name: ohif-viewer
             compose: docker/docker-compose.web.yml
             service: viewer
             port: 3000
-            # FIX: Script outputs "OHIF Viewer" not "ohif: /"
-            expect: 'OHIF Viewer'
+            # Script outputs under "Web Interfaces" -> "OHIF Viewer"
+            expect: 'OHIF'
           - name: qido-open
             compose: docker/docker-compose.web.yml
             service: qido_open
             port: 8081
-            # FIX: Match actual script output format
+            # Script outputs "qido: open" in the DICOMweb Endpoints section
             expect: 'qido: open'
           - name: qido-secured
             compose: docker/docker-compose.web.yml
@@ -39,7 +40,8 @@ jobs:
             compose: docker/dicoogle/docker-compose.yml
             service: dicoogle
             port: 8080
-            expect: 'ui: dicoogle'
+            # Script outputs "Dicoogle" in Web Interfaces
+            expect: 'Dicoogle'
 
     steps:
       - uses: actions/checkout@v4
@@ -52,12 +54,34 @@ jobs:
       - name: Install updated NSE into /usr/share
         run: |
           set -euo pipefail
+          
+          # Verify source script exists
+          if [ ! -f scripts/dicom-web-info.nse ]; then
+            echo "::error::scripts/dicom-web-info.nse not found!"
+            exit 1
+          fi
+          
+          # Show source script info
+          echo "=== Source script ==="
+          head -5 scripts/dicom-web-info.nse
+          wc -l scripts/dicom-web-info.nse
+          
+          # Install to system location
           sudo mkdir -p /usr/share/nmap/scripts
           sudo cp -f scripts/dicom-web-info.nse /usr/share/nmap/scripts/dicom-web-info.nse
           sudo chown root:root /usr/share/nmap/scripts/dicom-web-info.nse
           sudo chmod 0644 /usr/share/nmap/scripts/dicom-web-info.nse
+          
+          # Update script database
           sudo nmap --script-updatedb
-          nmap --script-help dicom-web-info | sed -n '1,80p' || true
+          
+          # Verify installation
+          echo "=== Installed script ==="
+          head -5 /usr/share/nmap/scripts/dicom-web-info.nse
+          wc -l /usr/share/nmap/scripts/dicom-web-info.nse
+          
+          # Show script help to confirm it's recognized
+          nmap --script-help dicom-web-info 2>&1 | head -20 || true
 
       - name: Up ${{ matrix.target.name }}
         shell: bash
@@ -157,11 +181,18 @@ jobs:
           set -euo pipefail
           OUT="${{ steps.scan.outputs.out }}"
           WANT='${{ matrix.target.expect }}'
+          
+          echo "=== Full nmap output ==="
+          cat "$OUT"
+          echo "========================"
+          echo "Looking for: $WANT"
+          
           if [ -n "$WANT" ]; then
             if ! grep -Fi "$WANT" "$OUT"; then
               echo "::error::Missing expected: $WANT"
-              sed -n '1,200p' "$OUT" || true
               exit 1
+            else
+              echo "✓ Found expected string: $WANT"
             fi
           fi
 

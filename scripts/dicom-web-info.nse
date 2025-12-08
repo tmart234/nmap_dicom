@@ -178,7 +178,7 @@ local function cache_key(method, path, hdr)
 end
 
 local function http_get_cached(host, port, path, hdr)
-  -- Do NOT cache auth’d requests
+  -- Do NOT cache auth'd requests
   local h = hdr or {}
   if h["Authorization"] or h["authorization"] then
     return http_get(host, port, path, hdr)
@@ -286,10 +286,10 @@ action = function(host, port)
     local hdr_json = { ["Accept"] = "application/json" }
     local r_no = http_get_cached(host, port, "/system", hdr_json)
     if r_no and r_no.status then
-      stdnse.debug1("Orthanc check /system: %s. Body len: %d", r_no.status, #r_no.body)
+      stdnse.debug1("Orthanc check /system: %s. Body len: %d", r_no.status, r_no.body and #r_no.body or 0)
       -- DEBUG: Show body if we failed to match
       if r_no.status == 200 and not (body_has(r_no.body, '"name"') and body_has(r_no.body, "orthanc")) then
-         stdnse.debug1("Orthanc 200 OK but mismatch. Body start: %s", r_no.body:sub(1,200))
+         stdnse.debug1("Orthanc 200 OK but mismatch. Body start: %s", (r_no.body or ""):sub(1,200))
       end
 
       if r_no.status == 200 and r_no.body and (body_has(r_no.body, '"name"') and body_has(r_no.body, "orthanc")) then
@@ -348,9 +348,10 @@ action = function(host, port)
        local ttl = bdy:match("<title>([^<]+)</title>") or ""
        
        -- Dicoogle Detection
-       if srv:find("dicoogle", 1, true) or ttl:find("dicoogle", 1, true) then
+       if srv:find("dicoogle", 1, true) or ttl:find("dicoogle", 1, true) or bdy:find("dicoogle", 1, true) then
           local v = srv:match("dicoogle/([%d%.]+)")
           ui_found["Dicoogle"] = v and ("Version " .. v) or "/"
+          stdnse.debug1("Dicoogle detected via root check")
        end
        
        -- Kheops Detection (Proxy)
@@ -395,9 +396,21 @@ action = function(host, port)
       local r = http_get_cached(host, port, p)
       if r and r.status == 200 and r.body then
         stdnse.debug1("OHIF check %s: 200. Body len %d", p, #r.body)
-        -- IMPROVED: Check for title tag as well
         local b = lc(r.body)
-        if body_has(r.body, "data-cy-root") or body_has(r.body, "ohif") or body_has(r.body, "app-config.js") or b:find("<title>ohif", 1, true) then
+        -- IMPROVED: More comprehensive OHIF detection
+        -- Check for common OHIF markers in the HTML
+        local is_ohif = body_has(r.body, "data-cy-root") 
+                     or body_has(r.body, "ohif") 
+                     or body_has(r.body, "app-config.js")
+                     or body_has(r.body, "OHIF")
+                     or b:find("<title>ohif", 1, true)
+                     -- Also check for common OHIF React app patterns
+                     or (body_has(r.body, "cornerstone") and body_has(r.body, "dicom"))
+                     or body_has(r.body, "dicomImageLoader")
+        
+        stdnse.debug1("OHIF detection for %s: %s", p, tostring(is_ohif))
+        
+        if is_ohif then
           ohif = true
           mount = p
           if not hget(r.header, "Content-Security-Policy") then
@@ -407,15 +420,20 @@ action = function(host, port)
         end
       end
     end
+    
+    -- Fallback: check for app-config.js directly
     if not ohif then
       local r2 = http_get_cached(host, port, "/app-config.js")
       if r2 and r2.status == 200 and r2.body and #r2.body > 0 then
-        if body_has(r2.body, "window.config") or body_has(r2.body, "getAppConfig") then
+        stdnse.debug1("Checking /app-config.js for OHIF markers")
+        if body_has(r2.body, "window.config") or body_has(r2.body, "getAppConfig") or body_has(r2.body, "dataSources") then
           ohif = true
           mount = "/"
+          stdnse.debug1("OHIF detected via app-config.js")
         end
       end
     end
+    
     if ohif then
       -- Best-effort OHIF version from app-config.js (no warning if missing)
       local rjs = http_get_cached(host, port, (mount or "/") .. "app-config.js")
@@ -429,6 +447,7 @@ action = function(host, port)
         if v then ver_str = " (Version: " .. v .. ")" end
       end
       ui_found["OHIF Viewer"] = (mount or "/") .. ver_str
+      stdnse.debug1("OHIF Viewer added to ui_found: %s", ui_found["OHIF Viewer"])
     end
   end
 
@@ -446,11 +465,16 @@ action = function(host, port)
     if not (r and r.status == 200 and r.body) then return false end
     local ct = lc(hget(r.header, "Content-Type") or "")
     if ct:find("application/dicom%+json", 1, false) then return true end
-    -- Check for keys if header is missing/wrong
-    return body_has(r.body, '"StudyInstanceUID"')
-        or body_has(r.body, '"SeriesInstanceUID"')
-        or body_has(r.body, '"SOPInstanceUID"')
-        or body_has(r.body, '"MainDicomTags"')
+    if ct:find("application/json", 1, true) then
+      -- Check for DICOM JSON structure
+      return body_has(r.body, '"StudyInstanceUID"')
+          or body_has(r.body, '"SeriesInstanceUID"')
+          or body_has(r.body, '"SOPInstanceUID"')
+          or body_has(r.body, '"MainDicomTags"')
+          or body_has(r.body, '"0020000D"')  -- StudyInstanceUID tag
+          or body_has(r.body, '"00080050"')  -- AccessionNumber tag
+    end
+    return false
   end
 
   local function qido_try_paths(base)
@@ -459,11 +483,14 @@ action = function(host, port)
       base .. "/studies?offset=0&limit=1",
     }
     for _, path in ipairs(candidates) do
+      -- Try with DICOM+JSON accept header first
       local r = http_get_cached(host, port, path, { ["Accept"]="application/dicom+json" })
       if r and r.status == 406 then
+        -- Fallback to regular JSON
         r = http_get_cached(host, port, path, { ["Accept"]="application/json" })
       end
       if r then
+        stdnse.debug1("QIDO check %s: status=%s, CT=%s", path, r.status, hget(r.header, "Content-Type") or "nil")
         return r, path
       end
     end
@@ -472,6 +499,8 @@ action = function(host, port)
 
   for _, b in ipairs(bases) do
     local r = http_get_cached(host, port, b.base .. "/")
+    stdnse.debug1("DICOMweb base check %s/: status=%s", b.base, r and r.status or "nil")
+    
     if r and (r.status == 200 or r.status == 204 or r.status == 401 or r.status == 403) then
       
       -- Found a valid base!
@@ -482,6 +511,9 @@ action = function(host, port)
       if do_qido then
         local rq, used_path = qido_try_paths(b.base)
         if rq then
+          stdnse.debug1("QIDO response for %s: status=%s, is_dicom_json=%s", 
+                        used_path, rq.status, tostring(is_dicom_json(rq)))
+          
           if is_dicom_json(rq) then
             qido_status = "open"
             -- True vulnerability: unauthenticated QIDO returns DICOM JSON
@@ -507,7 +539,7 @@ action = function(host, port)
           else
             -- DEBUG: Why did QIDO check fail?
             stdnse.debug1("QIDO %s check failed. Status: %s. CT: %s. Body start: %s", 
-               b.base, rq.status, hget(rq.header,"Content-Type") or "nil", rq.body:sub(1,100))
+               b.base, rq.status, hget(rq.header,"Content-Type") or "nil", (rq.body or ""):sub(1,100))
           end
         end
       end
@@ -519,6 +551,7 @@ action = function(host, port)
       end
       local entry = string.format("%s (impl: %s, qido: %s)%s", b.base, b.impl, qido_status, extra)
       table.insert(endpoints_found, entry)
+      stdnse.debug1("Added endpoint: %s", entry)
 
       if do_cors then
         local rc = http_options_cached(host, port, b.base .. "/studies?limit=0", {
@@ -564,9 +597,15 @@ action = function(host, port)
   
   if global_auth then out["Authentication"] = global_auth end
   
-  if next(ui_found) then out["Web Interfaces"] = ui_found end
+  if next(ui_found) then 
+    out["Web Interfaces"] = ui_found 
+    stdnse.debug1("Web Interfaces being added to output: %d items", 0) -- count later
+  end
   
-  if #endpoints_found > 0 then out["DICOMweb Endpoints"] = endpoints_found end
+  if #endpoints_found > 0 then 
+    out["DICOMweb Endpoints"] = endpoints_found 
+    stdnse.debug1("DICOMweb Endpoints being added: %d", #endpoints_found)
+  end
   
   if next(features_found) then out["Features"] = features_found end
 
@@ -581,6 +620,9 @@ action = function(host, port)
     end
   end
 
+  -- Debug: show what we're returning
+  stdnse.debug1("Final output check: next(out)=%s", tostring(next(out)))
+  
   if next(out) == nil then return nil end
 
   -- SERVICE DETECTION FIX

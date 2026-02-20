@@ -27,8 +27,8 @@ way of detecting DICOM servers.
 -- @usage nmap -p4242 --script dicom-ping <target>
 -- @usage nmap -sV --script dicom-ping <target>
 -- @usage nmap --script dicom-ping --script-args dicom-ping.ports=11114,11115 <target>
+-- @usage nmap -v --script dicom-ping <target>
 -- @usage nmap --script dicom-ping --script-args dicom-ping.extended <target>
--- @usage nmap --script dicom-ping --script-args dicom-ping.extended,dicom-ping.oids <target>
 --
 -- @args dicom.called_aet       Called Application Entity Title. Default: ANY-SCP
 -- @args dicom-ping.ports       Optional comma-separated list of ports to probe
@@ -37,10 +37,8 @@ way of detecting DICOM servers.
 --                              the service is already identified as "dicom".
 -- @args dicom-ping.extended    If set, prints additional identification fields
 --                              (implementation class UID and implementation
---                              version name) from the A-ASSOCIATE-AC.
--- @args dicom-ping.oids        If set together with dicom-ping.extended and a
---                              known vendor/version, also prints impl_class_uid
---                              even when vendor/version are already present.
+--                              version name) from the A-ASSOCIATE-AC. This behaves
+--                              identically to running Nmap with verbosity (-v).
 --
 -- @output
 -- PORT     STATE SERVICE REASON
@@ -97,7 +95,8 @@ portrule = function(host, port)
     return true
   end
 
-  -- Run for common DICOM ports, or if service is already identified as dicom/dicom-tls
+  -- Notice the "ssl" removal from the protocol array here compared to earlier attempts. 
+  -- Nmap expects IP layer protocols ("tcp", "udp") in the third argument.
   if shortport.port_or_service(COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, "tcp")(host, port) then
     stdnse.debug1("dicom-ping: matched common DICOM port/service (%d)", port.number)
     return true
@@ -110,9 +109,8 @@ action = function(host, port)
   stdnse.debug1("dicom-ping: ACTION for %s:%d", host.ip, port.number)
   local out = stdnse.output_table()
 
-  local called_aet  = stdnse.get_script_args("dicom.called_aet")
-  local extended    = stdnse.get_script_args("dicom-ping.extended") ~= nil
-  local show_oids   = stdnse.get_script_args("dicom-ping.oids")     ~= nil
+  local called_aet = stdnse.get_script_args("dicom.called_aet")
+  local extended   = stdnse.get_script_args("dicom-ping.extended") ~= nil
 
   -- Safely check for TLS using Nmap's correct internal properties
   local is_tls = (port.version and port.version.service_tunnel == "ssl") or 
@@ -139,7 +137,7 @@ action = function(host, port)
       return out
     end
 
-    -- Catch mTLS rejections
+    -- Catch mTLS rejections (when the connection fails at the TLS layer)
     if is_tls then
       out.dicom    = "TLS endpoint detected, but DICOM association failed."
       out.tls_hint = "Server likely requires Mutual TLS (mTLS) with valid client certificates."
@@ -183,28 +181,27 @@ action = function(host, port)
 
   if version then
     port.version.version = version
-    -- Truth first: show the analyst the raw string if the script cleaned it heavily
-    if impl_version_name and version ~= impl_version_name then
-      out.version = string.format("%s (Raw: %s)", version, impl_version_name)
-    else
-      out.version = version
-    end
+    out.version = version
   end
 
   port.version.name = is_tls and "dicom-tls" or "dicom"
   nmap.set_port_version(host, port)
 
-  if extended then
-    if uid then
-      if show_oids or (not vendor and not version) then
-        out.impl_class_uid = uid
-      end
-      if not vendor and not version then
-         out.note = "Look up impl_class_uid in a DICOM OID registry for implementation details"
-      end
-    end
+  local is_verbose = nmap.verbosity() > 0 or extended
 
-    if impl_version_name and (not version or version == impl_version_name) then
+  if uid then
+    -- If verbose, always show it. If not verbose, only show it if we failed to identify a vendor.
+    if is_verbose or (not vendor and not version) then
+      out.impl_class_uid = uid
+    end
+    -- Only add the lookup note if we failed to identify it
+    if not vendor and not version then
+      out.note = "Look up impl_class_uid in a DICOM OID registry for implementation details"
+    end
+  end
+
+  if impl_version_name then
+    if is_verbose and version ~= impl_version_name then
       out.impl_version_name = impl_version_name
     end
   end

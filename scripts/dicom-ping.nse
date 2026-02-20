@@ -97,8 +97,7 @@ portrule = function(host, port)
     return true
   end
 
-  -- Notice the "ssl" removal from the protocol array here compared to earlier attempts. 
-  -- Nmap expects IP layer protocols ("tcp", "udp") in the third argument.
+  -- Run for common DICOM ports, or if service is already identified as dicom/dicom-tls
   if shortport.port_or_service(COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, "tcp")(host, port) then
     stdnse.debug1("dicom-ping: matched common DICOM port/service (%d)", port.number)
     return true
@@ -137,6 +136,17 @@ action = function(host, port)
       else
         out.config = string.format("Association Rejected (Tried AET: %s)", called_aet)
       end
+      return out
+    end
+
+    -- Catch mTLS rejections
+    if is_tls then
+      out.dicom    = "TLS endpoint detected, but DICOM association failed."
+      out.tls_hint = "Server likely requires Mutual TLS (mTLS) with valid client certificates."
+      out.error    = e
+      
+      port.version.name = "dicom-tls"
+      nmap.set_port_version(host, port)
       return out
     end
 

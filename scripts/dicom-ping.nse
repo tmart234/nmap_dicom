@@ -97,8 +97,9 @@ portrule = function(host, port)
     return true
   end
 
-  -- Run for common DICOM ports, or if service is already identified as dicom/dicom-tls
-  if shortport.port_or_service(COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, {"tcp", "ssl"})(host, port) then
+  -- Notice the "ssl" removal from the protocol array here compared to earlier attempts. 
+  -- Nmap expects IP layer protocols ("tcp", "udp") in the third argument.
+  if shortport.port_or_service(COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, "tcp")(host, port) then
     stdnse.debug1("dicom-ping: matched common DICOM port/service (%d)", port.number)
     return true
   end
@@ -114,6 +115,10 @@ action = function(host, port)
   local extended    = stdnse.get_script_args("dicom-ping.extended") ~= nil
   local show_oids   = stdnse.get_script_args("dicom-ping.oids")     ~= nil
 
+  -- Safely check for TLS using Nmap's correct internal properties
+  local is_tls = (port.version and port.version.service_tunnel == "ssl") or 
+                 (port.version and type(port.version.name) == "string" and port.version.name:match("tls"))
+
   -- dicom.associate handles the heavy lifting, including native SSL wrapping
   local ok, err, version, vendor, uid, impl_version_name = dicom.associate(host, port, nil, called_aet)
 
@@ -123,7 +128,7 @@ action = function(host, port)
 
     -- Only treat a clearly signalled ASSOCIATE-REJECT as positive DICOM detection.
     if e == "ASSOCIATE REJECT received" then
-      port.version.name = port.tunnel == "ssl" and "dicom-tls" or "dicom"
+      port.version.name = is_tls and "dicom-tls" or "dicom"
       nmap.set_port_version(host, port)
 
       out.dicom  = "DICOM Service Provider discovered!"
@@ -136,7 +141,7 @@ action = function(host, port)
     end
 
     -- Heuristic fallback if user didn't run -sV but hits IANA DICOM/TLS port.
-    if port.tunnel ~= "ssl" and tonumber(port.number) == 2762 and e:lower():match("short pdu header") then
+    if not is_tls and tonumber(port.number) == 2762 and e:lower():match("short pdu header") then
       out.dicom    = "Possible DICOM/TLS endpoint (plaintext A-ASSOCIATE not accepted)"
       out.tls_hint = "Port 2762 is open, but DICOM associate could not be completed. Rerun with -sV or --script+ssl to confirm."
       out.error    = e
@@ -155,7 +160,7 @@ action = function(host, port)
     out.config = string.format("Called AET enforced (used: %s)", called_aet)
   end
 
-  if port.tunnel == "ssl" then
+  if is_tls then
     out.tls_status = "Successfully associated over TLS"
   elseif tonumber(port.number) == 2762 then
     out.tls_hint = "Warning: Plaintext DICOM detected on IANA TLS port"
@@ -176,7 +181,7 @@ action = function(host, port)
     end
   end
 
-  port.version.name = port.tunnel == "ssl" and "dicom-tls" or "dicom"
+  port.version.name = is_tls and "dicom-tls" or "dicom"
   nmap.set_port_version(host, port)
 
   if extended then

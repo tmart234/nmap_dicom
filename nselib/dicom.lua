@@ -122,8 +122,19 @@ function start_connection(host, port)
 
   -- Dynamically adapt to SSL/TLS if detected by Nmap core
   local protocol = "tcp"
-  if port.tunnel == "ssl" or port.version.service == "dicom-tls" then
+  local is_ssl = false
+  
+  -- Nmap stores SSL tunnel flags in port.version.service_tunnel
+  if port.version and port.version.service_tunnel == "ssl" then
+    is_ssl = true
+  end
+  if port.version and type(port.version.name) == "string" and port.version.name:match("tls") then
+    is_ssl = true
+  end
+
+  if is_ssl then
     protocol = "ssl"
+    stdnse.debug1("DICOM: Upgrading nsock connection to SSL/TLS")
   end
 
   local ok, err = dcm['socket']:connect(host, port, protocol)

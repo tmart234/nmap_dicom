@@ -45,6 +45,8 @@ way of detecting DICOM servers.
 -- 4242/tcp open  dicom   syn-ack
 -- | dicom-ping:
 -- |   dicom: DICOM Service Provider discovered!
+-- |_  config: Called AET check enabled
+--
 -- PORT     STATE SERVICE REASON
 -- 4242/tcp open  dicom   syn-ack
 -- | dicom-ping:

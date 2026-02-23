@@ -113,6 +113,38 @@ local VENDOR_UID_PATTERNS = {
   {"^1%.3%.46%.670589%.",                     "Philips"},
 }
 
+-- Known toolkit/product signatures found in Implementation Version Name (0x55).
+-- When a device manufacturer (e.g. Philips, GE) ships a commercial toolkit
+-- without overriding the default 0x55 string, the toolkit identity leaks here.
+-- A pentester cares about the toolkit because that is the actual code listening
+-- on the wire — CVEs, buffer overflows, and parser bugs live in the toolkit.
+-- Case-insensitive plain-text matching against the cleaned 0x55 value.
+local TOOLKIT_PATTERNS = {
+  {"offis",       "DCMTK"},
+  {"dcmtk",       "DCMTK"},
+  {"mergecom",    "Merge Healthcare SDK"},
+  {"dcm4che",     "dcm4che"},
+  {"pynetdicom",  "pynetdicom"},
+  {"leadtools",   "LeadTools"},
+  {"clearcanvas", "ClearCanvas"},
+  {"orthanc",     "Orthanc"},
+  {"osirix",      "OsiriX"},
+  {"horos",       "Horos"},
+  {"conquest",    "ConQuest"},
+  {"dgate",       "ConQuest"},
+}
+
+--- Check whether two canonical vendor/toolkit names refer to the same entity.
+-- Handles cases like toolkit="OsiriX" vs org="OsiriX/Horos" where a substring
+-- match is sufficient to declare equivalence.
+local function names_match(a, b)
+  if not a or not b then return false end
+  if a == b then return true end
+  -- Substring containment (either direction) covers combined names
+  if a:find(b, 1, true) or b:find(a, 1, true) then return true end
+  return false
+end
+
 ---
 -- start_connection(host, port) starts socket to DICOM service
 ---
@@ -280,6 +312,23 @@ function identify_vendor_from_uid(uid)
   return nil
 end
 
+---
+-- Identify the toolkit or product from the Implementation Version Name (0x55).
+-- Returns a canonical toolkit name, or nil if unrecognized.
+--
+function identify_toolkit(version_str)
+  if not version_str then return nil end
+  local s = version_str:gsub("%z", ""):match("^%s*(.-)%s*$")
+  if s == "" then return nil end
+  local low = s:lower()
+  for _, entry in ipairs(TOOLKIT_PATTERNS) do
+    if low:find(entry[1], 1, true) then
+      return entry[2]
+    end
+  end
+  return nil
+end
+
 function extract_clean_version(version_str, vendor)
   if not version_str then return nil end
   local s = version_str:gsub("%z", ""):match("^%s*(.-)%s*$")
@@ -361,7 +410,14 @@ end
 
 ---
 -- associate(host, port) Attempts to associate to a DICOM Service Provider
----
+--
+-- Returns on success:
+--   true, nil, version, vendor, uid, impl_version_name, device_vendor
+--
+-- vendor:         the toolkit or product actually running (from 0x55 first, 0x52 fallback)
+-- device_vendor:  the device manufacturer (from 0x52) ONLY when it differs from vendor
+--                 e.g. vendor="DCMTK", device_vendor="Philips" for a Philips MRI using DCMTK
+--
 function associate(host, port, calling_aet, called_aet)
   local status, dcm = start_connection(host, port)
   if not status then
@@ -425,14 +481,39 @@ function associate(host, port, calling_aet, called_aet)
   local received_version_str, received_uid_str = parse_implementation_version(response_data)
   local impl_version_name = received_version_str 
 
-  local parsed_vendor, parsed_clean_version = nil, nil
+  ---------------------------------------------------------------------------
+  -- Vendor resolution: toolkit-first (0x55), org-fallback (0x52)
+  --
+  -- Pentesters care about the toolkit because that is the code on the wire.
+  -- Asset managers care about the device manufacturer (the OID registrant).
+  -- When the two differ (e.g. Philips MRI shipping DCMTK), we report both.
+  ---------------------------------------------------------------------------
 
-  if received_uid_str then
-    parsed_vendor = identify_vendor_from_uid(received_uid_str)
+  -- Step 1: Try to identify a known toolkit from 0x55
+  local toolkit_name = identify_toolkit(received_version_str)
+
+  -- Step 2: Try to identify the registrant org from 0x52
+  local org_name = identify_vendor_from_uid(received_uid_str)
+
+  -- Step 3: Resolve vendor, version, and (optional) device_vendor
+  local parsed_vendor, parsed_clean_version, device_vendor = nil, nil, nil
+
+  if toolkit_name then
+    -- 0x55 identified a known toolkit — this is the actual code on the wire
+    parsed_vendor = toolkit_name
+    parsed_clean_version = extract_clean_version(received_version_str, toolkit_name)
+    -- If 0x52 maps to a different org, surface it as device_vendor (asset inventory)
+    if org_name and not names_match(org_name, toolkit_name) then
+      device_vendor = org_name
+    end
+  elseif org_name then
+    -- No toolkit detected in 0x55; fall back to 0x52 org identity
+    parsed_vendor = org_name
     if received_version_str then
-      parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
+      parsed_clean_version = extract_clean_version(received_version_str, org_name)
     end
   elseif received_version_str then
+    -- Last resort: text-based vendor guess from 0x55
     local v = received_version_str:lower()
     if     v:find("dcm4che",   1, true) then parsed_vendor = "dcm4che"
     elseif v:find("dcmtk",     1, true) then parsed_vendor = "DCMTK"
@@ -444,7 +525,7 @@ function associate(host, port, calling_aet, called_aet)
 
   local final_version = parsed_clean_version or impl_version_name
 
-  return true, nil, final_version, parsed_vendor, received_uid_str, impl_version_name
+  return true, nil, final_version, parsed_vendor, received_uid_str, impl_version_name, device_vendor
 end
 
 function send_pdata(dicom, data)

@@ -45,9 +45,30 @@ way of detecting DICOM servers.
 -- 4242/tcp open  dicom   syn-ack
 -- | dicom-ping:
 -- |   dicom: DICOM Service Provider discovered!
+-- PORT     STATE SERVICE REASON
+-- 4242/tcp open  dicom   syn-ack
+-- | dicom-ping:
+-- |   dicom: DICOM Service Provider discovered!
 -- |   config: Any AET is accepted (Insecure)
 -- |   vendor: Orthanc
 -- |_  version: 1.11.0
+--
+-- Example with vendor/toolkit mismatch (verbose or extended):
+-- PORT     STATE SERVICE REASON
+-- 104/tcp  open  dicom   syn-ack
+-- | dicom-ping:
+-- |   dicom: DICOM Service Provider discovered!
+-- |   config: Any AET is accepted (Insecure)
+-- |   vendor: DCMTK
+-- |   version: 3.6.4
+-- |   device_vendor: Philips
+-- |_  impl_class_uid: 1.3.46.670589.54.2.20.6
+--
+-- @xmloutput
+-- <script id="dicom-ping" output="&#xa;  dicom: DICOM Service Provider discovered!&#xa;
+--   config: Called AET check enabled"><elem key="dicom">DICOM Service Provider discovered!</elem>
+-- <elem key="config">Called AET check enabled</elem>
+-- </script>
 --
 -- @xmloutput
 -- <script id="dicom-ping" output="&#xa;  dicom: DICOM Service Provider discovered!&#xa;  config: Any AET is accepted (Insecure)&#xa;  vendor: Orthanc&#xa;  version: 1.11.0"><elem key="dicom">DICOM Service Provider discovered!</elem>
@@ -117,7 +138,8 @@ action = function(host, port)
                  (port.version and type(port.version.name) == "string" and port.version.name:match("tls"))
 
   -- dicom.associate handles the heavy lifting, including native SSL wrapping
-  local ok, err, version, vendor, uid, impl_version_name = dicom.associate(host, port, nil, called_aet)
+  -- Returns: ok, err, version, vendor, uid, impl_version_name, device_vendor
+  local ok, err, version, vendor, uid, impl_version_name, device_vendor = dicom.associate(host, port, nil, called_aet)
 
   if not ok then
     stdnse.debug1("Association failed: %s", tostring(err or "Unknown error"))
@@ -174,6 +196,7 @@ action = function(host, port)
     out.tls_hint = "Warning: Plaintext DICOM detected on IANA TLS port"
   end
 
+  -- vendor = toolkit/product actually running (from 0x55 first, 0x52 fallback)
   if vendor then
     port.version.product = vendor
     out.vendor = vendor
@@ -184,17 +207,25 @@ action = function(host, port)
     out.version = version
   end
 
+  -- device_vendor = the device manufacturer from 0x52, ONLY when it differs
+  -- from the toolkit. e.g. vendor="DCMTK", device_vendor="Philips"
+  if device_vendor then
+    out.device_vendor = device_vendor
+    port.version.extrainfo = "Device: " .. device_vendor
+  end
+
   port.version.name = is_tls and "dicom-tls" or "dicom"
   nmap.set_port_version(host, port)
 
   local is_verbose = nmap.verbosity() > 0 or extended
 
   if uid then
-    -- If verbose, always show it. If not verbose, only show it if we failed to identify a vendor.
-    if is_verbose or (not vendor and not version) then
+    -- Show UID when: verbose, mismatch case (device_vendor present), or
+    -- when we couldn't identify anything (manual lookup needed)
+    if is_verbose or device_vendor or (not vendor and not version) then
       out.impl_class_uid = uid
     end
-    -- Only add the lookup note if we failed to identify it
+    -- Only add the lookup note if we failed to identify anything
     if not vendor and not version then
       out.note = "Look up impl_class_uid in a DICOM OID registry for implementation details"
     end

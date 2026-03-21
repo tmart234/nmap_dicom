@@ -90,17 +90,9 @@ for i, v in pairs(PDU_CODES) do
   PDU_NAMES[v] = i
 end
 
----------------------------------------------------------------------------
--- UID Pattern Tables — split by category
---
--- "toolkit"      = the DICOM software library handling the protocol on the
---                  wire. This is what a pentester targets (CVEs, parser bugs).
--- "manufacturer" = the device OEM (GE, Siemens, Philips, …). Important for
---                  asset inventory but not the attack surface itself.
---
--- Each entry: { lua_pattern, canonical_name }
--- Most-specific patterns FIRST within each table.
----------------------------------------------------------------------------
+-- UID tables: "toolkit" = DICOM library on the wire (CVE target),
+-- "manufacturer" = device OEM (asset inventory).
+-- Most-specific patterns first within each table.
 
 local TOOLKIT_UID_PATTERNS = {
   {"^1%.3%.6%.1%.4%.1%.25403%.",              "ClearCanvas"},
@@ -123,12 +115,8 @@ local MANUFACTURER_UID_PATTERNS = {
   {"^1%.2%.840%.113669%..*",                  "Merge Healthcare"},
 }
 
--- Known toolkit/product signatures found in Implementation Version Name (0x55).
--- When a device manufacturer (e.g. Philips, GE) ships a commercial toolkit
--- without overriding the default 0x55 string, the toolkit identity leaks here.
--- A pentester cares about the toolkit because that is the actual code listening
--- on the wire — CVEs, buffer overflows, and parser bugs live in the toolkit.
--- Case-insensitive plain-text matching against the cleaned 0x55 value.
+-- Known toolkit signatures in Implementation Version Name (0x55).
+-- Case-insensitive plain-text match against the cleaned value.
 local TOOLKIT_PATTERNS = {
   {"offis",       "DCMTK"},
   {"dcmtk",       "DCMTK"},
@@ -150,7 +138,6 @@ local TOOLKIT_PATTERNS = {
 local function names_match(a, b)
   if not a or not b then return false end
   if a == b then return true end
-  -- Substring containment (either direction) covers combined names
   if a:find(b, 1, true) or b:find(a, 1, true) then return true end
   return false
 end
@@ -166,7 +153,6 @@ function start_connection(host, port)
   local protocol = "tcp"
   local is_ssl = false
   
-  -- Nmap stores SSL tunnel flags in port.version.service_tunnel
   if port.version and port.version.service_tunnel == "ssl" then
     is_ssl = true
   end
@@ -176,7 +162,7 @@ function start_connection(host, port)
 
   if is_ssl then
     protocol = "ssl"
-    stdnse.debug1("DICOM: Upgrading nsock connection to SSL/TLS")
+    stdnse.debug1("DICOM: Upgrading to SSL/TLS")
   end
 
   local ok, err = dcm['socket']:connect(host, port, protocol)
@@ -254,7 +240,6 @@ function parse_implementation_version(data)
   local version, uid = nil, nil
   local data_len = #data
 
-  -- A-ASSOCIATE-AC fixed length is 74 bytes. Variable items begin at byte 75 (1-indexed).
   if data_len < 74 then 
     return nil, nil 
   end
@@ -262,7 +247,7 @@ function parse_implementation_version(data)
   local offset = 75
   local userinfo_start = nil
 
-  -- 1. Safely walk the TLV structure instead of using string matching (data:find)
+  -- Walk the TLV structure to find User Information item (0x50)
   while offset + 3 <= data_len do
     local item_type = string.byte(data, offset)
     local item_len  = string.unpack(">I2", data, offset + 2)
@@ -271,7 +256,6 @@ function parse_implementation_version(data)
       userinfo_start = offset
       break
     end
-    -- Skip to the next item
     offset = offset + 4 + item_len
   end
 
@@ -280,14 +264,13 @@ function parse_implementation_version(data)
       return nil, nil
   end
 
-  -- Ensure we can safely read the length of the User Info Block itself
   if userinfo_start + 3 > data_len then return nil, nil end
 
   local userinfo_len = string.unpack(">I2", data, userinfo_start + 2)
   local sub_offset = userinfo_start + 4
   local effective_end = math.min(userinfo_start + 3 + userinfo_len, data_len)
 
-  -- 2. Walk the sub-items inside User Info
+  -- Walk sub-items inside User Info
   while sub_offset + 3 <= effective_end do
     local sub_type = string.byte(data, sub_offset)
     local sub_len  = string.unpack(">I2", data, sub_offset + 2)
@@ -313,26 +296,22 @@ end
 
 ---
 -- Identify the Implementation Class UID (0x52) against both UID tables.
---
--- Returns: name, category
---   category is "toolkit" or "manufacturer", or nil if no match.
+-- Returns: name, category ("toolkit" or "manufacturer", or nil if no match)
 --
 function identify_vendor_from_uid(uid)
   if not uid then return nil, nil end
   uid = uid:gsub("%z", ""):match("^%s*(.-)%s*$")
 
-  -- Check toolkit roots first (higher priority for security relevance)
   for _, entry in ipairs(TOOLKIT_UID_PATTERNS) do
     if uid:match(entry[1]) then
-      stdnse.debug1("DICOM: 0x52 UID matched toolkit: %s (pattern: %s)", entry[2], entry[1])
+      stdnse.debug1("DICOM: 0x52 UID -> toolkit: %s", entry[2])
       return entry[2], "toolkit"
     end
   end
 
-  -- Then check manufacturer roots
   for _, entry in ipairs(MANUFACTURER_UID_PATTERNS) do
     if uid:match(entry[1]) then
-      stdnse.debug1("DICOM: 0x52 UID matched manufacturer: %s (pattern: %s)", entry[2], entry[1])
+      stdnse.debug1("DICOM: 0x52 UID -> manufacturer: %s", entry[2])
       return entry[2], "manufacturer"
     end
   end
@@ -342,7 +321,7 @@ function identify_vendor_from_uid(uid)
 end
 
 ---
--- Identify the toolkit or product from the Implementation Version Name (0x55).
+-- Identify the toolkit from the Implementation Version Name (0x55).
 -- Returns a canonical toolkit name, or nil if unrecognized.
 --
 function identify_toolkit(version_str)
@@ -352,11 +331,11 @@ function identify_toolkit(version_str)
   local low = s:lower()
   for _, entry in ipairs(TOOLKIT_PATTERNS) do
     if low:find(entry[1], 1, true) then
-      stdnse.debug1("DICOM: 0x55 version matched toolkit: %s (from string: %s)", entry[2], s)
+      stdnse.debug1("DICOM: 0x55 -> toolkit: %s (from: %s)", entry[2], s)
       return entry[2]
     end
   end
-  stdnse.debug1("DICOM: 0x55 version unrecognized by toolkit patterns: %s", s)
+  stdnse.debug1("DICOM: 0x55 unrecognized: %s", s)
   return nil
 end
 
@@ -440,16 +419,9 @@ end
 -- ============================================================
 
 ---
--- associate(host, port) Attempts to associate to a DICOM Service Provider
---
+-- associate(host, port) Attempts to associate to a DICOM Service Provider.
 -- Returns on success:
---   true, nil, version, vendor, uid, impl_version_name, device_vendor, uid_category
---
--- vendor:         the toolkit or product actually running (from 0x55 first, then
---                 0x52 only if 0x52 matched category "toolkit")
--- device_vendor:  the device manufacturer (from 0x52) when 0x52 matched category
---                 "manufacturer" and differs from vendor
--- uid_category:   "toolkit", "manufacturer", or nil — what the 0x52 UID resolved to
+--   true, nil, version, vendor, uid, impl_version_name, device_vendor
 --
 function associate(host, port, calling_aet, called_aet)
   local status, dcm = start_connection(host, port)
@@ -491,7 +463,7 @@ function associate(host, port, calling_aet, called_aet)
   end
 
   local receive_status, response_data = receive(dcm)
-  dcm['socket']:close() -- Association handshake complete; socket cleanup.
+  dcm['socket']:close()
 
   if not receive_status then 
     return false, string.format("Couldn't read ASSOCIATE response: %s", response_data) 
@@ -514,82 +486,45 @@ function associate(host, port, calling_aet, called_aet)
   local received_version_str, received_uid_str = parse_implementation_version(response_data)
   local impl_version_name = received_version_str 
 
-  ---------------------------------------------------------------------------
-  -- Vendor resolution: toolkit-first, category-aware
-  --
-  -- Pentesters care about the toolkit because that is the code on the wire.
-  -- Asset managers care about the device manufacturer (the OID registrant).
-  -- The 0x52 UID table is now split: each match returns a category so we
-  -- can reason explicitly about what we found.
-  --
-  -- Resolution order:
-  --   1. 0x55 string -> known toolkit? (highest confidence for wire-level ID)
-  --   2. 0x52 UID -> toolkit root?     (confirms or provides toolkit identity)
-  --   3. 0x52 UID -> manufacturer root? (asset context, reported as device_vendor)
-  --   4. 0x55 string -> last-resort text match
-  --   5. Nothing matched -> report raw values for manual lookup
-  ---------------------------------------------------------------------------
-
-  -- Step 1: Try to identify a known toolkit from 0x55 (Implementation Version Name)
+  -- Vendor resolution: 0x55 toolkit > 0x52 toolkit > 0x52 manufacturer > 0x55 text fallback
   local toolkit_name = identify_toolkit(received_version_str)
-
-  -- Step 2: Identify the 0x52 UID with category awareness
   local uid_name, uid_category = identify_vendor_from_uid(received_uid_str)
 
-  -- Step 3: Resolve vendor, version, and (optional) device_vendor
   local parsed_vendor, parsed_clean_version, device_vendor = nil, nil, nil
 
   if toolkit_name then
-    ---------------------------------------------------------------------------
-    -- 0x55 identified a known toolkit — this is the actual code on the wire.
-    -- This is the highest-confidence identification path.
-    ---------------------------------------------------------------------------
+    -- 0x55 matched a known toolkit — highest confidence
     parsed_vendor = toolkit_name
     parsed_clean_version = extract_clean_version(received_version_str, toolkit_name)
-    stdnse.debug1("DICOM: Vendor resolved from 0x55 toolkit match: %s", toolkit_name)
+    stdnse.debug1("DICOM: Vendor from 0x55: %s", toolkit_name)
 
     if uid_name then
       if uid_category == "manufacturer" then
-        -- 0x52 is a device manufacturer, 0x55 is the toolkit: classic mismatch.
-        -- e.g. Philips MRI shipping DCMTK — report both.
         device_vendor = uid_name
-        stdnse.debug1("DICOM: Device manufacturer from 0x52: %s (toolkit on wire: %s)", uid_name, toolkit_name)
+        stdnse.debug1("DICOM: Device manufacturer from 0x52: %s", uid_name)
       elseif uid_category == "toolkit" and not names_match(uid_name, toolkit_name) then
-        -- 0x52 is a *different* toolkit than 0x55 — unusual but possible
-        -- (e.g. forked toolkit with original UID but rebranded version string).
-        -- Prefer 0x55 for vendor, note the discrepancy in debug.
-        stdnse.debug1("DICOM: 0x52 toolkit (%s) differs from 0x55 toolkit (%s) — using 0x55", uid_name, toolkit_name)
+        stdnse.debug1("DICOM: 0x52 toolkit (%s) differs from 0x55 (%s) — using 0x55", uid_name, toolkit_name)
       end
-      -- If uid_category == "toolkit" and names_match: consistent, nothing extra to report.
     end
 
   elseif uid_name and uid_category == "toolkit" then
-    ---------------------------------------------------------------------------
-    -- 0x55 didn't match a known toolkit, but 0x52 matched a toolkit root.
-    -- The device is probably running that toolkit with a customized 0x55 string.
-    ---------------------------------------------------------------------------
+    -- 0x52 matched a toolkit root; device likely runs it with custom 0x55
     parsed_vendor = uid_name
-    stdnse.debug1("DICOM: Vendor resolved from 0x52 toolkit root: %s", uid_name)
+    stdnse.debug1("DICOM: Vendor from 0x52 toolkit: %s", uid_name)
     if received_version_str then
       parsed_clean_version = extract_clean_version(received_version_str, uid_name)
     end
 
   elseif uid_name and uid_category == "manufacturer" then
-    ---------------------------------------------------------------------------
-    -- 0x55 didn't match any toolkit. 0x52 is a device manufacturer OID.
-    -- This means the device vendor registered their own UID but we can't
-    -- identify the underlying DICOM stack. The manufacturer goes to
-    -- device_vendor; vendor (product) stays nil — we don't know the toolkit.
-    ---------------------------------------------------------------------------
+    -- 0x52 is a device manufacturer; toolkit unknown
     device_vendor = uid_name
-    stdnse.debug1("DICOM: 0x52 matched manufacturer (%s) but no toolkit identified from 0x55", uid_name)
-    -- Still try to extract a version from 0x55 even without a vendor context
+    stdnse.debug1("DICOM: 0x52 manufacturer (%s), no toolkit from 0x55", uid_name)
     if received_version_str then
       parsed_clean_version = extract_clean_version(received_version_str, nil)
     end
 
   elseif received_version_str then
-    -- Neither table matched. Last resort: text-based toolkit guess from 0x55.
+    -- Last resort: text-based toolkit guess from 0x55
     local v = received_version_str:lower()
     if     v:find("dcm4che",   1, true) then parsed_vendor = "dcm4che"
     elseif v:find("dcmtk",     1, true) then parsed_vendor = "DCMTK"
@@ -597,19 +532,19 @@ function associate(host, port, calling_aet, called_aet)
     elseif v:find("orthanc",   1, true) then parsed_vendor = "Orthanc"
     end
     if parsed_vendor then
-      stdnse.debug1("DICOM: Vendor resolved from 0x55 text fallback: %s", parsed_vendor)
+      stdnse.debug1("DICOM: Vendor from 0x55 fallback: %s", parsed_vendor)
     else
-      stdnse.debug1("DICOM: No vendor identified. 0x55=%s, 0x52=%s",
+      stdnse.debug1("DICOM: No vendor. 0x55=%s, 0x52=%s",
         tostring(received_version_str), tostring(received_uid_str))
     end
     parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
   else
-    stdnse.debug1("DICOM: No identification data available (0x55 and 0x52 both empty/missing)")
+    stdnse.debug1("DICOM: No identification data (0x55 and 0x52 both empty)")
   end
 
   local final_version = parsed_clean_version or impl_version_name
 
-  return true, nil, final_version, parsed_vendor, received_uid_str, impl_version_name, device_vendor, uid_category
+  return true, nil, final_version, parsed_vendor, received_uid_str, impl_version_name, device_vendor
 end
 
 function send_pdata(dicom, data)

@@ -56,28 +56,6 @@ way of detecting DICOM servers.
 -- |   vendor: Orthanc
 -- |_  version: 1.11.0
 --
--- Toolkit/manufacturer mismatch (verbose or extended):
--- PORT     STATE SERVICE REASON
--- 104/tcp  open  dicom   syn-ack
--- | dicom-ping:
--- |   dicom: DICOM Service Provider discovered!
--- |   config: Any AET is accepted (Insecure)
--- |   vendor: DCMTK
--- |   version: 3.6.4
--- |   device_vendor: Philips
--- |_  impl_class_uid: 1.3.46.670589.54.2.20.6
---
--- Manufacturer OID recognized but no toolkit identified:
--- PORT     STATE SERVICE REASON
--- 104/tcp  open  dicom   syn-ack
--- | dicom-ping:
--- |   dicom: DICOM Service Provider discovered!
--- |   config: Any AET is accepted (Insecure)
--- |   device_vendor: GE Healthcare
--- |   impl_class_uid: 1.2.840.113619.6.5
--- |   impl_version_name: GE_PACS_V4
--- |_  version: 4
---
 -- Completely unrecognized implementation (default output):
 -- PORT     STATE SERVICE REASON
 -- 104/tcp  open  dicom   syn-ack
@@ -87,7 +65,7 @@ way of detecting DICOM servers.
 -- |   impl_class_uid: 1.2.3.4.5.6.7.8.9
 -- |   impl_uid_root: 1.2.3.4.5.6.7.8
 -- |   impl_version_name: UNKNOWN_STACK_V2
--- |_  note: Unrecognized implementation - look up impl_class_uid in a DICOM OID registry
+-- |_  note: Unrecognized - look up UID in OID registry
 --
 -- @xmloutput
 -- <script id="dicom-ping" output="&#xa;  dicom: DICOM Service Provider discovered!&#xa;
@@ -127,7 +105,7 @@ end
 -- Default/common DICOM ports:
 local COMMON_DICOM_PORTS = {104, 11112, 2761, 2762, 4242}
 
--- Cache custom ports at script load so we don't parse it on every open port
+-- Cache custom ports at script load
 local custom_ports_arg = stdnse.get_script_args("dicom-ping.ports")
 local custom_ports_set = parse_ports_arg(custom_ports_arg)
 
@@ -141,8 +119,6 @@ portrule = function(host, port)
     return true
   end
 
-  -- Notice the "ssl" removal from the protocol array here compared to earlier attempts. 
-  -- Nmap expects IP layer protocols ("tcp", "udp") in the third argument.
   if shortport.port_or_service(COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, "tcp")(host, port) then
     stdnse.debug1("dicom-ping: matched common DICOM port/service (%d)", port.number)
     return true
@@ -158,19 +134,16 @@ action = function(host, port)
   local called_aet = stdnse.get_script_args("dicom.called_aet")
   local extended   = stdnse.get_script_args("dicom-ping.extended") ~= nil
 
-  -- Safely check for TLS using Nmap's correct internal properties
   local is_tls = (port.version and port.version.service_tunnel == "ssl") or 
                  (port.version and type(port.version.name) == "string" and port.version.name:match("tls"))
 
-  -- dicom.associate handles the heavy lifting, including native SSL wrapping
-  -- Returns: ok, err, version, vendor, uid, impl_version_name, device_vendor, uid_category
-  local ok, err, version, vendor, uid, impl_version_name, device_vendor, uid_category = dicom.associate(host, port, nil, called_aet)
+  -- Returns: ok, err, version, vendor, uid, impl_version_name, device_vendor
+  local ok, err, version, vendor, uid, impl_version_name, device_vendor = dicom.associate(host, port, nil, called_aet)
 
   if not ok then
     stdnse.debug1("Association failed: %s", tostring(err or "Unknown error"))
     local e = tostring(err or "")
 
-    -- Only treat a clearly signalled ASSOCIATE-REJECT as positive DICOM detection.
     if e == "ASSOCIATE REJECT received" then
       port.version.name = is_tls and "dicom-tls" or "dicom"
       nmap.set_port_version(host, port)
@@ -184,7 +157,6 @@ action = function(host, port)
       return out
     end
 
-    -- Catch mTLS rejections (when the connection fails at the TLS layer)
     if is_tls then
       out.dicom    = "TLS endpoint detected, but DICOM association failed."
       out.tls_hint = "Server likely requires Mutual TLS (mTLS) with valid client certificates."
@@ -195,7 +167,7 @@ action = function(host, port)
       return out
     end
 
-    -- Heuristic fallback if user didn't run -sV but hits IANA DICOM/TLS port.
+    -- Heuristic: plaintext on IANA TLS port
     if not is_tls and tonumber(port.number) == 2762 and e:lower():match("short pdu header") then
       out.dicom    = "Possible DICOM/TLS endpoint (plaintext A-ASSOCIATE not accepted)"
       out.tls_hint = "Port 2762 is open, but DICOM associate could not be completed. Rerun with -sV or --script+ssl to confirm."
@@ -203,13 +175,10 @@ action = function(host, port)
       return out
     end
 
-    -- Unknown failure or timeout: stay silent to avoid false positives.
     return nil
   end
 
-  -- =========================================================================
-  -- Success path: association accepted.
-  -- =========================================================================
+  -- Success: association accepted
   out.dicom = "DICOM Service Provider discovered!"
   if not called_aet or called_aet == "ANY-SCP" then
     out.config = "Any AET is accepted (Insecure)"
@@ -223,8 +192,6 @@ action = function(host, port)
     out.tls_hint = "Warning: Plaintext DICOM detected on IANA TLS port"
   end
 
-  -- vendor = toolkit/product actually running (from 0x55 first, 0x52 toolkit fallback)
-  -- device_vendor = device manufacturer from 0x52 when category is "manufacturer"
   local is_verbose = nmap.verbosity() > 0 or extended
   local identified = (vendor ~= nil)
 
@@ -238,7 +205,6 @@ action = function(host, port)
     out.version = version
   end
 
-  -- device_vendor: always show when present — it's asset-relevant context
   if device_vendor then
     out.device_vendor = device_vendor
     port.version.extrainfo = "Device: " .. device_vendor
@@ -247,51 +213,31 @@ action = function(host, port)
   port.version.name = is_tls and "dicom-tls" or "dicom"
   nmap.set_port_version(host, port)
 
-  ---------------------------------------------------------------------------
-  -- Raw identification fields: impl_class_uid, impl_uid_root, impl_version_name
-  --
-  -- Nmap convention: when fingerprinting fails, surface raw data so the
-  -- operator can do manual lookup (analogous to -sV showing an unmatched
-  -- service fingerprint).
-  --
-  -- Show policy:
-  --   identified + verbose     -> show uid (for verification)
-  --   identified + mismatch    -> show uid (documents the discrepancy)
-  --   NOT identified           -> ALWAYS show uid + root + raw version
-  --                               (this is the most common case in clinical
-  --                               environments; hiding it behind -v loses
-  --                               the most important data)
-  ---------------------------------------------------------------------------
-
+  -- Raw fields: show always when unidentified, show on verbose/mismatch when identified
   if uid then
     if not identified then
-      -- Unrecognized implementation: promote everything to default output
       out.impl_class_uid = uid
       local uid_root = dicom.extract_uid_root(uid)
       if uid_root and uid_root ~= uid then
         out.impl_uid_root = uid_root
       end
     elseif is_verbose or device_vendor then
-      -- Identified but verbose or mismatch: show UID for cross-reference
       out.impl_class_uid = uid
     end
   end
 
   if impl_version_name then
     if not identified then
-      -- Unrecognized: always show raw version name for manual identification
       out.impl_version_name = impl_version_name
     elseif is_verbose and version ~= impl_version_name then
-      -- Identified + verbose: show only if it differs from cleaned version
       out.impl_version_name = impl_version_name
     end
   end
 
-  -- Note for operator when we couldn't identify anything
   if not identified and not device_vendor then
-    out.note = "Unrecognized implementation - look up impl_class_uid in a DICOM OID registry"
+    out.note = "Unrecognized - look up UID in OID registry"
   elseif not identified and device_vendor then
-    out.note = "Device manufacturer identified but DICOM toolkit unknown - look up impl_class_uid for stack details"
+    out.note = "Device manufacturer known but toolkit unknown - look up UID for stack details"
   end
 
   return out

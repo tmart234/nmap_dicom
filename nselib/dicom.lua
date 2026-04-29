@@ -51,9 +51,17 @@ local function item_application_context(uid) return ul_item(0x10, uid) end
 local function item_abstract_syntax(uid)    return ul_item(0x30, uid) end
 local function item_transfer_syntax(uid)    return ul_item(0x40, uid) end
 
-local function item_presentation_context(pc_id, abstract_uid, transfer_uid)
+local function item_presentation_context(pc_id, abstract_uid, transfer_uids)
+  -- transfer_uids may be a single UID string or an array of UID strings.
   local header = string.pack(">B B B B", pc_id, 0x00, 0x00, 0x00)
-  local payload = header .. item_abstract_syntax(abstract_uid) .. item_transfer_syntax(transfer_uid)
+  local payload = header .. item_abstract_syntax(abstract_uid)
+  if type(transfer_uids) == "string" then
+    payload = payload .. item_transfer_syntax(transfer_uids)
+  else
+    for _, ts in ipairs(transfer_uids) do
+      payload = payload .. item_transfer_syntax(ts)
+    end
+  end
   return ul_item(0x20, payload)
 end
 
@@ -89,6 +97,17 @@ local PDU_CODES = {
 for i, v in pairs(PDU_CODES) do
   PDU_NAMES[v] = i
 end
+
+-- Per-Presentation-Context result codes as returned by the SCP in the
+-- A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2). dicom-enum surfaces these so
+-- callers can distinguish "service unsupported" from "encoding unsupported".
+PC_RESULT_NAMES = {
+  [0] = "acceptance",
+  [1] = "user-rejection",
+  [2] = "no-reason",
+  [3] = "abstract-syntax-not-supported",
+  [4] = "transfer-syntaxes-not-supported",
+}
 
 -- UID tables: "toolkit" = DICOM library on the wire (CVE target),
 -- "manufacturer" = device OEM (asset inventory).
@@ -429,9 +448,12 @@ function associate(host, port, calling_aet, called_aet)
     return false, dcm -- dcm contains the error message
   end
 
-  local application_context_name = "1.2.840.10008.3.1.1.1"   
-  local abstract_syntax_name     = "1.2.840.10008.1.1"       
-  local transfer_syntax_name     = "1.2.840.10008.1.2"       
+  local application_context_name = "1.2.840.10008.3.1.1.1"
+  local abstract_syntax_name     = "1.2.840.10008.1.1"
+  -- Offer Implicit VR LE (always required by the standard) plus Explicit VR LE.
+  -- A handful of SCPs prefer Explicit VR; offering both in the same PC costs
+  -- ~22 bytes and improves robustness without adding more presentation contexts.
+  local transfer_syntax_names    = {"1.2.840.10008.1.2", "1.2.840.10008.1.2.1"}
 
   local called_ae_title_val  = pad16(called_aet  or "ANY-SCP")
   local calling_ae_title_val = pad16(calling_aet or "ECHOSCU")
@@ -442,7 +464,7 @@ function associate(host, port, calling_aet, called_aet)
   local max_pdu_len            = 16384
 
   local application_context  = item_application_context(application_context_name)
-  local presentation_context = item_presentation_context(1, abstract_syntax_name, transfer_syntax_name)
+  local presentation_context = item_presentation_context(1, abstract_syntax_name, transfer_syntax_names)
   local userinfo_context     = item_user_information(implementation_id, implementation_version, max_pdu_len)
 
   local fixed = string.pack(">I2 I2 c16 c16 c32", 0x0001, 0x0000, called_ae_title_val, calling_ae_title_val, string.rep("\0", 32))
@@ -545,6 +567,171 @@ function associate(host, port, calling_aet, called_aet)
   local final_version = parsed_clean_version or impl_version_name
 
   return true, nil, final_version, parsed_vendor, received_uid_str, impl_version_name, device_vendor
+end
+
+---
+-- Walk the variable-items region of an A-ASSOCIATE-AC PDU and pull out
+-- one entry per Presentation-Context AC item (0x21). Each entry carries
+-- the PC ID, the SCP's result code, and the accepted Transfer Syntax UID
+-- (only meaningful when result == 0). PS3.8 §9.3.3.2.
+--
+-- @param data  Raw AC PDU starting at the PDU type byte.
+-- @return table  Array of {pc_id, result, accepted_ts} (possibly empty).
+---
+function parse_pc_results(data)
+  local results = {}
+  local data_len = #data
+  -- Variable items start after the 6-byte PDU header + 68-byte fixed area.
+  if data_len < 75 then return results end
+  local offset = 75
+  while offset + 3 <= data_len do
+    local item_type = string.byte(data, offset)
+    local item_len  = string.unpack(">I2", data, offset + 2)
+    local item_end  = offset + 3 + item_len
+    if item_end > data_len then break end
+
+    if item_type == 0x21 then
+      -- PC-AC layout: pc_id(1) reserved(1) result(1) reserved(1) [TS sub-item]
+      if item_len >= 4 then
+        local pc_id  = string.byte(data, offset + 4)
+        local result = string.byte(data, offset + 6)
+        local accepted_ts = nil
+
+        local sub_offset = offset + 8
+        while sub_offset + 3 <= item_end do
+          local sub_type = string.byte(data, sub_offset)
+          local sub_len  = string.unpack(">I2", data, sub_offset + 2)
+          if sub_type == 0x40 and sub_len > 0
+             and sub_offset + 3 + sub_len <= item_end then
+            accepted_ts = data:sub(sub_offset + 4, sub_offset + 3 + sub_len)
+                              :gsub("%z", ""):match("^%s*(.-)%s*$")
+            break
+          end
+          sub_offset = sub_offset + 4 + sub_len
+        end
+
+        table.insert(results, {pc_id = pc_id, result = result, accepted_ts = accepted_ts})
+      end
+    end
+    offset = offset + 4 + item_len
+  end
+  return results
+end
+
+---
+-- Issue a single A-ASSOCIATE with a caller-supplied list of presentation
+-- contexts and return per-PC accept/reject results from the AC PDU. This
+-- is the primitive dicom-enum builds on; dicom.associate is a thin
+-- single-PC Verification call kept for dicom-ping/dicom-brute.
+--
+-- @param host         Target host table.
+-- @param port         Target port table.
+-- @param calling_aet  Calling AE Title (defaults to NMAP-DICOM).
+-- @param called_aet   Called AE Title (defaults to ANY-SCP).
+-- @param pc_list      Array of {abstract_syntax = UID, transfer_syntaxes = {UID,...}}.
+--                     PC IDs are auto-assigned 1, 3, 5, ... (PS3.8 requires odd).
+-- @param opts         Optional: { impl_version = string }.
+-- @return ok, err_or_nil, results, info
+--   results = array of {pc_id, abstract_syntax, requested_ts, result, result_name, accepted_ts}
+--   info    = {impl_version_name, impl_class_uid}
+---
+function associate_pcs(host, port, calling_aet, called_aet, pc_list, opts)
+  if type(pc_list) ~= "table" or #pc_list == 0 then
+    return false, "associate_pcs: pc_list must be a non-empty array"
+  end
+  if #pc_list > 128 then
+    return false, "associate_pcs: PS3.8 caps presentation contexts at 128"
+  end
+  opts = opts or {}
+
+  local status, dcm = start_connection(host, port)
+  if not status then return false, dcm end
+
+  local application_context_name = "1.2.840.10008.3.1.1.1"
+  local called_ae_title_val  = pad16(called_aet  or "ANY-SCP")
+  local calling_ae_title_val = pad16(calling_aet or "NMAP-DICOM")
+
+  local implementation_id      = "1.2.276.0.7230010.3.0.3.6.2"
+  local implementation_version = opts.impl_version or "NMAP_DICOM_ENUM"
+  local max_pdu_len            = 16384
+
+  local pc_blob = ""
+  local pc_id_by_index = {}
+  for i, pc in ipairs(pc_list) do
+    local pc_id = (i * 2) - 1   -- PS3.8: PC IDs must be odd
+    pc_id_by_index[i] = pc_id
+    local ts = pc.transfer_syntaxes
+    if type(ts) == "string" then ts = {ts} end
+    if not ts or #ts == 0 then
+      dcm['socket']:close()
+      return false, string.format("associate_pcs: PC %d has no transfer syntaxes", i)
+    end
+    pc_blob = pc_blob .. item_presentation_context(pc_id, pc.abstract_syntax, ts)
+  end
+
+  local app_ctx   = item_application_context(application_context_name)
+  local user_info = item_user_information(implementation_id, implementation_version, max_pdu_len)
+
+  local fixed = string.pack(">I2 I2 c16 c16 c32",
+    0x0001, 0x0000, called_ae_title_val, calling_ae_title_val, string.rep("\0", 32))
+  local body = fixed .. app_ctx .. pc_blob .. user_info
+
+  local h_ok, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"], #body)
+  if not h_ok then
+    dcm['socket']:close()
+    return false, "Failed to encode PDU header"
+  end
+
+  local s_ok, s_err = send(dcm, header .. body)
+  if not s_ok then
+    dcm['socket']:close()
+    return false, string.format("Couldn't send ASSOCIATE request: %s", s_err or "unknown")
+  end
+
+  local r_ok, response = receive(dcm)
+  dcm['socket']:close()
+  if not r_ok then
+    return false, string.format("Couldn't read ASSOCIATE response: %s", response)
+  end
+  if #response < MIN_HEADER_LEN then
+    return false, "Received response too short for PDU header"
+  end
+
+  local resp_type = string.byte(response, 1)
+  if resp_type == PDU_CODES["ASSOCIATE_REJECT"] then
+    return false, "ASSOCIATE REJECT received"
+  elseif resp_type == PDU_CODES["ABORT"] then
+    return false, "A-ABORT received"
+  elseif resp_type ~= PDU_CODES["ASSOCIATE_ACCEPT"] then
+    return false, "Received unexpected response PDU type: " .. tostring(resp_type)
+  end
+
+  local pc_ac = parse_pc_results(response)
+  local pc_ac_by_id = {}
+  for _, r in ipairs(pc_ac) do pc_ac_by_id[r.pc_id] = r end
+
+  local results = {}
+  for i, pc in ipairs(pc_list) do
+    local pc_id = pc_id_by_index[i]
+    local r = pc_ac_by_id[pc_id]
+    local ts_req = pc.transfer_syntaxes
+    if type(ts_req) == "string" then ts_req = {ts_req} end
+    table.insert(results, {
+      pc_id           = pc_id,
+      abstract_syntax = pc.abstract_syntax,
+      requested_ts    = ts_req,
+      result          = r and r.result or nil,
+      result_name     = r and (PC_RESULT_NAMES[r.result] or "unknown") or "no-response",
+      accepted_ts     = r and r.accepted_ts or nil,
+    })
+  end
+
+  local impl_ver, impl_uid = parse_implementation_version(response)
+  local info = {
+    impl_version_name = impl_ver,
+    impl_class_uid    = impl_uid,
+  }
+  return true, nil, results, info
 end
 
 function send_pdata(dicom, data)

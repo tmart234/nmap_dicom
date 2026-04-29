@@ -23,6 +23,12 @@ The library hooks into Nmap's port.version.service_tunnel property to automatica
 - conquest,
 - Orthanc with DICOM TLS (stunnel)
 
+## dicom-enum
+
+`dicom-enum.nse` proposes ~28 curated presentation contexts (Verification, the major Storage SOP classes, Modality Worklist FIND, Patient/Study Root Q/R, Storage Commitment, MPPS, and Print) in a single A-ASSOCIATE request and parses the per-PC result map returned in the A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2). Each PC is reported as `accepted`, `user-rejection`, `no-reason`, `abstract-syntax-not-supported`, or `transfer-syntaxes-not-supported`. Output shape mirrors `ssh2-enum-algos`. Categories are `discovery, safe` (not `default`) — same call the maintainers made for `ssh2-enum-algos`.
+
+Capability-only: `dicom-enum` does **not** brute-force AETs. If the target enforces an AET allowlist, run `dicom-brute` first to learn a valid pair, then pass it via `--script-args dicom.called_aet=<X> dicom.calling_aet=<Y>` to either `dicom-ping` or `dicom-enum`.
+
 ## DICOM Web script
 Detect DICOM-related HTTP endpoints
 ### Testing

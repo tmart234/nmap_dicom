@@ -51,9 +51,18 @@ local function item_application_context(uid) return ul_item(0x10, uid) end
 local function item_abstract_syntax(uid)    return ul_item(0x30, uid) end
 local function item_transfer_syntax(uid)    return ul_item(0x40, uid) end
 
-local function item_presentation_context(pc_id, abstract_uid, transfer_uid)
+local function item_presentation_context(pc_id, abstract_uid, transfer_uids)
   local header = string.pack(">B B B B", pc_id, 0x00, 0x00, 0x00)
-  local payload = header .. item_abstract_syntax(abstract_uid) .. item_transfer_syntax(transfer_uid)
+  local ts_blob = ""
+  -- Accept either a single UID string or a list of UIDs.
+  if type(transfer_uids) == "string" then
+    ts_blob = item_transfer_syntax(transfer_uids)
+  else
+    for _, uid in ipairs(transfer_uids) do
+      ts_blob = ts_blob .. item_transfer_syntax(uid)
+    end
+  end
+  local payload = header .. item_abstract_syntax(abstract_uid) .. ts_blob
   return ul_item(0x20, payload)
 end
 
@@ -89,6 +98,29 @@ local PDU_CODES = {
 for i, v in pairs(PDU_CODES) do
   PDU_NAMES[v] = i
 end
+
+-- Per-PC result codes returned in A-ASSOCIATE-AC (PS3.8 §9.3.3.2)
+PC_RESULT_NAMES = {
+  [0] = "accepted",
+  [1] = "user-rejection",
+  [2] = "no-reason",
+  [3] = "abstract-syntax-not-supported",
+  [4] = "transfer-syntaxes-not-supported",
+}
+
+-- Common DICOM Transfer Syntax UIDs
+TRANSFER_SYNTAX_UIDS = {
+  IMPLICIT_VR_LE     = "1.2.840.10008.1.2",
+  EXPLICIT_VR_LE     = "1.2.840.10008.1.2.1",
+  EXPLICIT_VR_BE     = "1.2.840.10008.1.2.2",
+}
+
+-- Friendly names for the few TS UIDs we propose by default
+TRANSFER_SYNTAX_NAMES = {
+  ["1.2.840.10008.1.2"]   = "Implicit VR Little Endian",
+  ["1.2.840.10008.1.2.1"] = "Explicit VR Little Endian",
+  ["1.2.840.10008.1.2.2"] = "Explicit VR Big Endian",
+}
 
 -- UID tables: "toolkit" = DICOM library on the wire (CVE target),
 -- "manufacturer" = device OEM (asset inventory).
@@ -235,6 +267,81 @@ function pdu_header_encode(pdu_type, length)
 end
 
 -- ==================== Parse Sub-Routines ====================
+
+---
+-- parse_associate_accept(data) walks an A-ASSOCIATE-AC PDU and returns:
+--   {
+--     pc_results   = { [pc_id] = {result = N, accepted_ts = uid_or_nil} },
+--     max_pdu      = number_or_nil,
+--     impl_uid     = string_or_nil,        -- 0x52
+--     impl_version = string_or_nil,        -- 0x55
+--   }
+-- Item structure follows PS3.8 §9.3.3.
+function parse_associate_accept(data)
+  local out = { pc_results = {}, max_pdu = nil, impl_uid = nil, impl_version = nil }
+  local data_len = #data
+  if data_len < 74 then return out end
+
+  local offset = 75 -- skip 6-byte PDU header + 68-byte fixed AC preamble (1-indexed Lua)
+
+  while offset + 3 <= data_len do
+    local item_type = string.byte(data, offset)
+    local item_len  = string.unpack(">I2", data, offset + 2)
+    local val_start = offset + 4
+    local val_end   = offset + 3 + item_len
+    if val_end > data_len then break end
+
+    if item_type == 0x21 and item_len >= 4 then
+      -- Presentation Context AC item
+      local pc_id     = string.byte(data, val_start)
+      local pc_result = string.byte(data, val_start + 2)
+      local entry     = { result = pc_result, accepted_ts = nil }
+
+      local sub = val_start + 4
+      while sub + 3 <= val_end do
+        local stype = string.byte(data, sub)
+        local slen  = string.unpack(">I2", data, sub + 2)
+        local svs   = sub + 4
+        local sve   = sub + 3 + slen
+        if sve > val_end then break end
+        if stype == 0x40 and slen > 0 then
+          local raw = data:sub(svs, sve)
+          entry.accepted_ts = (raw:gsub("%z", "")):match("^%s*(.-)%s*$")
+        end
+        sub = sub + 4 + slen
+      end
+
+      out.pc_results[pc_id] = entry
+
+    elseif item_type == 0x50 then
+      -- User Information item
+      local sub = val_start
+      while sub + 3 <= val_end do
+        local stype = string.byte(data, sub)
+        local slen  = string.unpack(">I2", data, sub + 2)
+        local svs   = sub + 4
+        local sve   = sub + 3 + slen
+        if sve > val_end then break end
+
+        if stype == 0x51 and slen >= 4 then
+          out.max_pdu = string.unpack(">I4", data, svs)
+        elseif stype == 0x52 and slen > 0 then
+          local raw = data:sub(svs, sve)
+          out.impl_uid = (raw:gsub("%z", "")):match("^%s*(.-)%s*$")
+        elseif stype == 0x55 and slen > 0 then
+          local raw = data:sub(svs, sve)
+          out.impl_version = (raw:gsub("%z", "")):match("^%s*(.-)%s*$")
+        end
+
+        sub = sub + 4 + slen
+      end
+    end
+
+    offset = offset + 4 + item_len
+  end
+
+  return out
+end
 
 function parse_implementation_version(data)
   local version, uid = nil, nil
@@ -419,81 +526,19 @@ end
 -- ============================================================
 
 ---
--- associate(host, port) Attempts to associate to a DICOM Service Provider.
--- Returns on success:
---   true, nil, version, vendor, uid, impl_version_name, device_vendor
---
-function associate(host, port, calling_aet, called_aet)
-  local status, dcm = start_connection(host, port)
-  if not status then
-    return false, dcm -- dcm contains the error message
-  end
+-- resolve_vendor_info(received_version_str, received_uid_str)
+-- Maps the raw 0x55 / 0x52 strings to (final_version, parsed_vendor,
+-- parsed_clean_version, device_vendor, impl_version_name) using the
+-- toolkit-first resolution policy. Shared by associate() and dicom-enum.
+function resolve_vendor_info(received_version_str, received_uid_str)
+  local impl_version_name = received_version_str
 
-  local application_context_name = "1.2.840.10008.3.1.1.1"   
-  local abstract_syntax_name     = "1.2.840.10008.1.1"       
-  local transfer_syntax_name     = "1.2.840.10008.1.2"       
-
-  local called_ae_title_val  = pad16(called_aet  or "ANY-SCP")
-  local calling_ae_title_val = pad16(calling_aet or "ECHOSCU")
-
-  -- Use a generic, clearly labeled scanner identification
-  local implementation_id      = "1.2.276.0.7230010.3.0.3.6.2" -- Re-using DCMTK's root as it passes most legacy strict filters
-  local implementation_version = "NMAP_DICOM_PING"
-  local max_pdu_len            = 16384
-
-  local application_context  = item_application_context(application_context_name)
-  local presentation_context = item_presentation_context(1, abstract_syntax_name, transfer_syntax_name)
-  local userinfo_context     = item_user_information(implementation_id, implementation_version, max_pdu_len)
-
-  local fixed = string.pack(">I2 I2 c16 c16 c32", 0x0001, 0x0000, called_ae_title_val, calling_ae_title_val, string.rep("\0", 32))
-  local assoc_body = fixed .. application_context .. presentation_context .. userinfo_context
-
-  local header_ok, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"], #assoc_body)
-  if not header_ok then 
-    dcm['socket']:close()
-    return false, "Failed to encode PDU header" 
-  end
-  
-  local assoc_request = header .. assoc_body
-
-  local send_status, send_err = send(dcm, assoc_request)
-  if not send_status then
-    dcm['socket']:close()
-    return false, string.format("Couldn't send ASSOCIATE request: %s", send_err or "Unknown error")
-  end
-
-  local receive_status, response_data = receive(dcm)
-  dcm['socket']:close()
-
-  if not receive_status then 
-    return false, string.format("Couldn't read ASSOCIATE response: %s", response_data) 
-  end
-
-  if #response_data < MIN_HEADER_LEN then 
-    return false, "Received response too short for PDU header" 
-  end
-  
-  local resp_type, _, resp_length = string.unpack(">B B I4", response_data)
-
-  if resp_type ~= PDU_CODES["ASSOCIATE_ACCEPT"] then
-    if resp_type == PDU_CODES["ASSOCIATE_REJECT"] then
-      return false, "ASSOCIATE REJECT received"
-    else
-      return false, "Received unexpected response PDU type: " .. tostring(resp_type)
-    end
-  end
-
-  local received_version_str, received_uid_str = parse_implementation_version(response_data)
-  local impl_version_name = received_version_str 
-
-  -- Vendor resolution: 0x55 toolkit > 0x52 toolkit > 0x52 manufacturer > 0x55 text fallback
   local toolkit_name = identify_toolkit(received_version_str)
   local uid_name, uid_category = identify_vendor_from_uid(received_uid_str)
 
   local parsed_vendor, parsed_clean_version, device_vendor = nil, nil, nil
 
   if toolkit_name then
-    -- 0x55 matched a known toolkit — highest confidence
     parsed_vendor = toolkit_name
     parsed_clean_version = extract_clean_version(received_version_str, toolkit_name)
     stdnse.debug1("DICOM: Vendor from 0x55: %s", toolkit_name)
@@ -508,7 +553,6 @@ function associate(host, port, calling_aet, called_aet)
     end
 
   elseif uid_name and uid_category == "toolkit" then
-    -- 0x52 matched a toolkit root; device likely runs it with custom 0x55
     parsed_vendor = uid_name
     stdnse.debug1("DICOM: Vendor from 0x52 toolkit: %s", uid_name)
     if received_version_str then
@@ -516,7 +560,6 @@ function associate(host, port, calling_aet, called_aet)
     end
 
   elseif uid_name and uid_category == "manufacturer" then
-    -- 0x52 is a device manufacturer; toolkit unknown
     device_vendor = uid_name
     stdnse.debug1("DICOM: 0x52 manufacturer (%s), no toolkit from 0x55", uid_name)
     if received_version_str then
@@ -524,7 +567,6 @@ function associate(host, port, calling_aet, called_aet)
     end
 
   elseif received_version_str then
-    -- Last resort: text-based toolkit guess from 0x55
     local v = received_version_str:lower()
     if     v:find("dcm4che",   1, true) then parsed_vendor = "dcm4che"
     elseif v:find("dcmtk",     1, true) then parsed_vendor = "DCMTK"
@@ -543,8 +585,144 @@ function associate(host, port, calling_aet, called_aet)
   end
 
   local final_version = parsed_clean_version or impl_version_name
+  return final_version, parsed_vendor, parsed_clean_version, device_vendor, impl_version_name
+end
 
-  return true, nil, final_version, parsed_vendor, received_uid_str, impl_version_name, device_vendor
+---
+-- associate_extended(host, port, calling_aet, called_aet, presentation_contexts)
+-- Generalized A-ASSOCIATE that accepts a list of presentation contexts:
+--   { {abstract_syntax = uid, transfer_syntaxes = {uid, ...}}, ... }
+-- On accept, returns:
+--   true, nil, pc_results, info
+-- where:
+--   pc_results[i] = {pc_id, result, accepted_ts, abstract_syntax, transfer_syntaxes}
+--   info          = {max_pdu, impl_uid, impl_version}
+-- pc_results is keyed by the index of the input list (1..N), preserving order.
+-- On failure, returns false, err_string.
+function associate_extended(host, port, calling_aet, called_aet, presentation_contexts)
+  if not presentation_contexts or #presentation_contexts == 0 then
+    return false, "presentation_contexts must contain at least one entry"
+  end
+  if #presentation_contexts > 128 then
+    return false, "too many presentation contexts (PS3.8 limit is 128)"
+  end
+
+  local status, dcm = start_connection(host, port)
+  if not status then
+    return false, dcm
+  end
+
+  local application_context_name = "1.2.840.10008.3.1.1.1"
+  local called_ae_title_val  = pad16(called_aet  or "ANY-SCP")
+  local calling_ae_title_val = pad16(calling_aet or "ECHOSCU")
+  local implementation_id      = "1.2.276.0.7230010.3.0.3.6.2"
+  local implementation_version = "NMAP_DICOM_PING"
+  local max_pdu_len            = 16384
+
+  local application_context  = item_application_context(application_context_name)
+  local userinfo_context     = item_user_information(implementation_id, implementation_version, max_pdu_len)
+
+  local pc_blocks = {}
+  local pc_id_to_index = {}
+  local index_to_pc_id = {}
+  for i, pc in ipairs(presentation_contexts) do
+    local pc_id = (i - 1) * 2 + 1 -- odd IDs per PS3.7
+    if pc_id > 255 then
+      dcm['socket']:close()
+      return false, "presentation context ID overflow"
+    end
+    index_to_pc_id[i] = pc_id
+    pc_id_to_index[pc_id] = i
+    pc_blocks[#pc_blocks + 1] = item_presentation_context(pc_id, pc.abstract_syntax, pc.transfer_syntaxes)
+  end
+  local presentation_blob = table.concat(pc_blocks)
+
+  local fixed = string.pack(">I2 I2 c16 c16 c32",
+    0x0001, 0x0000, called_ae_title_val, calling_ae_title_val, string.rep("\0", 32))
+  local assoc_body = fixed .. application_context .. presentation_blob .. userinfo_context
+
+  local header_ok, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"], #assoc_body)
+  if not header_ok then
+    dcm['socket']:close()
+    return false, "Failed to encode PDU header"
+  end
+
+  local send_status, send_err = send(dcm, header .. assoc_body)
+  if not send_status then
+    dcm['socket']:close()
+    return false, string.format("Couldn't send ASSOCIATE request: %s", send_err or "Unknown error")
+  end
+
+  local receive_status, response_data = receive(dcm)
+  dcm['socket']:close()
+
+  if not receive_status then
+    return false, string.format("Couldn't read ASSOCIATE response: %s", response_data)
+  end
+  if #response_data < MIN_HEADER_LEN then
+    return false, "Received response too short for PDU header"
+  end
+
+  local resp_type = string.unpack(">B", response_data)
+  if resp_type ~= PDU_CODES["ASSOCIATE_ACCEPT"] then
+    if resp_type == PDU_CODES["ASSOCIATE_REJECT"] then
+      return false, "ASSOCIATE REJECT received"
+    else
+      return false, "Received unexpected response PDU type: " .. tostring(resp_type)
+    end
+  end
+
+  local parsed = parse_associate_accept(response_data)
+
+  -- Re-key results back to the original proposal index, attaching the
+  -- abstract syntax string so the caller doesn't need to cross-reference.
+  local pc_results = {}
+  for i, pc in ipairs(presentation_contexts) do
+    local pc_id = index_to_pc_id[i]
+    local raw   = parsed.pc_results[pc_id] or {}
+    pc_results[i] = {
+      pc_id             = pc_id,
+      abstract_syntax   = pc.abstract_syntax,
+      transfer_syntaxes = pc.transfer_syntaxes,
+      result            = raw.result,
+      accepted_ts       = raw.accepted_ts,
+    }
+  end
+
+  local info = {
+    max_pdu      = parsed.max_pdu,
+    impl_uid     = parsed.impl_uid,
+    impl_version = parsed.impl_version,
+  }
+
+  return true, nil, pc_results, info
+end
+
+---
+-- associate(host, port) Attempts to associate to a DICOM Service Provider
+-- using a single Verification PC with Implicit + Explicit VR LE transfer
+-- syntaxes (still ping-shaped — one PC, ~22 bytes more on the wire).
+-- Returns on success:
+--   true, nil, version, vendor, uid, impl_version_name, device_vendor
+--
+function associate(host, port, calling_aet, called_aet)
+  local pcs = {{
+    abstract_syntax   = "1.2.840.10008.1.1",
+    transfer_syntaxes = {
+      "1.2.840.10008.1.2",   -- Implicit VR Little Endian
+      "1.2.840.10008.1.2.1", -- Explicit VR Little Endian
+    },
+  }}
+
+  local ok, err, _pc_results, info = associate_extended(host, port, calling_aet, called_aet, pcs)
+  if not ok then return false, err end
+
+  local impl_version = info and info.impl_version or nil
+  local impl_uid     = info and info.impl_uid or nil
+  local final_version, parsed_vendor, _clean, device_vendor, impl_version_name =
+    resolve_vendor_info(impl_version, impl_uid)
+
+  return true, nil, final_version, parsed_vendor, impl_uid, impl_version_name, device_vendor
 end
 
 function send_pdata(dicom, data)

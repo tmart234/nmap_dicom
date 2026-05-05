@@ -213,10 +213,18 @@ jobs:
           OUT="${{ steps.test_enum.outputs.enum_out }}"
           grep -qE 'association:\s+accepted' "$OUT" \
             || { echo "::error::dicom-enum did not get an accept"; tail -n 200 "$OUT"; exit 1; }
-          grep -qE 'accepted \([0-9]+\)' "$OUT" \
-            || { echo "::error::dicom-enum produced no accepted bucket"; tail -n 200 "$OUT"; exit 1; }
+          # Result buckets are now nested tables: "accepted:" on one line then
+          # "count: N" indented underneath, replacing the old "accepted (N):"
+          # count-in-key form. Look for an "accepted:" line whose two-line
+          # follow-up contains a non-zero count.
+          grep -A2 -E '^[|][[:space:]]+accepted:[[:space:]]*$' "$OUT" \
+            | grep -qE '^.*count:[[:space:]]*[1-9][0-9]*$' \
+            || { echo "::error::dicom-enum produced no accepted bucket with non-zero count"; tail -n 200 "$OUT"; exit 1; }
           grep -qE '\bVerification\b' "$OUT" \
             || { echo "::error::Verification not present in dicom-enum output"; tail -n 200 "$OUT"; exit 1; }
+          # Sanity-check the new structural fields landed.
+          grep -qE '^[|]\s+service_classes:' "$OUT" \
+            || { echo "::error::dicom-enum missing service_classes block"; tail -n 200 "$OUT"; exit 1; }
 
       - name: Assert TLS row (no vendor/version)
         if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.expect_vendor_version == 'false'

@@ -44,20 +44,11 @@ PDU_NAMES = {}  -- exported reverse map: pdu_type -> name (built below)
 -- OFFIS / IANA-PEN tree, so it does not impersonate DCMTK or any registered
 -- vendor. Replace with 1.3.6.1.4.1.<PEN>.1 if Insecure.Com registers a PEN.
 local IMPLEMENTATION_CLASS_UID = "2.25.205477355541376756296906656564391676347"
-
-local function _nmap_version_str()
-  if type(nmap.version) == "function" then
-    local ok, v = pcall(nmap.version)
-    if ok and type(v) == "table" then
-      if v.major and v.minor then
-        return string.format("%d.%d", v.major, v.minor)
-      end
-      if v.version then return tostring(v.version) end
-    end
-  end
-  return "0.0"
-end
-local IMPLEMENTATION_VERSION_NAME = "NMAP_NSE_" .. _nmap_version_str()
+-- Implementation Version Name (PS3.7 D.3.3.2). Stable across Nmap releases
+-- so SCP fingerprinting / audit-log filtering rules don't need updating
+-- whenever Nmap ships. Embed the Nmap version in port.version at the
+-- script layer where it belongs, not in the wire-level identifier.
+local IMPLEMENTATION_VERSION_NAME = "NMAP_NSE"
 
 -- A-ASSOCIATE-AC PDU layout (PS3.8 §9.3.3 Table 9-17).
 -- 6-byte PDU header + 68-byte fixed preamble = 74; first variable item starts

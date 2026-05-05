@@ -134,7 +134,7 @@ action = function(host, port)
   local called_aet = stdnse.get_script_args("dicom.called_aet")
   local extended   = stdnse.get_script_args("dicom-ping.extended") ~= nil
 
-  local is_tls = (port.version and port.version.service_tunnel == "ssl") or 
+  local is_tls = (port.version and port.version.service_tunnel == "ssl") or
                  (port.version and type(port.version.name) == "string" and port.version.name:match("tls"))
 
   -- Returns: ok, err, version, vendor, uid, impl_version_name, device_vendor
@@ -161,7 +161,7 @@ action = function(host, port)
       out.dicom    = "TLS endpoint detected, but DICOM association failed."
       out.tls_hint = "Server likely requires Mutual TLS (mTLS) with valid client certificates."
       out.error    = e
-      
+
       port.version.name = "dicom-tls"
       nmap.set_port_version(host, port)
       return out

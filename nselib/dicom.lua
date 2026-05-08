@@ -257,6 +257,119 @@ function infer_device_class(accepted_services)
   return nil
 end
 
+-- DICOM Storage SOP-Class UID -> imaging modality. Sourced from PS3.4 Annex B
+-- and the PS3.6 UID registry. Order matters: most-specific UIDs (with the
+-- longer suffixes) come before any prefix that would also match.
+SOP_MODALITY_BY_UID = {
+  -- CT
+  {uid = "1.2.840.10008.5.1.4.1.1.2.1",         modality = "CT"},
+  {uid = "1.2.840.10008.5.1.4.1.1.2.2",         modality = "CT"},
+  {uid = "1.2.840.10008.5.1.4.1.1.2",           modality = "CT"},
+  -- MR
+  {uid = "1.2.840.10008.5.1.4.1.1.4.1",         modality = "MRI"},
+  {uid = "1.2.840.10008.5.1.4.1.1.4.2",         modality = "MRI"},
+  {uid = "1.2.840.10008.5.1.4.1.1.4.3",         modality = "MRI"},
+  {uid = "1.2.840.10008.5.1.4.1.1.4.4",         modality = "MRI"},
+  {uid = "1.2.840.10008.5.1.4.1.1.4",           modality = "MRI"},
+  -- Ultrasound
+  {uid = "1.2.840.10008.5.1.4.1.1.3.1",         modality = "Ultrasound"},
+  {uid = "1.2.840.10008.5.1.4.1.1.6.1",         modality = "Ultrasound"},
+  {uid = "1.2.840.10008.5.1.4.1.1.6.2",         modality = "Ultrasound"},
+  -- Mammography (must come before generic DX/CR Storage prefixes)
+  {uid = "1.2.840.10008.5.1.4.1.1.1.2.1",       modality = "Mammography"},
+  {uid = "1.2.840.10008.5.1.4.1.1.1.2",         modality = "Mammography"},
+  {uid = "1.2.840.10008.5.1.4.1.1.13.1.3",      modality = "Mammography"},
+  -- Intra-oral / dentistry (more specific than generic X-Ray)
+  {uid = "1.2.840.10008.5.1.4.1.1.1.3.1",       modality = "X-Ray (Intra-oral)"},
+  {uid = "1.2.840.10008.5.1.4.1.1.1.3",         modality = "X-Ray (Intra-oral)"},
+  -- Digital X-Ray (DR)
+  {uid = "1.2.840.10008.5.1.4.1.1.1.1.1",       modality = "X-Ray (DX)"},
+  {uid = "1.2.840.10008.5.1.4.1.1.1.1",         modality = "X-Ray (DX)"},
+  -- Computed Radiography
+  {uid = "1.2.840.10008.5.1.4.1.1.1",           modality = "X-Ray (CR)"},
+  -- X-Ray Angiography
+  {uid = "1.2.840.10008.5.1.4.1.1.12.1.1",      modality = "X-Ray Angiography"},
+  {uid = "1.2.840.10008.5.1.4.1.1.12.1",        modality = "X-Ray Angiography"},
+  -- X-Ray Radiofluoroscopy
+  {uid = "1.2.840.10008.5.1.4.1.1.12.2.1",      modality = "Fluoroscopy"},
+  {uid = "1.2.840.10008.5.1.4.1.1.12.2",        modality = "Fluoroscopy"},
+  -- Nuclear Medicine
+  {uid = "1.2.840.10008.5.1.4.1.1.20",          modality = "Nuclear Medicine"},
+  -- PET (PET-CT scanners emit both PET and CT Storage SOP classes)
+  {uid = "1.2.840.10008.5.1.4.1.1.130",         modality = "PET"},
+  {uid = "1.2.840.10008.5.1.4.1.1.128.1",       modality = "PET"},
+  {uid = "1.2.840.10008.5.1.4.1.1.128",         modality = "PET"},
+  -- Endoscopy / Visible Light
+  {uid = "1.2.840.10008.5.1.4.1.1.77.1.1.1",    modality = "Endoscopy"},
+  {uid = "1.2.840.10008.5.1.4.1.1.77.1.1",      modality = "Endoscopy"},
+  {uid = "1.2.840.10008.5.1.4.1.1.77.1.4.1",    modality = "VL Photographic"},
+  {uid = "1.2.840.10008.5.1.4.1.1.77.1.4",      modality = "VL Photographic"},
+  -- Radiotherapy
+  {uid = "1.2.840.10008.5.1.4.1.1.481.1",       modality = "RT Image"},
+  -- Document / non-image objects (no implied physical modality)
+  {uid = "1.2.840.10008.5.1.4.1.1.7",           modality = "Secondary Capture"},
+  {uid = "1.2.840.10008.5.1.4.1.1.104.1",       modality = "Encapsulated Document"},
+}
+
+---
+-- Map a Storage SOP-Class UID to its imaging modality. Returns nil for
+-- non-Storage UIDs (Verification, Q/R, MWL, Print, ...).
+function modality_for_uid(uid)
+  if not uid then return nil end
+  for _, entry in ipairs(SOP_MODALITY_BY_UID) do
+    if uid == entry.uid then return entry.modality end
+  end
+  return nil
+end
+
+---
+-- Build the sorted set of modalities implied by a list of accepted abstract
+-- syntax UIDs. PET-CT is collapsed when both PET and CT are present.
+function infer_modalities(accepted_uids)
+  if not accepted_uids then return {} end
+  local set = {}
+  for _, uid in ipairs(accepted_uids) do
+    local m = modality_for_uid(uid)
+    if m then set[m] = true end
+  end
+  if set["PET"] and set["CT"] then
+    set["PET-CT"] = true
+  end
+  local list = {}
+  for m in pairs(set) do list[#list + 1] = m end
+  table.sort(list)
+  return list
+end
+
+---
+-- Infer DIMSE service commands from accepted abstract syntax UIDs. Mapping
+-- follows the Q/R model UIDs (PS3.4 Annex C) where the trailing component
+-- selects FIND (.1), MOVE (.2), or GET (.3), plus Verification (C-ECHO),
+-- Storage (C-STORE), and Modality Worklist (C-FIND).
+function infer_service_commands(accepted_uids)
+  if not accepted_uids then return {} end
+  local cmds = {}
+  for _, uid in ipairs(accepted_uids) do
+    if uid == "1.2.840.10008.1.1" then
+      cmds["C-ECHO"] = true
+    elseif uid:sub(1, #"1.2.840.10008.5.1.4.1.1.") == "1.2.840.10008.5.1.4.1.1." then
+      cmds["C-STORE"] = true
+    elseif uid == "1.2.840.10008.5.1.4.31" then
+      cmds["C-FIND"] = true
+    elseif uid:sub(1, #"1.2.840.10008.5.1.4.1.2.") == "1.2.840.10008.5.1.4.1.2." then
+      local tail = uid:match("%.([123])$")
+      if     tail == "1" then cmds["C-FIND"] = true
+      elseif tail == "2" then cmds["C-MOVE"] = true
+      elseif tail == "3" then cmds["C-GET"]  = true
+      end
+    end
+  end
+  local list = {}
+  for c in pairs(cmds) do list[#list + 1] = c end
+  table.sort(list)
+  return list
+end
+
 -- UID tables: "toolkit" = DICOM library on the wire (CVE target),
 -- "manufacturer" = device OEM (asset inventory).
 -- Most-specific patterns first within each table.

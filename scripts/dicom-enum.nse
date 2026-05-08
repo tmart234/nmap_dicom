@@ -8,15 +8,32 @@ Each presentation context is reported as one of:
   accepted (0), user-rejection (1), no-reason (2),
   abstract-syntax-not-supported (3), transfer-syntaxes-not-supported (4)
 
-This is a capability fingerprint: it identifies which Storage SOP classes
-the SCP serves (CT/MR/US/CR/DX/Mammo/...), whether it supports Modality
-Worklist FIND, Patient/Study Root Query/Retrieve, Storage Commitment,
-MPPS, and Print Management, and which transfer syntaxes it negotiates.
+Only the "accepted" bucket is rendered in normal script output — that is
+the SCP's positive capability surface. The other four buckets are emitted
+at debug level only (-d), since "everything we proposed that this SCP
+doesn't serve" is useful for triage but noise in default output.
 
-The script also infers a device class (PACS/VNA, Modality, RIS gateway,
-Archive front-end, Print server) from the set of accepted service classes.
-This taxonomy is a practitioner consensus, not a normative DICOM concept;
-treat the inferred_device_class line as a fingerprint, not a classification.
+This is a capability fingerprint: it identifies which Storage SOP classes
+the SCP serves (CT/MR/US/CR/DX/Mammo/PET/NM/XA/XRF/Endoscopy/...), whether
+it supports Modality Worklist FIND, Patient/Study Root Query/Retrieve,
+Storage Commitment, MPPS, and Print Management, and which transfer
+syntaxes it negotiates.
+
+From the accepted SOP classes the script also derives:
+  modalities         - the imaging modalities implied by accepted Storage
+                       SOP classes (CT, MRI, Ultrasound, Mammography,
+                       X-Ray, X-Ray Angiography, Fluoroscopy, PET, PET-CT,
+                       Nuclear Medicine, Endoscopy, ...). PET-CT is
+                       reported when both PET and CT are accepted.
+  service_commands   - the DIMSE commands implied by the accepted SOP
+                       classes: C-ECHO (Verification), C-STORE (Storage),
+                       C-FIND (Q/R FIND or Modality Worklist FIND),
+                       C-MOVE (Q/R MOVE), C-GET (Q/R GET).
+  inferred_device_class - PACS/VNA, Modality, RIS gateway, Archive
+                       front-end, or Print server. This taxonomy is a
+                       practitioner consensus, not a normative DICOM
+                       concept; treat it as a fingerprint, not a
+                       classification.
 
 This script does NOT brute-force Application Entity Titles. If the target
 PACS enforces an AET allowlist, the association is rejected before any
@@ -51,6 +68,20 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- |     QR-Study-Root
 -- |     Storage
 -- |     Verification
+-- |   service_commands:
+-- |     C-ECHO
+-- |     C-FIND
+-- |     C-GET
+-- |     C-MOVE
+-- |     C-STORE
+-- |   modalities:
+-- |     CT
+-- |     MRI
+-- |     Mammography
+-- |     PET
+-- |     PET-CT
+-- |     Ultrasound
+-- |     X-Ray (DX)
 -- |   inferred_device_class: Archive front-end
 -- |   results:
 -- |     accepted:
@@ -58,13 +89,7 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- |       items:
 -- |         Verification - Implicit VR Little Endian
 -- |         CT Image Storage - Explicit VR Little Endian
--- |         MR Image Storage - JPEG 2000 Image Compression (Lossless Only)
--- |     abstract-syntax-not-supported:
--- |       count: 10
--- |       items:
--- |         Modality Worklist Information Model - FIND
--- |         Encapsulated PDF Storage
--- |_    transfer-syntaxes-not-supported:
+-- |_        MR Image Storage - JPEG 2000 Image Compression (Lossless Only)
 --
 -- @output
 -- PORT     STATE SERVICE
@@ -81,6 +106,19 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 --   <elem>QR-Study-Root</elem>
 --   <elem>Storage</elem>
 --   <elem>Verification</elem>
+-- </table>
+-- <table key="service_commands">
+--   <elem>C-ECHO</elem>
+--   <elem>C-FIND</elem>
+--   <elem>C-GET</elem>
+--   <elem>C-MOVE</elem>
+--   <elem>C-STORE</elem>
+-- </table>
+-- <table key="modalities">
+--   <elem>CT</elem>
+--   <elem>MRI</elem>
+--   <elem>PET</elem>
+--   <elem>PET-CT</elem>
 -- </table>
 -- <elem key="inferred_device_class">Archive front-end</elem>
 -- <table key="results">
@@ -124,7 +162,7 @@ local TS_HTJ2K_R = "1.2.840.10008.1.2.4.202"  -- HTJ2K Lossless RPCL
 local TS_HTJ2K   = "1.2.840.10008.1.2.4.203"  -- HTJ2K (Lossy)
 
 -- Storage SOP classes accept the full transfer-syntax matrix. PDU-size
--- sanity: 17 storage PCs × 13 TS sub-items × ~30 bytes/TS ≈ 6.6 KB plus
+-- sanity: 25 storage PCs × 13 TS sub-items × ~30 bytes/TS ≈ 9.8 KB plus
 -- ~2 KB of non-storage PCs and headers — well under the 16 KB max PDU.
 local STORAGE_TS = {
   TS_I, TS_E, TS_EBE, TS_DEFLATE,
@@ -154,6 +192,14 @@ local PC_LIST = {
   {name = "Digital Mammography X-Ray Image Storage - For Presentation", uid = "1.2.840.10008.5.1.4.1.1.1.2",   ts = STORAGE_TS},
   {name = "Digital Mammography X-Ray Image Storage - For Processing",   uid = "1.2.840.10008.5.1.4.1.1.1.2.1", ts = STORAGE_TS},
   {name = "X-Ray Angiographic Image Storage",            uid = "1.2.840.10008.5.1.4.1.1.12.1",        ts = STORAGE_TS},
+  {name = "Enhanced X-Ray Angiographic Image Storage",   uid = "1.2.840.10008.5.1.4.1.1.12.1.1",      ts = STORAGE_TS},
+  {name = "X-Ray Radiofluoroscopic Image Storage",       uid = "1.2.840.10008.5.1.4.1.1.12.2",        ts = STORAGE_TS},
+  {name = "Enhanced X-Ray Radiofluoroscopic Image Storage", uid = "1.2.840.10008.5.1.4.1.1.12.2.1",   ts = STORAGE_TS},
+  {name = "Nuclear Medicine Image Storage",              uid = "1.2.840.10008.5.1.4.1.1.20",          ts = STORAGE_TS},
+  {name = "Positron Emission Tomography Image Storage",  uid = "1.2.840.10008.5.1.4.1.1.128",         ts = STORAGE_TS},
+  {name = "Enhanced PET Image Storage",                  uid = "1.2.840.10008.5.1.4.1.1.130",         ts = STORAGE_TS},
+  {name = "VL Endoscopic Image Storage",                 uid = "1.2.840.10008.5.1.4.1.1.77.1.1",      ts = STORAGE_TS},
+  {name = "Video Endoscopic Image Storage",              uid = "1.2.840.10008.5.1.4.1.1.77.1.1.1",    ts = STORAGE_TS},
   {name = "Secondary Capture Image Storage",             uid = "1.2.840.10008.5.1.4.1.1.7",           ts = STORAGE_TS},
   {name = "Encapsulated PDF Storage",                    uid = "1.2.840.10008.5.1.4.1.1.104.1",       ts = STORAGE_TS},
   {name = "Basic Text SR Storage",                       uid = "1.2.840.10008.5.1.4.1.1.88.11",       ts = STORAGE_TS},
@@ -205,8 +251,10 @@ local function ts_label(uid)
   return dicom.TRANSFER_SYNTAX_NAMES[uid] or uid or "(unknown TS)"
 end
 
--- Order in which to render result buckets in the output table.
-local BUCKET_ORDER = {0, 1, 3, 4, 2}
+-- Per-PC results other than "accepted" are a fingerprint of what the SCP
+-- *doesn't* serve, useful for triage but noisy in normal output. They are
+-- emitted at debug level only; the normal-output table reports "accepted".
+local DEBUG_BUCKET_ORDER = {1, 3, 4, 2}
 
 -- ---------- action ----------
 
@@ -301,14 +349,16 @@ action = function(host, port)
     out.association = "accepted"
   end
 
-  -- Bucket per-PC results and collect accepted service classes.
+  -- Bucket per-PC results and collect accepted service classes / UIDs.
   local buckets = { [0]={}, [1]={}, [2]={}, [3]={}, [4]={}, unknown={} }
   local accepted_services = {}
+  local accepted_uids = {}
   for i, r in ipairs(pc_results) do
     local pc = PC_LIST[i]
     local code = r.result
     if code == 0 then
       table.insert(buckets[0], string.format("%s - %s", pc.name, ts_label(r.accepted_ts)))
+      accepted_uids[#accepted_uids + 1] = r.abstract_syntax
       local svc = dicom.service_class_for_uid(r.abstract_syntax)
       if svc then accepted_services[svc] = true end
     elseif code == 1 or code == 2 or code == 3 or code == 4 then
@@ -326,30 +376,50 @@ action = function(host, port)
     out.service_classes = svc_list
   end
 
+  -- DIMSE service commands implied by the accepted SOP classes
+  -- (C-ECHO from Verification, C-STORE from Storage, C-FIND/MOVE/GET from
+  -- Q/R + Modality Worklist).
+  local cmds = dicom.infer_service_commands(accepted_uids)
+  if #cmds > 0 then
+    out.service_commands = cmds
+  end
+
+  -- Imaging modalities implied by accepted Storage SOP classes (CT, MRI,
+  -- Ultrasound, Mammography, X-Ray, PET, Fluoroscopy, Endoscopy, ...).
+  local modalities = dicom.infer_modalities(accepted_uids)
+  if #modalities > 0 then
+    out.modalities = modalities
+  end
+
   -- Device-class fingerprint (practitioner taxonomy, not normative DICOM).
   local device_class = dicom.infer_device_class(accepted_services)
   if device_class then
     out.inferred_device_class = device_class
   end
 
-  -- Structured results: nested tables with count + items, stable XML keys.
+  -- Structured results in normal output: only the accepted bucket. The
+  -- non-accepted buckets are a fingerprint of what the SCP *doesn't* serve;
+  -- emit them at debug level so normal output stays focused on capabilities.
   local results = stdnse.output_table()
-  for _, code in ipairs(BUCKET_ORDER) do
+  if #buckets[0] > 0 then
+    local sub = stdnse.output_table()
+    sub.count = #buckets[0]
+    sub.items = buckets[0]
+    results[dicom.PC_RESULT_NAMES[0]] = sub
+  end
+  out.results = results
+
+  for _, code in ipairs(DEBUG_BUCKET_ORDER) do
     local items = buckets[code]
     if items and #items > 0 then
-      local sub = stdnse.output_table()
-      sub.count = #items
-      sub.items = items
-      results[dicom.PC_RESULT_NAMES[code]] = sub
+      stdnse.debug1("DICOM: %s (%d): %s",
+        dicom.PC_RESULT_NAMES[code], #items, table.concat(items, ", "))
     end
   end
   if #buckets.unknown > 0 then
-    local sub = stdnse.output_table()
-    sub.count = #buckets.unknown
-    sub.items = buckets.unknown
-    results["unknown-result"] = sub
+    stdnse.debug1("DICOM: unknown-result (%d): %s",
+      #buckets.unknown, table.concat(buckets.unknown, ", "))
   end
-  out.results = results
 
   return out
 end

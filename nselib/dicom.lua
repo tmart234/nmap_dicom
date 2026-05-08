@@ -263,6 +263,7 @@ end
 
 local TOOLKIT_UID_PATTERNS = {
   {"^1%.3%.6%.1%.4%.1%.25403%.",              "ClearCanvas"},
+  {"^1%.3%.6%.1%.4%.1%.30071%.8",             "fo-dicom"},
   {"^1%.2%.826%.0%.1%.3680043%.9%.3811%.",    "pynetdicom"},
   {"^1%.2%.826%.0%.1%.3680043%.8%.641%.",     "Orthanc"},
   {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.",    "OsiriX/Horos"},
@@ -284,19 +285,25 @@ local MANUFACTURER_UID_PATTERNS = {
 
 -- Known toolkit signatures in Implementation Version Name (0x55).
 -- Case-insensitive plain-text match against the cleaned value.
+-- More-specific substrings must come before any prefix that would also match.
 local TOOLKIT_PATTERNS = {
-  {"offis",       "DCMTK"},
-  {"dcmtk",       "DCMTK"},
-  {"mergecom",    "Merge Healthcare SDK"},
-  {"dcm4che",     "dcm4che"},
-  {"pynetdicom",  "pynetdicom"},
-  {"leadtools",   "LeadTools"},
-  {"clearcanvas", "ClearCanvas"},
-  {"orthanc",     "Orthanc"},
-  {"osirix",      "OsiriX"},
-  {"horos",       "Horos"},
-  {"conquest",    "ConQuest"},
-  {"dgate",       "ConQuest"},
+  {"offis",          "DCMTK"},
+  {"dcmtk",          "DCMTK"},
+  {"mergecom",       "Merge Healthcare SDK"},
+  {"dcm4che",        "dcm4che"},
+  {"pynetdicom",     "pynetdicom"},
+  {"leadtools",      "LeadTools"},
+  {"clearcanvas",    "ClearCanvas"},
+  {"orthanc",        "Orthanc"},
+  {"osirix",         "OsiriX"},
+  {"horos",          "Horos"},
+  {"conquest",       "ConQuest"},
+  {"dgate",          "ConQuest"},
+  {"fo-dicom",       "fo-dicom"},
+  {"dicomobjects",   "DICOMObjects"},  -- DicomObjects.NET default
+  {"dcmobj",         "DICOMObjects"},  -- DicomObjects.COM default ("DCMOBJw.x.y.z")
+  {"logipacs",       "LogiPACS"},
+  {"neologica",      "LogiPACS"},
 }
 
 --- Check whether two canonical vendor/toolkit names refer to the same entity.
@@ -635,6 +642,24 @@ function extract_clean_version(version_str, vendor)
 
     maj, min = s:match("ClearCanvas[_-](%d+)%.(%d+)")
     if maj and min then return string.format("%s.%s", maj, min) end
+  end
+
+  -- fo-dicom emits "fo-dicom <Major>.<Minor>.<Build>" per
+  -- FO-DICOM.Core/DicomImplementation.cs (GetImplementationVersion()).
+  if v == "fo-dicom" or s:lower():find("fo-dicom", 1, true) then
+    local sem = s:match("[Ff][Oo]%-[Dd][Ii][Cc][Oo][Mm][%s_/:-]+([%d]+%.%d+%.%d+)")
+             or s:match("[Ff][Oo]%-[Dd][Ii][Cc][Oo][Mm][%s_/:-]+([%d]+%.%d+)")
+    if sem then return sem end
+  end
+
+  -- DicomObjects.COM default Implementation Version Name is "DCMOBJw.x.y.z"
+  -- per Medical Connections KB. The .NET variant emits "DicomObjects.NET"
+  -- with no embedded version, so version stays nil there.
+  if v == "dicomobjects" or s:lower():find("dcmobj", 1, true) then
+    local sem = s:match("[Dd][Cc][Mm][Oo][Bb][Jj][%s_/:-]*(%d+%.%d+%.%d+%.%d+)")
+             or s:match("[Dd][Cc][Mm][Oo][Bb][Jj][%s_/:-]*(%d+%.%d+%.%d+)")
+             or s:match("[Dd][Cc][Mm][Oo][Bb][Jj][%s_/:-]*(%d+%.%d+)")
+    if sem then return sem end
   end
 
   -- Generic fallbacks

@@ -48,6 +48,6 @@ files["nselib/dicom.lua"] = {
     "MAX_PRESENTATION_CONTEXTS", "PRESENTATION_CONTEXT_BLOB_BUDGET",
     "presentation_context_size", "split_presentation_contexts",
     "service_tier", "is_associate_reject", "enumerate_presentation_contexts",
-    "OPERATION_PROBE_CONTEXTS", "probe_operation_aet",
+    "negotiated_role_label", "OPERATION_PROBE_CONTEXTS", "probe_operation_aet",
   },
 }

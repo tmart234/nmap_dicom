@@ -225,6 +225,11 @@ jobs:
           # Sanity-check the new structural fields landed.
           grep -qE '^[|]\s+service_classes:' "$OUT" \
             || { echo "::error::dicom-enum missing service_classes block"; tail -n 200 "$OUT"; exit 1; }
+          # SCP/SCU role selection is on by default: accepted contexts must be
+          # tagged with the acceptor's negotiated role, confirming the 0x54
+          # round-trip did not break association against a real toolkit.
+          grep -qE '\[(SCP|SCU)' "$OUT" \
+            || { echo "::error::dicom-enum accepted contexts missing [SCP]/[SCU] role tag"; tail -n 200 "$OUT"; exit 1; }
 
       - name: Run Nmap dicom-enum full registry (${{ matrix.dicom_server.name }})
         id: test_enum_full

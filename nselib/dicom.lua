@@ -61,6 +61,7 @@ local ITEM_TRANSFER_SYNTAX     = 0x40
 local ITEM_USER_INFORMATION    = 0x50
 local SUBITEM_MAX_PDU          = 0x51
 local SUBITEM_IMPL_CLASS_UID   = 0x52
+local SUBITEM_SCP_SCU_ROLE     = 0x54
 local SUBITEM_IMPL_VERSION     = 0x55
 
 -- ===== Local Helper Functions =====
@@ -94,8 +95,23 @@ end
 local function item_impl_uid(uid)     return ul_item(0x52, uid) end
 local function item_impl_version(ver) return ul_item(0x55, ver) end
 
-local function item_user_information(impl_uid, impl_ver, max_pdu_len)
+-- SCP/SCU Role Selection sub-item (PS3.7 §D.3.3.4 Table D.3-9), carried in the
+-- User Information item. In the A-ASSOCIATE-RQ the two role bytes declare the
+-- roles the *requestor* is willing to play for this SOP Class; setting both to
+-- 1 ("I support SCU and SCP") invites the acceptor to reveal its own role for
+-- the class in its A-ASSOCIATE-AC role sub-item. Body = UID-length(2) + UID +
+-- SCU-role(1) + SCP-role(1).
+local function item_scp_scu_role(uid, scu, scp)
+  local body = string.pack(">I2", #uid) .. uid
+            .. string.pack(">B B", scu and 1 or 0, scp and 1 or 0)
+  return string.pack(">B B I2", SUBITEM_SCP_SCU_ROLE, 0x00, #body) .. body
+end
+
+local function item_user_information(impl_uid, impl_ver, max_pdu_len, role_items)
   local payload = item_max_pdu(max_pdu_len) .. item_impl_uid(impl_uid) .. item_impl_version(impl_ver)
+  if role_items and #role_items > 0 then
+    payload = payload .. table.concat(role_items)
+  end
   return ul_item(0x50, payload)
 end
 
@@ -530,10 +546,11 @@ end
 --     max_pdu      = number_or_nil,
 --     impl_uid     = string_or_nil,        -- 0x52
 --     impl_version = string_or_nil,        -- 0x55
+--     roles        = { [sop_class_uid] = {scu = 0|1, scp = 0|1} },  -- 0x54
 --   }
--- Item structure follows PS3.8 §9.3.3.
+-- Item structure follows PS3.8 §9.3.3; role sub-items follow PS3.7 §D.3.3.4.
 function parse_associate_accept(data)
-  local out = { pc_results = {}, max_pdu = nil, impl_uid = nil, impl_version = nil }
+  local out = { pc_results = {}, max_pdu = nil, impl_uid = nil, impl_version = nil, roles = {} }
   local data_len = #data
   if data_len < AC_VARIABLE_ITEM_OFFSET - 1 then return out end
 
@@ -590,6 +607,19 @@ function parse_associate_accept(data)
         elseif stype == SUBITEM_IMPL_VERSION and slen > 0 then
           local raw = data:sub(svs, sve)
           out.impl_version = (raw:gsub("%z", "")):match("^%s*(.-)%s*$")
+        elseif stype == SUBITEM_SCP_SCU_ROLE and slen >= 4 then
+          -- AC SCP/SCU Role Selection (PS3.7 §D.3.3.4 Table D.3-10): the role
+          -- bytes report which roles the *acceptor* will play for this SOP
+          -- Class. UID-length(2) + UID + SCU-role(1) + SCP-role(1).
+          local uidlen = string.unpack(">I2", data, svs)
+          if 2 + uidlen + 2 <= slen then
+            local uid = data:sub(svs + 2, svs + 1 + uidlen):gsub("%z", ""):match("^%s*(.-)%s*$")
+            local scu = string.byte(data, svs + 2 + uidlen)
+            local scp = string.byte(data, svs + 3 + uidlen)
+            if uid and uid ~= "" then
+              out.roles[uid] = { scu = scu, scp = scp }
+            end
+          end
         end
 
         sub = sub + 4 + slen
@@ -881,9 +911,10 @@ function associate_extended(host, port, calling_aet, called_aet, presentation_co
   local max_pdu_len            = 16384
 
   local application_context  = item_application_context(application_context_name)
-  local userinfo_context     = item_user_information(implementation_id, implementation_version, max_pdu_len)
 
   local pc_blocks = {}
+  local role_items = {}
+  local seen_role_uid = {}
   local index_to_pc_id = {}
   for i, pc in ipairs(presentation_contexts) do
     local pc_id = (i - 1) * 2 + 1 -- odd IDs per PS3.7
@@ -893,8 +924,15 @@ function associate_extended(host, port, calling_aet, called_aet, presentation_co
     end
     index_to_pc_id[i] = pc_id
     pc_blocks[#pc_blocks + 1] = item_presentation_context(pc_id, pc.abstract_syntax, pc.transfer_syntaxes)
+    -- Optional SCP/SCU Role Selection (PS3.7 §D.3.3.4): a context may declare
+    -- the roles the requestor supports. One role sub-item per SOP Class UID.
+    if (pc.scu_role ~= nil or pc.scp_role ~= nil) and not seen_role_uid[pc.abstract_syntax] then
+      seen_role_uid[pc.abstract_syntax] = true
+      role_items[#role_items + 1] = item_scp_scu_role(pc.abstract_syntax, pc.scu_role, pc.scp_role)
+    end
   end
   local presentation_blob = table.concat(pc_blocks)
+  local userinfo_context  = item_user_information(implementation_id, implementation_version, max_pdu_len, role_items)
 
   local fixed = string.pack(">I2 I2 c16 c16 c32",
     0x0001, 0x0000, called_ae_title_val, calling_ae_title_val, string.rep("\0", 32))
@@ -979,6 +1017,9 @@ function associate_extended(host, port, calling_aet, called_aet, presentation_co
       transfer_syntaxes = pc.transfer_syntaxes,
       result            = raw.result,
       accepted_ts       = raw.accepted_ts,
+      -- Acceptor's negotiated roles for this SOP Class (PS3.7 §D.3.3.4), or
+      -- nil if the AC carried no role sub-item (default: acceptor is SCP).
+      roles             = parsed.roles[pc.abstract_syntax],
     }
   end
 
@@ -1085,6 +1126,12 @@ function split_presentation_contexts(pcs, max_pcs)
   local batches, cur, bytes = {}, {}, 0
   for _, pc in ipairs(pcs) do
     local sz = presentation_context_size(pc.abstract_syntax, pc.transfer_syntaxes)
+    -- A context that also carries SCP/SCU role selection adds a 0x54 sub-item
+    -- (~UID + 8 bytes) to the User Information; charge it against the budget so
+    -- the whole RQ stays bounded.
+    if pc.scu_role ~= nil or pc.scp_role ~= nil then
+      sz = sz + #pc.abstract_syntax + 8
+    end
     if #cur > 0 and (#cur >= cap or bytes + sz > PRESENTATION_CONTEXT_BLOB_BUDGET) then
       batches[#batches + 1] = cur
       cur, bytes = {}, 0
@@ -1123,6 +1170,20 @@ function is_associate_reject(err)
 end
 
 ---
+-- Human label for the acceptor's negotiated role on an accepted context
+-- (from the AC SCP/SCU Role Selection sub-item). When the acceptor returned no
+-- role sub-item, the DICOM default applies: the Association-acceptor is the SCP.
+-- Returns "SCP", "SCU", "SCU+SCP", or "none".
+function negotiated_role_label(roles)
+  if not roles then return "SCP" end
+  local parts = {}
+  if roles.scp == 1 then parts[#parts + 1] = "SCP" end
+  if roles.scu == 1 then parts[#parts + 1] = "SCU" end
+  if #parts == 0 then return "none" end
+  return table.concat(parts, "+")
+end
+
+---
 -- Run a (possibly large) list of presentation contexts as one or more
 -- associations, batched to respect protocol limits, merging the per-PC
 -- results. Returns:
@@ -1147,6 +1208,7 @@ function enumerate_presentation_contexts(host, port, calling_aet, called_aet, pc
           abstract_syntax = r.abstract_syntax,
           result          = r.result,
           accepted_ts     = r.accepted_ts,
+          roles           = r.roles,
         }
       end
     else

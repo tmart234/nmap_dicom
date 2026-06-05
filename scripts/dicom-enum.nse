@@ -101,6 +101,12 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 --                            request. Default: 128 (the PS3.8 protocol
 --                            ceiling). Lower it (e.g. =1) for a stack that
 --                            cannot handle multi-context requests.
+-- @args dicom-enum.roles     SCP/SCU Role Selection negotiation (PS3.7
+--                            §D.3.3.4). Default on: each proposed context
+--                            offers both roles so the acceptor reveals whether
+--                            it serves the SOP class as SCU, SCP, or both (both
+--                            columns of the conformance table). Set to "no" to
+--                            propose the default SCU-requestor role only.
 -- @args dicom-enum.isolate   If set, skip the fast combined pass and probe
 --                            each tier (Verification / core / Query-Retrieve)
 --                            in its own association from the start. Use it for
@@ -437,16 +443,28 @@ for _, pc in ipairs(EXTRA_PC_LIST) do
 end
 
 -- Select the proposal as a list of library-shape presentation contexts
--- ({abstract_syntax=, transfer_syntaxes=}). Returns (pcs, count, mode).
+-- ({abstract_syntax=, transfer_syntaxes=}). By default each context also
+-- carries SCP/SCU Role Selection (requestor supports both roles, scu=scp=1) so
+-- the acceptor reveals whether it serves the SOP class as SCU, SCP, or both --
+-- i.e. both columns of the conformance table, not just the SCP column a plain
+-- association exposes. Disable with dicom-enum.roles=no.
+-- Returns (pcs, count, mode, with_roles).
 local function select_proposal()
   local sop = (stdnse.get_script_args("dicom-enum.sop") or "curated"):lower()
   local src = (sop == "full" or sop == "all") and FULL_PC_LIST or CURATED_PC_LIST
   local mode = (sop == "full" or sop == "all") and "full" or "curated"
+  local roles_arg = (stdnse.get_script_args("dicom-enum.roles") or "yes"):lower()
+  local with_roles = not (roles_arg == "no" or roles_arg == "off"
+                          or roles_arg == "0" or roles_arg == "false")
   local pcs = {}
   for i, pc in ipairs(src) do
     pcs[i] = { abstract_syntax = pc.uid, transfer_syntaxes = pc.ts }
+    if with_roles then
+      pcs[i].scu_role = 1
+      pcs[i].scp_role = 1
+    end
   end
-  return pcs, #pcs, mode
+  return pcs, #pcs, mode, with_roles
 end
 
 -- ---------- portrule ----------
@@ -521,7 +539,7 @@ action = function(host, port)
   local calling_aet = stdnse.get_script_args("dicom.calling_aet")
   local max_pcs     = tonumber(stdnse.get_script_args("dicom-enum.max_pcs"))
 
-  local proposal, pc_count, sop_mode = select_proposal()
+  local proposal, pc_count, sop_mode, with_roles = select_proposal()
   -- Skip the fast combined pass and go straight to per-tier isolation when
   -- the operator already knows the device is hostile to mixed requests.
   local force_isolate = stdnse.get_script_args("dicom-enum.isolate") ~= nil
@@ -684,11 +702,23 @@ action = function(host, port)
   local buckets = { [0]={}, [1]={}, [2]={}, [3]={}, [4]={}, unknown={} }
   local accepted_services = {}
   local accepted_uids = {}
+  local scu_classes = {}   -- SOP classes the acceptor will serve as SCU
   for _, r in ipairs(merged) do
     local code = r.result
     local name = NAME_BY_UID[r.abstract_syntax] or r.abstract_syntax
     if code == 0 then
-      table.insert(buckets[0], string.format("%s - %s", name, ts_label(r.accepted_ts)))
+      -- Annotate each accepted context with the acceptor's negotiated role
+      -- (SCP by DICOM default; SCU/SCU+SCP when the AC role sub-item says so).
+      if with_roles then
+        local role = dicom.negotiated_role_label(r.roles)
+        table.insert(buckets[0], string.format("%s [%s] - %s", name, role, ts_label(r.accepted_ts)))
+        if r.roles and r.roles.scu == 1 then
+          scu_classes[#scu_classes + 1] = string.format("%s (%s)", name,
+            (r.roles.scp == 1) and "SCU+SCP" or "SCU only")
+        end
+      else
+        table.insert(buckets[0], string.format("%s - %s", name, ts_label(r.accepted_ts)))
+      end
       accepted_uids[#accepted_uids + 1] = r.abstract_syntax
       local svc = dicom.service_class_for_uid(r.abstract_syntax)
       if svc then accepted_services[svc] = true end
@@ -699,12 +729,22 @@ action = function(host, port)
     end
   end
 
-  -- Service-class summary (sorted for stable output).
+  -- Service-class summary (sorted for stable output). With role selection on,
+  -- "accepted" contexts are by default the acceptor's SCP roles (Provider
+  -- column of the conformance table).
   local svc_list = {}
   for s in pairs(accepted_services) do svc_list[#svc_list + 1] = s end
   table.sort(svc_list)
   if #svc_list > 0 then
     out.service_classes = svc_list
+  end
+
+  -- The SCU column: SOP classes the acceptor declared it will serve as SCU
+  -- (via the AC SCP/SCU Role Selection sub-item). This is the role a plain
+  -- association never reveals -- e.g. a device that is the *User* of Q/R.
+  if #scu_classes > 0 then
+    table.sort(scu_classes)
+    out.scu_roles = scu_classes
   end
 
   -- DIMSE service commands implied by the accepted SOP classes

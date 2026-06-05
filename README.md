@@ -58,6 +58,26 @@ A whole-association **A-ASSOCIATE-RJ** (AET allowlist, application-context, prot
 nmap -p 4242 --script dicom-enum --script-args dicom-enum.sop=full <target>
 ```
 
+### SCU vs SCP roles (both columns of the conformance table)
+
+Every SOP class has two independent roles — **SCU** (User) and **SCP** (Provider) — and a plain association only tests the SCP side, because DICOM defaults the requestor to SCU and the acceptor to SCP. A device that is the Q/R *User* (it queries other nodes) has an empty SCP column for Q/R, so a default scan sees nothing there.
+
+`dicom-enum` negotiates **SCP/SCU Role Selection** (PS3.7 §D.3.3.4) by default: each proposed context carries a `0x54` role sub-item offering both roles, and the acceptor's reply reveals whether it serves each SOP class as SCU, SCP, or both. Accepted contexts are tagged with the negotiated role, and any class the device serves as **SCU** (the column a plain scan can't see) is summarized under `scu_roles`:
+
+```
+|   service_classes:        (SCP / Provider column)
+|     Storage
+|     Verification
+|   scu_roles:              (SCU / User column — only visible via role selection)
+|     Patient Root Query/Retrieve - FIND (SCU only)
+|   results:
+|     accepted:
+|       items:
+|_        CT Image Storage [SCP] - Explicit VR Little Endian
+```
+
+Caveats: role selection only reveals what the device's *acceptor* side declares — a device must implement role-reversal negotiation for its SCU capabilities to show up, and if the AC carries no role sub-item the DICOM default (acceptor = SCP) is assumed. Disable with `dicom-enum.roles=no` if a device misbehaves on the `0x54` sub-item.
+
 ### Adaptive tier isolation (non-conformant devices)
 
 Some real devices negotiate badly:

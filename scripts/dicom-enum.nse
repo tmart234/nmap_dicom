@@ -421,59 +421,32 @@ local EXTRA_PC_LIST = {
 
 -- ---------- SOP-class coverage selection ----------
 
--- Build the full list once (curated + extras), preserving order.
+-- Build the full list once (curated + extras), preserving order, and a
+-- UID -> friendly-name map for rendering results back from the wire (where
+-- only the abstract syntax UID is echoed). Batching, tiering and the batched
+-- enumerate live in nselib/dicom.lua so the protocol limits are in one place.
 local FULL_PC_LIST = {}
-for _, pc in ipairs(CURATED_PC_LIST) do FULL_PC_LIST[#FULL_PC_LIST + 1] = pc end
-for _, pc in ipairs(EXTRA_PC_LIST)   do FULL_PC_LIST[#FULL_PC_LIST + 1] = pc end
-
--- PS3.8 §9.3.2.2: presentation context IDs are a single odd octet (1..255),
--- so at most 128 contexts per A-ASSOCIATE-RQ.
-local PROTOCOL_MAX_PCS = 128
-
--- Conservative byte budget for the presentation-context blob in one
--- A-ASSOCIATE-RQ. The fixed preamble + application context + user info add
--- ~170 bytes, so this keeps the whole request comfortably under the 16 KB
--- that even cautious/embedded stacks accept.
-local PC_BLOB_BUDGET = 14000
-
--- Estimate the on-the-wire size of one presentation-context item, mirroring
--- item_presentation_context() in nselib/dicom.lua: a 0x20 item (4-byte
--- header) wrapping a 4-byte PC header, the abstract-syntax sub-item
--- (4 + UID), and one transfer-syntax sub-item (4 + UID) per TS.
-local function pc_wire_size(pc)
-  local n = 8 + 4 + #pc.uid
-  for _, ts in ipairs(pc.ts) do
-    n = n + 4 + #ts
-  end
-  return n
+local NAME_BY_UID  = {}
+for _, pc in ipairs(CURATED_PC_LIST) do
+  FULL_PC_LIST[#FULL_PC_LIST + 1] = pc
+  NAME_BY_UID[pc.uid] = pc.name
+end
+for _, pc in ipairs(EXTRA_PC_LIST) do
+  FULL_PC_LIST[#FULL_PC_LIST + 1] = pc
+  NAME_BY_UID[pc.uid] = pc.name
 end
 
--- Greedily split a PC list into batches that respect both the 128-context
--- ceiling and the byte budget. A single context that exceeds the budget on
--- its own still goes out alone rather than being dropped.
-local function build_batches(pc_list, max_pcs)
-  local cap = math.min(max_pcs or PROTOCOL_MAX_PCS, PROTOCOL_MAX_PCS)
-  if cap < 1 then cap = 1 end
-  local batches, cur, cur_bytes = {}, {}, 0
-  for _, pc in ipairs(pc_list) do
-    local sz = pc_wire_size(pc)
-    if #cur > 0 and (#cur >= cap or cur_bytes + sz > PC_BLOB_BUDGET) then
-      batches[#batches + 1] = cur
-      cur, cur_bytes = {}, 0
-    end
-    cur[#cur + 1] = pc
-    cur_bytes = cur_bytes + sz
-  end
-  if #cur > 0 then batches[#batches + 1] = cur end
-  return batches
-end
-
-local function select_pc_list()
+-- Select the proposal as a list of library-shape presentation contexts
+-- ({abstract_syntax=, transfer_syntaxes=}). Returns (pcs, count, mode).
+local function select_proposal()
   local sop = (stdnse.get_script_args("dicom-enum.sop") or "curated"):lower()
-  if sop == "full" or sop == "all" then
-    return FULL_PC_LIST, "full"
+  local src = (sop == "full" or sop == "all") and FULL_PC_LIST or CURATED_PC_LIST
+  local mode = (sop == "full" or sop == "all") and "full" or "curated"
+  local pcs = {}
+  for i, pc in ipairs(src) do
+    pcs[i] = { abstract_syntax = pc.uid, transfer_syntaxes = pc.ts }
   end
-  return CURATED_PC_LIST, "curated"
+  return pcs, #pcs, mode
 end
 
 -- ---------- portrule ----------
@@ -539,65 +512,6 @@ local function report_reject(out, err)
   end
 end
 
--- Classify a PC into an isolation tier. Some non-conformant SCPs drop or
--- abort the *entire* association merely because a Query/Retrieve abstract
--- syntax is present in the A-ASSOCIATE-RQ (a real, observed device class),
--- and some enforce the AET allowlist on Storage/operations while leaving
--- Verification open. Isolating these tiers keeps one hostile group from
--- poisoning the rest of the scan.
---   verification   - C-ECHO; mandatory for any acceptor, usually the most
---                    permissive context (often no AET enforcement).
---   query-retrieve - the Q/R Service Class information models
---                    (1.2.840.10008.5.1.4.1.2.*: patient/study/patient-study
---                    root + composite instance root + without-bulk).
---   core           - everything else (Storage, Worklist, MPPS, StgCmt, Print).
-local QR_UID_PREFIX = "1.2.840.10008.5.1.4.1.2."
-local function pc_tier(pc)
-  if pc.uid == "1.2.840.10008.1.1" then return "verification" end
-  if pc.uid:sub(1, #QR_UID_PREFIX) == QR_UID_PREFIX then return "query-retrieve" end
-  return "core"
-end
-
--- Size-batch a list of PC entries and run each batch as its own association,
--- merging the per-PC results. Returns a table:
---   { merged = {...}, info = AC-user-info-or-nil, ok = N_accepted_assocs,
---     assoc = N_assocs_attempted, failures = { {err=, entries={...}}, ... } }
--- A whole-association failure (RJ / abort / drop / timeout) yields a failures
--- entry carrying that batch's PC entries, so the caller can re-probe them in
--- isolation.
-local function associate_group(host, port, calling_aet, called_aet, entries, max_pcs)
-  local out = { merged = {}, info = nil, ok = 0, assoc = 0, failures = {} }
-  for _, batch in ipairs(build_batches(entries, max_pcs)) do
-    local pcs = {}
-    for i, pc in ipairs(batch) do
-      pcs[i] = { abstract_syntax = pc.uid, transfer_syntaxes = pc.ts }
-    end
-    out.assoc = out.assoc + 1
-    local ok, err, pc_results, binfo =
-      dicom.associate_extended(host, port, calling_aet, called_aet, pcs)
-    if ok then
-      out.ok   = out.ok + 1
-      out.info = out.info or binfo
-      for i, r in ipairs(pc_results) do
-        out.merged[#out.merged + 1] = {
-          name            = batch[i].name,
-          result          = r.result,
-          accepted_ts     = r.accepted_ts,
-          abstract_syntax = r.abstract_syntax,
-        }
-      end
-    else
-      out.failures[#out.failures + 1] = { err = err, entries = batch }
-    end
-  end
-  return out
-end
-
--- Is this failure a clean A-ASSOCIATE-RJ (vs. a drop / abort / timeout)?
-local function is_reject(err)
-  return type(err) == "table" and err.err == "ASSOCIATE REJECT received"
-end
-
 -- ---------- action ----------
 
 action = function(host, port)
@@ -607,12 +521,12 @@ action = function(host, port)
   local calling_aet = stdnse.get_script_args("dicom.calling_aet")
   local max_pcs     = tonumber(stdnse.get_script_args("dicom-enum.max_pcs"))
 
-  local pc_list, sop_mode = select_pc_list()
+  local proposal, pc_count, sop_mode = select_proposal()
   -- Skip the fast combined pass and go straight to per-tier isolation when
   -- the operator already knows the device is hostile to mixed requests.
   local force_isolate = stdnse.get_script_args("dicom-enum.isolate") ~= nil
 
-  local merged       = {}    -- list of {name, result, accepted_ts, abstract_syntax}
+  local merged       = {}    -- list of {abstract_syntax, result, accepted_ts}
   local info         = nil   -- first AC PDU's user-info (max_pdu / impl_*)
   local ok_assocs    = 0
   local assoc_total  = 0
@@ -621,27 +535,29 @@ action = function(host, port)
   local tier_failed  = {}    -- [tier] = "rejects" | "drops"
   local isolated     = false -- did we fall back to per-tier isolation?
 
-  local function absorb(group)
-    assoc_total = assoc_total + group.assoc
-    ok_assocs   = ok_assocs + group.ok
-    info        = info or group.info
-    for _, m in ipairs(group.merged) do merged[#merged + 1] = m end
+  local function absorb(acc)
+    assoc_total = assoc_total + acc.assoc
+    ok_assocs   = ok_assocs + acc.ok
+    info        = info or acc.info
+    for _, r in ipairs(acc.results) do merged[#merged + 1] = r end
   end
 
-  -- Pass 1 (fast path): propose the whole list, size-batched. Normal SCPs
-  -- accept this in one association ("curated") or a few ("full"). The
-  -- contexts in any batch that fails wholesale are queued for isolation.
+  -- Pass 1 (fast path): propose the whole list, batched to protocol limits by
+  -- the library. Normal SCPs accept this in one association ("curated") or a
+  -- few ("full"). The contexts in any batch that fails wholesale are queued
+  -- for isolation.
   local to_isolate = {}
   if force_isolate then
     isolated = true
-    for _, pc in ipairs(pc_list) do to_isolate[#to_isolate + 1] = pc end
+    to_isolate = proposal
   else
-    local g1 = associate_group(host, port, calling_aet, called_aet, pc_list, max_pcs)
+    local g1 = dicom.enumerate_presentation_contexts(
+      host, port, calling_aet, called_aet, proposal, max_pcs)
     absorb(g1)
     for _, f in ipairs(g1.failures) do
-      if is_reject(f.err) then first_reject = first_reject or f.err
+      if dicom.is_associate_reject(f.err) then first_reject = first_reject or f.err
       else first_error = first_error or f.err end
-      for _, pc in ipairs(f.entries) do to_isolate[#to_isolate + 1] = pc end
+      for _, c in ipairs(f.contexts) do to_isolate[#to_isolate + 1] = c end
     end
   end
 
@@ -660,18 +576,19 @@ action = function(host, port)
     }
     local by_name = {}
     for _, t in ipairs(tiers) do by_name[t.name] = t.list end
-    for _, pc in ipairs(to_isolate) do
-      local bucket = by_name[pc_tier(pc)]
-      bucket[#bucket + 1] = pc
+    for _, c in ipairs(to_isolate) do
+      local bucket = by_name[dicom.service_tier(c.abstract_syntax)]
+      bucket[#bucket + 1] = c
     end
     for _, t in ipairs(tiers) do
       if #t.list > 0 then
-        local g = associate_group(host, port, calling_aet, called_aet, t.list, max_pcs)
+        local g = dicom.enumerate_presentation_contexts(
+          host, port, calling_aet, called_aet, t.list, max_pcs)
         absorb(g)
         if #g.failures > 0 then
           local rep = g.failures[1].err
-          tier_failed[t.name] = is_reject(rep) and "rejects" or "drops"
-          if is_reject(rep) then first_reject = first_reject or rep
+          tier_failed[t.name] = dicom.is_associate_reject(rep) and "rejects" or "drops"
+          if dicom.is_associate_reject(rep) then first_reject = first_reject or rep
           else first_error = first_error or rep end
         end
       end
@@ -736,7 +653,7 @@ action = function(host, port)
   -- output is self-describing about how thorough the scan was.
   if sop_mode == "full" or assoc_total > 1 then
     out.scan = string.format("%s coverage: %d SOP classes across %d association(s)%s",
-      sop_mode, #pc_list, assoc_total,
+      sop_mode, pc_count, assoc_total,
       isolated and "; isolated failing groups by tier" or "")
   end
 
@@ -769,15 +686,16 @@ action = function(host, port)
   local accepted_uids = {}
   for _, r in ipairs(merged) do
     local code = r.result
+    local name = NAME_BY_UID[r.abstract_syntax] or r.abstract_syntax
     if code == 0 then
-      table.insert(buckets[0], string.format("%s - %s", r.name, ts_label(r.accepted_ts)))
+      table.insert(buckets[0], string.format("%s - %s", name, ts_label(r.accepted_ts)))
       accepted_uids[#accepted_uids + 1] = r.abstract_syntax
       local svc = dicom.service_class_for_uid(r.abstract_syntax)
       if svc then accepted_services[svc] = true end
     elseif code == 1 or code == 2 or code == 3 or code == 4 then
-      table.insert(buckets[code], r.name)
+      table.insert(buckets[code], name)
     else
-      table.insert(buckets.unknown, r.name)
+      table.insert(buckets.unknown, name)
     end
   end
 

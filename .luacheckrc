@@ -45,5 +45,9 @@ files["nselib/dicom.lua"] = {
     "identify_vendor_from_uid", "identify_toolkit", "extract_clean_version",
     "resolve_vendor_info", "associate_extended", "associate",
     "send_pdata", "extract_uid_root",
+    "MAX_PRESENTATION_CONTEXTS", "PRESENTATION_CONTEXT_BLOB_BUDGET",
+    "presentation_context_size", "split_presentation_contexts",
+    "service_tier", "is_associate_reject", "enumerate_presentation_contexts",
+    "OPERATION_PROBE_CONTEXTS", "probe_operation_aet",
   },
 }

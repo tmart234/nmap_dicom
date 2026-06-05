@@ -1043,4 +1043,172 @@ function extract_uid_root(uid)
   return trimmed:match("^([%d%.]+)%.[^%.]+$") or trimmed
 end
 
+-- ============================================================
+-- Presentation-context batching, tiering, and capability probing.
+-- These are protocol-level helpers shared by the NSE scripts so the
+-- limits (PS3.8) and the Q/R/Verification taxonomy live in one place.
+-- ============================================================
+
+-- Max presentation contexts per A-ASSOCIATE-RQ. PS3.8 §9.3.2.2: PC IDs are
+-- odd octets (1..255) -> 128 contexts.
+MAX_PRESENTATION_CONTEXTS = 128
+
+-- Conservative byte budget for the presentation-context blob in one
+-- A-ASSOCIATE-RQ. The fixed preamble + application context + user info add
+-- ~170 bytes, so this keeps the whole request comfortably under the 16 KB
+-- that even cautious/embedded stacks accept.
+PRESENTATION_CONTEXT_BLOB_BUDGET = 14000
+
+---
+-- On-the-wire size of one presentation-context item, mirroring
+-- item_presentation_context(): a 0x20 item (4-byte header) wrapping a 4-byte
+-- PC header, the abstract-syntax sub-item (4 + UID), and one transfer-syntax
+-- sub-item (4 + UID) per TS. Accepts a single TS string or a list.
+function presentation_context_size(abstract_uid, transfer_syntaxes)
+  local n = 8 + 4 + #abstract_uid
+  if type(transfer_syntaxes) == "string" then
+    n = n + 4 + #transfer_syntaxes
+  else
+    for _, ts in ipairs(transfer_syntaxes) do n = n + 4 + #ts end
+  end
+  return n
+end
+
+---
+-- Split a list of presentation contexts ({abstract_syntax=, transfer_syntaxes=})
+-- into batches that respect both the 128-context ceiling and the byte budget.
+-- A single context that exceeds the budget alone still goes out by itself.
+-- @param max_pcs optional per-association cap (clamped to MAX_PRESENTATION_CONTEXTS).
+function split_presentation_contexts(pcs, max_pcs)
+  local cap = math.min(max_pcs or MAX_PRESENTATION_CONTEXTS, MAX_PRESENTATION_CONTEXTS)
+  if cap < 1 then cap = 1 end
+  local batches, cur, bytes = {}, {}, 0
+  for _, pc in ipairs(pcs) do
+    local sz = presentation_context_size(pc.abstract_syntax, pc.transfer_syntaxes)
+    if #cur > 0 and (#cur >= cap or bytes + sz > PRESENTATION_CONTEXT_BLOB_BUDGET) then
+      batches[#batches + 1] = cur
+      cur, bytes = {}, 0
+    end
+    cur[#cur + 1] = pc
+    bytes = bytes + sz
+  end
+  if #cur > 0 then batches[#batches + 1] = cur end
+  return batches
+end
+
+---
+-- Classify an abstract syntax UID into a negotiation "tier" for isolation
+-- probing. Some non-conformant SCPs drop/abort the whole association merely
+-- because a Query/Retrieve abstract syntax is present (contrary to PS3.8
+-- §9.3.3.2), and some gate Storage/operations on the AET allowlist while
+-- leaving Verification open. Isolating tiers keeps one hostile group from
+-- hiding the others.
+--   "verification"   - C-ECHO (1.2.840.10008.1.1).
+--   "query-retrieve" - Q/R Service Class info models (...5.1.4.1.2.*).
+--   "core"           - everything else (Storage, Worklist, MPPS, StgCmt, Print).
+function service_tier(uid)
+  if not uid then return "core" end
+  if uid == "1.2.840.10008.1.1" then return "verification" end
+  if uid:sub(1, #"1.2.840.10008.5.1.4.1.2.") == "1.2.840.10008.5.1.4.1.2." then
+    return "query-retrieve"
+  end
+  return "core"
+end
+
+---
+-- Did associate_extended return a clean A-ASSOCIATE-RJ (vs. a drop/abort/
+-- timeout/socket error, which come back as a string)?
+function is_associate_reject(err)
+  return type(err) == "table" and err.err == "ASSOCIATE REJECT received"
+end
+
+---
+-- Run a (possibly large) list of presentation contexts as one or more
+-- associations, batched to respect protocol limits, merging the per-PC
+-- results. Returns:
+--   { results  = { {abstract_syntax, result, accepted_ts}, ... },
+--     info     = first AC user-info (max_pdu/impl_*) or nil,
+--     ok       = number of accepted associations,
+--     assoc    = number of associations attempted,
+--     failures = { {err=, contexts={...lib-shape pcs...}}, ... } }
+-- A wholesale association failure yields a failures entry carrying that
+-- batch's contexts, so the caller can re-probe them in isolation.
+function enumerate_presentation_contexts(host, port, calling_aet, called_aet, pcs, max_pcs)
+  local acc = { results = {}, info = nil, ok = 0, assoc = 0, failures = {} }
+  for _, batch in ipairs(split_presentation_contexts(pcs, max_pcs)) do
+    acc.assoc = acc.assoc + 1
+    local ok, err, pcres, info =
+      associate_extended(host, port, calling_aet, called_aet, batch)
+    if ok then
+      acc.ok   = acc.ok + 1
+      acc.info = acc.info or info
+      for _, r in ipairs(pcres) do
+        acc.results[#acc.results + 1] = {
+          abstract_syntax = r.abstract_syntax,
+          result          = r.result,
+          accepted_ts     = r.accepted_ts,
+        }
+      end
+    else
+      acc.failures[#acc.failures + 1] = { err = err, contexts = batch }
+    end
+  end
+  return acc
+end
+
+-- Representative "operation" abstract syntaxes (several common Storage classes
+-- + Modality Worklist) used to test whether association-level gating (e.g. an
+-- AET allowlist) applies to real operations as opposed to Verification.
+-- Multiple classes so the probe is not hostage to one SOP class the SCP
+-- happens not to support. Query/Retrieve is deliberately excluded so a Q/R-
+-- hostile device's drop does not confound the AET signal.
+OPERATION_PROBE_CONTEXTS = {
+  "1.2.840.10008.5.1.4.1.1.2",     -- CT Image Storage
+  "1.2.840.10008.5.1.4.1.1.4",     -- MR Image Storage
+  "1.2.840.10008.5.1.4.1.1.7",     -- Secondary Capture Image Storage
+  "1.2.840.10008.5.1.4.1.1.1.1",   -- Digital X-Ray Image Storage (For Presentation)
+  "1.2.840.10008.5.1.4.31",        -- Modality Worklist - FIND
+}
+
+---
+-- Probe whether association-level gating applies to operations as opposed to
+-- Verification, by proposing the representative operation contexts above in a
+-- single association.
+--
+-- IMPORTANT: this can only observe gating that happens at the *association*
+-- layer. A device that accepts any association but enforces the AET (or other
+-- authorization) at the *DIMSE operation* layer cannot be distinguished from a
+-- genuinely open one without actually issuing a C-STORE/C-FIND (which has side
+-- effects). So an accepted probe is reported as "open at the association layer",
+-- not "definitely open".
+--
+-- Returns { verdict, ok, reject, err } where verdict is:
+--   "open"      association accepted (no association-layer gating; DIMSE layer
+--               NOT tested)
+--   "aet-gated" A-ASSOCIATE-RJ citing called/calling AET (definitive: AET is
+--               enforced on operations)
+--   "rejected"  A-ASSOCIATE-RJ for some other reason
+--   "dropped"   no clean response (abort/timeout/RST) -- operations likely
+--               gated, but unconfirmed
+function probe_operation_aet(host, port, calling_aet, called_aet)
+  local pcs = {}
+  for i, uid in ipairs(OPERATION_PROBE_CONTEXTS) do
+    pcs[i] = {
+      abstract_syntax   = uid,
+      transfer_syntaxes = { "1.2.840.10008.1.2", "1.2.840.10008.1.2.1" },
+    }
+  end
+  local ok, err = associate_extended(host, port, calling_aet, called_aet, pcs)
+  if ok then
+    return { verdict = "open", ok = true }
+  end
+  if is_associate_reject(err) then
+    if err.source == 1 and (err.reason == 7 or err.reason == 3) then
+      return { verdict = "aet-gated", ok = false, reject = err }
+    end
+    return { verdict = "rejected", ok = false, reject = err }
+  end
+  return { verdict = "dropped", ok = false, err = err }
+end
+
 return _ENV

@@ -197,27 +197,28 @@ action = function(host, port)
     out.config = "Any AET is accepted (Insecure)"
     -- A permissive C-ECHO only proves Verification is ungated. Optionally
     -- confirm whether real operations are gated by associating once more with
-    -- a Storage presentation context (CT Image Storage). If that association
-    -- is rejected/dropped where C-ECHO was accepted, the "open" verdict above
-    -- is misleading: AET is enforced on operations but not on Verification.
+    -- several representative operation contexts (Storage + Modality Worklist;
+    -- see dicom.OPERATION_PROBE_CONTEXTS). Only an A-ASSOCIATE-RJ citing the
+    -- AET is a definitive "operations are gated" signal; an accept proves only
+    -- that gating is not applied at the association layer (DIMSE-layer
+    -- authorization cannot be tested without issuing a real C-STORE/C-FIND).
     if check_ops then
-      local ops_pcs = {{
-        abstract_syntax   = "1.2.840.10008.5.1.4.1.1.2", -- CT Image Storage
-        transfer_syntaxes = { "1.2.840.10008.1.2", "1.2.840.10008.1.2.1" },
-      }}
-      local ops_ok, ops_err = dicom.associate_extended(host, port, nil, called_aet, ops_pcs)
-      if ops_ok then
-        out.config       = "Any AET accepted on C-ECHO and Storage operations (Insecure)"
-        out.aet_scope    = "operations not gated"
-      elseif type(ops_err) == "table" and ops_err.err == "ASSOCIATE REJECT received" then
+      local p = dicom.probe_operation_aet(host, port, nil, called_aet)
+      if p.verdict == "aet-gated" then
         out.config    = "Any AET accepted on C-ECHO only; operations enforce AET"
-        out.aet_scope = string.format("Storage association rejected: %s / %s / %s",
-          ops_err.result_text or "?", ops_err.source_text or "?", ops_err.reason_text or "?")
+        out.aet_scope = string.format("Operation association rejected: %s / %s / %s",
+          p.reject.result_text or "?", p.reject.source_text or "?", p.reject.reason_text or "?")
         out.aet_note  = "AET enforced on operations but NOT on C-ECHO — a ping-only 'open' verdict is misleading"
-      else
-        out.config    = "Any AET accepted on C-ECHO; Storage association failed (operations likely gated)"
-        out.aet_scope = type(ops_err) == "table" and (ops_err.err or "error") or tostring(ops_err or "unknown")
-        out.aet_note  = "AET enforcement on operations could not be confirmed (no clean A-ASSOCIATE-RJ)"
+      elseif p.verdict == "rejected" then
+        out.config    = "C-ECHO open; operation association rejected (operations gated)"
+        out.aet_scope = string.format("%s / %s / %s",
+          p.reject.result_text or "?", p.reject.source_text or "?", p.reject.reason_text or "?")
+      elseif p.verdict == "dropped" then
+        out.config    = "C-ECHO open; operation association dropped (operations likely gated, unconfirmed)"
+        out.aet_scope = tostring(p.err or "no response")
+      else -- "open"
+        out.config    = "Any AET accepted for C-ECHO and operations at association layer (Insecure)"
+        out.aet_note  = "DIMSE-layer authorization is not tested — only association negotiation"
       end
     end
   else

@@ -27,16 +27,19 @@ The library hooks into Nmap's port.version.service_tunnel property to automatica
 
 A lightweight liveness + AET-enforcement check (one association). It reports `Called AET check enabled` when the association is rejected, or `Any AET is accepted (Insecure)` when an unauthenticated C-ECHO succeeds.
 
-Caveat: a permissive C-ECHO only proves *Verification* is ungated — some devices skip the AET allowlist on C-ECHO but enforce it on real operations, so the bare "Insecure" verdict can be a false positive. Pass `dicom-ping.check_operations` to follow an open C-ECHO with one Storage association and report whether operations are actually gated:
+Caveat: a permissive C-ECHO only proves *Verification* is ungated — some devices skip the AET allowlist on C-ECHO but enforce it on real operations, so the bare "Insecure" verdict can be a false positive. Pass `dicom-ping.check_operations` to follow an open C-ECHO with one more association proposing **several representative operation contexts** (multiple Storage classes + Modality Worklist — `dicom.OPERATION_PROBE_CONTEXTS`, deliberately *not* a single SOP class and *not* Q/R) and report whether operations are gated:
 
 ```
 nmap -p 4242 --script dicom-ping --script-args dicom-ping.check_operations <target>
 ```
 
-- operations also open → `Any AET accepted on C-ECHO and Storage operations (Insecure)`
-- operations gated → `Any AET accepted on C-ECHO only; operations enforce AET` (+ a note that a ping-only verdict is misleading)
+- A-ASSOCIATE-RJ citing the AET → `Any AET accepted on C-ECHO only; operations enforce AET` (definitive; + a note that a ping-only verdict is misleading)
+- rejected for another reason / dropped → operations gated / likely gated (unconfirmed)
+- accepted → `Any AET accepted for C-ECHO and operations at association layer (Insecure)`
 
-This is off by default so plain ping stays a single quiet association; `dicom-enum` reveals the same asymmetry as part of its tiered capability scan.
+Honest limit: this only observes gating at the **association** layer. A device that accepts any association but enforces authorization at the **DIMSE operation** layer (when the actual C-STORE/C-FIND runs) cannot be told apart from a genuinely open one without issuing a real operation (side effects) — so an accepted probe says "open at the association layer", not "definitely open". Off by default so plain ping stays a single quiet association; `dicom-enum` reveals the same asymmetry as part of its tiered capability scan.
+
+All of this negotiation logic — context batching (PS3.8 limits), tier classification, the batched enumerate, and the operations probe — lives in `nselib/dicom.lua` (`split_presentation_contexts`, `service_tier`, `enumerate_presentation_contexts`, `probe_operation_aet`, …) so both scripts share one implementation.
 
 ## dicom-enum
 

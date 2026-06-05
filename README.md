@@ -23,6 +23,21 @@ The library hooks into Nmap's port.version.service_tunnel property to automatica
 - conquest,
 - Orthanc with DICOM TLS (stunnel)
 
+## dicom-ping
+
+A lightweight liveness + AET-enforcement check (one association). It reports `Called AET check enabled` when the association is rejected, or `Any AET is accepted (Insecure)` when an unauthenticated C-ECHO succeeds.
+
+Caveat: a permissive C-ECHO only proves *Verification* is ungated — some devices skip the AET allowlist on C-ECHO but enforce it on real operations, so the bare "Insecure" verdict can be a false positive. Pass `dicom-ping.check_operations` to follow an open C-ECHO with one Storage association and report whether operations are actually gated:
+
+```
+nmap -p 4242 --script dicom-ping --script-args dicom-ping.check_operations <target>
+```
+
+- operations also open → `Any AET accepted on C-ECHO and Storage operations (Insecure)`
+- operations gated → `Any AET accepted on C-ECHO only; operations enforce AET` (+ a note that a ping-only verdict is misleading)
+
+This is off by default so plain ping stays a single quiet association; `dicom-enum` reveals the same asymmetry as part of its tiered capability scan.
+
 ## dicom-enum
 
 `dicom-enum.nse` proposes a set of presentation contexts (Verification, the major Storage SOP classes, Modality Worklist FIND, Patient/Study Root Q/R, Storage Commitment, MPPS, and Print) in one or more A-ASSOCIATE requests and parses the per-PC result map returned in the A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2). Each PC is reported as `accepted`, `user-rejection`, `no-reason`, `abstract-syntax-not-supported`, or `transfer-syntaxes-not-supported`. Storage SOP classes propose the full transfer-syntax matrix (Implicit/Explicit VR, Deflate, JPEG Baseline/Lossless, JPEG-LS, JPEG2000 lossless+lossy, RLE, HTJ2K). Accepted abstract syntaxes are mapped to DICOM service classes and an `inferred_device_class` line (PACS/VNA, Modality, RIS gateway, Archive front-end, Print server) is rendered. Output shape mirrors `ssh2-enum-algos`. Categories are `discovery, safe` (not `default`) — same call the maintainers made for `ssh2-enum-algos`.

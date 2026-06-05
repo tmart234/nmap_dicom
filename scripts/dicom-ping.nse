@@ -29,6 +29,7 @@ way of detecting DICOM servers.
 -- @usage nmap --script dicom-ping --script-args dicom-ping.ports=11114,11115 <target>
 -- @usage nmap -v --script dicom-ping <target>
 -- @usage nmap --script dicom-ping --script-args dicom-ping.extended <target>
+-- @usage nmap --script dicom-ping --script-args dicom-ping.check_operations <target>
 --
 -- @args dicom.called_aet       Called Application Entity Title. Default: ANY-SCP
 -- @args dicom-ping.ports       Optional comma-separated list of ports to probe
@@ -39,6 +40,12 @@ way of detecting DICOM servers.
 --                              (implementation class UID and implementation
 --                              version name) from the A-ASSOCIATE-AC. This behaves
 --                              identically to running Nmap with verbosity (-v).
+-- @args dicom-ping.check_operations  If set, and a C-ECHO association is accepted
+--                              with any AET, perform one additional association
+--                              proposing a Storage (operation) presentation
+--                              context to test whether the AET allowlist is
+--                              enforced on operations but not on C-ECHO. Off by
+--                              default (plain ping stays a single association).
 --
 -- @output
 -- PORT     STATE SERVICE REASON
@@ -133,6 +140,12 @@ action = function(host, port)
 
   local called_aet = stdnse.get_script_args("dicom.called_aet")
   local extended   = stdnse.get_script_args("dicom-ping.extended") ~= nil
+  -- Opt-in: a permissive C-ECHO does not prove the node is open, because some
+  -- devices skip the AET allowlist on Verification but enforce it on real
+  -- operations. When set, follow an open C-ECHO with one Storage association
+  -- to test whether operations are actually gated. Off by default so plain
+  -- ping stays a single, quiet association.
+  local check_ops  = stdnse.get_script_args("dicom-ping.check_operations") ~= nil
 
   local is_tls = (port.version and port.version.service_tunnel == "ssl") or
                  (port.version and type(port.version.name) == "string" and port.version.name:match("tls"))
@@ -182,6 +195,31 @@ action = function(host, port)
   out.dicom = "DICOM Service Provider discovered!"
   if not called_aet or called_aet == "ANY-SCP" then
     out.config = "Any AET is accepted (Insecure)"
+    -- A permissive C-ECHO only proves Verification is ungated. Optionally
+    -- confirm whether real operations are gated by associating once more with
+    -- a Storage presentation context (CT Image Storage). If that association
+    -- is rejected/dropped where C-ECHO was accepted, the "open" verdict above
+    -- is misleading: AET is enforced on operations but not on Verification.
+    if check_ops then
+      local ops_pcs = {{
+        abstract_syntax   = "1.2.840.10008.5.1.4.1.1.2", -- CT Image Storage
+        transfer_syntaxes = { "1.2.840.10008.1.2", "1.2.840.10008.1.2.1" },
+      }}
+      local ops_ok, ops_err = dicom.associate_extended(host, port, nil, called_aet, ops_pcs)
+      if ops_ok then
+        out.config       = "Any AET accepted on C-ECHO and Storage operations (Insecure)"
+        out.aet_scope    = "operations not gated"
+      elseif type(ops_err) == "table" and ops_err.err == "ASSOCIATE REJECT received" then
+        out.config    = "Any AET accepted on C-ECHO only; operations enforce AET"
+        out.aet_scope = string.format("Storage association rejected: %s / %s / %s",
+          ops_err.result_text or "?", ops_err.source_text or "?", ops_err.reason_text or "?")
+        out.aet_note  = "AET enforced on operations but NOT on C-ECHO — a ping-only 'open' verdict is misleading"
+      else
+        out.config    = "Any AET accepted on C-ECHO; Storage association failed (operations likely gated)"
+        out.aet_scope = type(ops_err) == "table" and (ops_err.err or "error") or tostring(ops_err or "unknown")
+        out.aet_note  = "AET enforcement on operations could not be confirmed (no clean A-ASSOCIATE-RJ)"
+      end
+    end
   else
     out.config = string.format("Called AET enforced (used: %s)", called_aet)
   end

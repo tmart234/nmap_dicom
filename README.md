@@ -25,7 +25,20 @@ The library hooks into Nmap's port.version.service_tunnel property to automatica
 
 ## dicom-enum
 
-`dicom-enum.nse` proposes ~28 curated presentation contexts (Verification, the major Storage SOP classes, Modality Worklist FIND, Patient/Study Root Q/R, Storage Commitment, MPPS, and Print) in a single A-ASSOCIATE request and parses the per-PC result map returned in the A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2). Each PC is reported as `accepted`, `user-rejection`, `no-reason`, `abstract-syntax-not-supported`, or `transfer-syntaxes-not-supported`. Storage SOP classes propose the full transfer-syntax matrix (Implicit/Explicit VR, Deflate, JPEG Baseline/Lossless, JPEG-LS, JPEG2000 lossless+lossy, RLE, HTJ2K). Accepted abstract syntaxes are mapped to DICOM service classes and an `inferred_device_class` line (PACS/VNA, Modality, RIS gateway, Archive front-end, Print server) is rendered. Output shape mirrors `ssh2-enum-algos`. Categories are `discovery, safe` (not `default`) — same call the maintainers made for `ssh2-enum-algos`.
+`dicom-enum.nse` proposes a set of presentation contexts (Verification, the major Storage SOP classes, Modality Worklist FIND, Patient/Study Root Q/R, Storage Commitment, MPPS, and Print) in one or more A-ASSOCIATE requests and parses the per-PC result map returned in the A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2). Each PC is reported as `accepted`, `user-rejection`, `no-reason`, `abstract-syntax-not-supported`, or `transfer-syntaxes-not-supported`. Storage SOP classes propose the full transfer-syntax matrix (Implicit/Explicit VR, Deflate, JPEG Baseline/Lossless, JPEG-LS, JPEG2000 lossless+lossy, RLE, HTJ2K). Accepted abstract syntaxes are mapped to DICOM service classes and an `inferred_device_class` line (PACS/VNA, Modality, RIS gateway, Archive front-end, Print server) is rendered. Output shape mirrors `ssh2-enum-algos`. Categories are `discovery, safe` (not `default`) — same call the maintainers made for `ssh2-enum-algos`.
+
+### SOP-class coverage (`dicom-enum.sop`)
+
+- `curated` (default) — ~35 of the most common SOP classes in a **single** A-ASSOCIATE request. One round trip, quiet on the wire; the right default for a clinical network.
+- `full` (alias `all`) — the full PS3.6 registry of standard SOP classes (~165). Because an A-ASSOCIATE-RQ caps at **128** presentation contexts (PS3.8 §9.3.2.2 — one-octet odd PC IDs → 1..255 → 128) **and** at the PDU size, the full list is automatically split into several A-ASSOCIATE requests ("batches") and the accepted buckets are merged. This is *enumeration of a published list*, not brute force: there is no "list everything" command in DICOM, so coverage equals the proposed list, and private/vendor SOP UIDs cannot be discovered this way.
+
+There is deliberately no one-PC-per-association mode — the per-PC result map already gives the same accept/reject granularity inside a batched request, so single-context probing only multiplies associations (slow, and noisy enough to trip association/abort-rate alarms). For a stack that cannot handle a multi-context request, shrink the batch with `dicom-enum.max_pcs` (e.g. `=1`) instead.
+
+A whole-association **A-ASSOCIATE-RJ** (AET allowlist, application-context, protocol-version, congestion) happens *before* any presentation context is evaluated, so it is reported once with an actionable hint and the scan stops — every batch would be rejected identically. Clear the AET gate first (see `dicom-brute` below), then re-run with `dicom-enum.sop=full` to enumerate the capability surface.
+
+```
+nmap -p 4242 --script dicom-enum --script-args dicom-enum.sop=full <target>
+```
 
 The library identifies itself with an ITU-T X.667 self-issued OID (`2.25.<UUID>`) and Implementation Version Name `NMAP_NSE`. It does not impersonate DCMTK, OFFIS, or any registered vendor. After a successful association the script sends an A-RELEASE-RQ for an orderly close so SCPs do not log the scan as an abort; pass `--script-args dicom.no_release` to skip the release.
 

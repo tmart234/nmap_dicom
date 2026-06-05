@@ -1,7 +1,7 @@
 --[[
 Enumerates the SOP classes and transfer syntaxes a DICOM Service Provider
-accepts by proposing a curated set of presentation contexts in a single
-A-ASSOCIATE request and parsing the per-PC result map returned in the
+accepts by proposing a set of presentation contexts in one or more
+A-ASSOCIATE requests and parsing the per-PC result map returned in each
 A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2).
 
 Each presentation context is reported as one of:
@@ -18,6 +18,28 @@ the SCP serves (CT/MR/US/CR/DX/Mammo/PET/NM/XA/XRF/Endoscopy/...), whether
 it supports Modality Worklist FIND, Patient/Study Root Query/Retrieve,
 Storage Commitment, MPPS, and Print Management, and which transfer
 syntaxes it negotiates.
+
+SOP-class coverage (dicom-enum.sop):
+  curated (default) - ~35 of the most common SOP classes, sent in a single
+                      A-ASSOCIATE request. One round trip, quiet on the
+                      wire — the right default for a clinical network.
+  full              - the full PS3.6 registry of standard SOP classes
+                      (~165). Because an A-ASSOCIATE-RQ caps at 128
+                      presentation contexts (PS3.8 §9.3.2.2, one-octet odd
+                      PC IDs -> 1..255 -> 128) and at the PDU size, the full
+                      list is automatically split into several A-ASSOCIATE
+                      requests ("batches") and the accepted buckets are
+                      merged. This is enumeration of a published list, NOT
+                      brute force — there is no "list everything" command in
+                      DICOM, so coverage equals the proposed list. Private /
+                      vendor SOP UIDs cannot be discovered this way.
+
+There is deliberately no one-PC-per-association mode: the per-PC result map
+already gives the same accept/reject granularity inside a batched request,
+so single-context probing only multiplies associations (slow, and noisy
+enough to trip association/abort-rate alarms in clinical nets). For a stack
+that cannot handle a multi-context request, shrink the batch with
+dicom-enum.max_pcs instead.
 
 From the accepted SOP classes the script also derives:
   modalities         - the imaging modalities implied by accepted Storage
@@ -47,6 +69,7 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- @usage nmap -p 4242 --script dicom-enum <target>
 -- @usage nmap -sV -p 4242 --script dicom-enum <target>
 -- @usage nmap -p 11112 --script dicom-enum --script-args dicom.called_aet=ORTHANC <target>
+-- @usage nmap -p 4242 --script dicom-enum --script-args dicom-enum.sop=full <target>
 -- @usage nmap --script dicom-enum --script-args dicom-enum.ports=11114,11115 <target>
 --
 -- @args dicom.called_aet     Called AET. Default: ANY-SCP
@@ -55,6 +78,15 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- @args dicom.no_release     If set, the script omits A-RELEASE-RQ and lets
 --                            the SCP see an aborted association. Default:
 --                            unset (release is sent).
+-- @args dicom-enum.sop       SOP-class coverage: "curated" (default, ~35
+--                            common classes in one association) or "full"
+--                            (the full PS3.6 registry, ~165 classes, split
+--                            into batched associations). "all" is an alias
+--                            for "full".
+-- @args dicom-enum.max_pcs   Maximum presentation contexts per A-ASSOCIATE
+--                            request. Default: 128 (the PS3.8 protocol
+--                            ceiling). Lower it (e.g. =1) for a stack that
+--                            cannot handle multi-context requests.
 -- @args dicom-enum.ports     Optional comma-separated list of ports to
 --                            probe (e.g. "104,11112,2761,2762,4242").
 --
@@ -142,10 +174,9 @@ local nmap      = require "nmap"
 local table     = require "table"
 local string    = require "string"
 
--- ---------- Curated Presentation Context list ----------
+-- ---------- Transfer syntaxes ----------
 -- Abstract syntax UIDs are taken from PS3.4 (Storage / Worklist / Q-R) and
--- PS3.6 (registry of UIDs). The list is fixed for v1; per-profile presets
--- (storage-only, qr-only, ...) are an obvious follow-on PR.
+-- PS3.6 (registry of UIDs).
 
 local TS_I       = "1.2.840.10008.1.2"        -- Implicit VR LE
 local TS_E       = "1.2.840.10008.1.2.1"      -- Explicit VR LE
@@ -161,9 +192,7 @@ local TS_HTJ2K_L = "1.2.840.10008.1.2.4.201"  -- HTJ2K Lossless (Sup235)
 local TS_HTJ2K_R = "1.2.840.10008.1.2.4.202"  -- HTJ2K Lossless RPCL
 local TS_HTJ2K   = "1.2.840.10008.1.2.4.203"  -- HTJ2K (Lossy)
 
--- Storage SOP classes accept the full transfer-syntax matrix. PDU-size
--- sanity: 25 storage PCs × 13 TS sub-items × ~30 bytes/TS ≈ 9.8 KB plus
--- ~2 KB of non-storage PCs and headers — well under the 16 KB max PDU.
+-- Storage SOP classes accept the full transfer-syntax matrix.
 local STORAGE_TS = {
   TS_I, TS_E, TS_EBE, TS_DEFLATE,
   TS_JPEG_BL, TS_JPEG_LL, TS_JLS_LL,
@@ -175,7 +204,10 @@ local STORAGE_TS = {
 -- benefit from compressed transfer syntaxes; keep the proposal minimal.
 local CMD_TS = {TS_I, TS_E}
 
-local PC_LIST = {
+-- ---------- Curated Presentation Context list (default) ----------
+-- The ~35 most common SOP classes, sized to fit a single A-ASSOCIATE.
+
+local CURATED_PC_LIST = {
   -- Verification
   {name = "Verification",                                uid = "1.2.840.10008.1.1",                   ts = CMD_TS},
 
@@ -223,6 +255,207 @@ local PC_LIST = {
   {name = "Basic Grayscale Print Management Meta",       uid = "1.2.840.10008.5.1.1.9",               ts = CMD_TS},
 }
 
+-- ---------- Additional Presentation Contexts for "full" coverage ----------
+-- Everything else from the PS3.6 registry not already in CURATED_PC_LIST.
+-- Concatenated after the curated list to form the full proposal. No UID
+-- appears in both lists.
+
+local EXTRA_PC_LIST = {
+  -- Additional Storage SOP classes
+  {name = "Digital Intra-oral X-Ray Image Storage - For Presentation", uid = "1.2.840.10008.5.1.4.1.1.1.3",   ts = STORAGE_TS},
+  {name = "Digital Intra-oral X-Ray Image Storage - For Processing",   uid = "1.2.840.10008.5.1.4.1.1.1.3.1", ts = STORAGE_TS},
+  {name = "MR Spectroscopy Storage",                     uid = "1.2.840.10008.5.1.4.1.1.4.2",         ts = STORAGE_TS},
+  {name = "Enhanced MR Color Image Storage",             uid = "1.2.840.10008.5.1.4.1.1.4.3",         ts = STORAGE_TS},
+  {name = "Enhanced US Volume Storage",                  uid = "1.2.840.10008.5.1.4.1.1.6.2",         ts = STORAGE_TS},
+  {name = "Multi-frame Single Bit Secondary Capture Image Storage",    uid = "1.2.840.10008.5.1.4.1.1.7.1",   ts = STORAGE_TS},
+  {name = "Multi-frame Grayscale Byte Secondary Capture Image Storage", uid = "1.2.840.10008.5.1.4.1.1.7.2",  ts = STORAGE_TS},
+  {name = "Multi-frame Grayscale Word Secondary Capture Image Storage", uid = "1.2.840.10008.5.1.4.1.1.7.3",  ts = STORAGE_TS},
+  {name = "Multi-frame True Color Secondary Capture Image Storage",    uid = "1.2.840.10008.5.1.4.1.1.7.4",   ts = STORAGE_TS},
+  {name = "12-lead ECG Waveform Storage",                uid = "1.2.840.10008.5.1.4.1.1.9.1.1",       ts = STORAGE_TS},
+  {name = "General ECG Waveform Storage",                 uid = "1.2.840.10008.5.1.4.1.1.9.1.2",       ts = STORAGE_TS},
+  {name = "Ambulatory ECG Waveform Storage",             uid = "1.2.840.10008.5.1.4.1.1.9.1.3",       ts = STORAGE_TS},
+  {name = "Hemodynamic Waveform Storage",                uid = "1.2.840.10008.5.1.4.1.1.9.2.1",       ts = STORAGE_TS},
+  {name = "Cardiac Electrophysiology Waveform Storage",  uid = "1.2.840.10008.5.1.4.1.1.9.3.1",       ts = STORAGE_TS},
+  {name = "Basic Voice Audio Waveform Storage",          uid = "1.2.840.10008.5.1.4.1.1.9.4.1",       ts = STORAGE_TS},
+  {name = "General Audio Waveform Storage",              uid = "1.2.840.10008.5.1.4.1.1.9.4.2",       ts = STORAGE_TS},
+  {name = "Arterial Pulse Waveform Storage",             uid = "1.2.840.10008.5.1.4.1.1.9.5.1",       ts = STORAGE_TS},
+  {name = "Respiratory Waveform Storage",                uid = "1.2.840.10008.5.1.4.1.1.9.6.1",       ts = STORAGE_TS},
+  {name = "Color Softcopy Presentation State Storage",   uid = "1.2.840.10008.5.1.4.1.1.11.2",        ts = STORAGE_TS},
+  {name = "Pseudo-Color Softcopy Presentation State Storage", uid = "1.2.840.10008.5.1.4.1.1.11.3",   ts = STORAGE_TS},
+  {name = "Blending Softcopy Presentation State Storage", uid = "1.2.840.10008.5.1.4.1.1.11.4",       ts = STORAGE_TS},
+  {name = "XA/XRF Grayscale Softcopy Presentation State Storage", uid = "1.2.840.10008.5.1.4.1.1.11.5", ts = STORAGE_TS},
+  {name = "X-Ray 3D Angiographic Image Storage",         uid = "1.2.840.10008.5.1.4.1.1.13.1.1",      ts = STORAGE_TS},
+  {name = "X-Ray 3D Craniofacial Image Storage",         uid = "1.2.840.10008.5.1.4.1.1.13.1.2",      ts = STORAGE_TS},
+  {name = "Breast Tomosynthesis Image Storage",          uid = "1.2.840.10008.5.1.4.1.1.13.1.3",      ts = STORAGE_TS},
+  {name = "Intravascular OCT Image Storage - For Presentation", uid = "1.2.840.10008.5.1.4.1.1.14.1", ts = STORAGE_TS},
+  {name = "Intravascular OCT Image Storage - For Processing",   uid = "1.2.840.10008.5.1.4.1.1.14.2", ts = STORAGE_TS},
+  {name = "Raw Data Storage",                            uid = "1.2.840.10008.5.1.4.1.1.66",          ts = STORAGE_TS},
+  {name = "Spatial Registration Storage",                uid = "1.2.840.10008.5.1.4.1.1.66.1",        ts = STORAGE_TS},
+  {name = "Spatial Fiducials Storage",                   uid = "1.2.840.10008.5.1.4.1.1.66.2",        ts = STORAGE_TS},
+  {name = "Deformable Spatial Registration Storage",     uid = "1.2.840.10008.5.1.4.1.1.66.3",        ts = STORAGE_TS},
+  {name = "Segmentation Storage",                        uid = "1.2.840.10008.5.1.4.1.1.66.4",        ts = STORAGE_TS},
+  {name = "Surface Segmentation Storage",                uid = "1.2.840.10008.5.1.4.1.1.66.5",        ts = STORAGE_TS},
+  {name = "Real World Value Mapping Storage",            uid = "1.2.840.10008.5.1.4.1.1.67",          ts = STORAGE_TS},
+  {name = "Surface Scan Mesh Storage",                   uid = "1.2.840.10008.5.1.4.1.1.68.1",        ts = STORAGE_TS},
+  {name = "Surface Scan Point Cloud Storage",            uid = "1.2.840.10008.5.1.4.1.1.68.2",        ts = STORAGE_TS},
+  {name = "VL Microscopic Image Storage",                uid = "1.2.840.10008.5.1.4.1.1.77.1.2",      ts = STORAGE_TS},
+  {name = "Video Microscopic Image Storage",             uid = "1.2.840.10008.5.1.4.1.1.77.1.2.1",    ts = STORAGE_TS},
+  {name = "VL Slide-Coordinates Microscopic Image Storage", uid = "1.2.840.10008.5.1.4.1.1.77.1.3",   ts = STORAGE_TS},
+  {name = "VL Photographic Image Storage",               uid = "1.2.840.10008.5.1.4.1.1.77.1.4",      ts = STORAGE_TS},
+  {name = "Video Photographic Image Storage",            uid = "1.2.840.10008.5.1.4.1.1.77.1.4.1",    ts = STORAGE_TS},
+  {name = "Ophthalmic Photography 8 Bit Image Storage",  uid = "1.2.840.10008.5.1.4.1.1.77.1.5.1",    ts = STORAGE_TS},
+  {name = "Ophthalmic Photography 16 Bit Image Storage", uid = "1.2.840.10008.5.1.4.1.1.77.1.5.2",    ts = STORAGE_TS},
+  {name = "Stereometric Relationship Storage",           uid = "1.2.840.10008.5.1.4.1.1.77.1.5.3",    ts = STORAGE_TS},
+  {name = "Ophthalmic Tomography Image Storage",         uid = "1.2.840.10008.5.1.4.1.1.77.1.5.4",    ts = STORAGE_TS},
+  {name = "VL Whole Slide Microscopy Image Storage",     uid = "1.2.840.10008.5.1.4.1.1.77.1.6",      ts = STORAGE_TS},
+  {name = "Lensometry Measurements Storage",             uid = "1.2.840.10008.5.1.4.1.1.78.1",        ts = STORAGE_TS},
+  {name = "Autorefraction Measurements Storage",         uid = "1.2.840.10008.5.1.4.1.1.78.2",        ts = STORAGE_TS},
+  {name = "Keratometry Measurements Storage",            uid = "1.2.840.10008.5.1.4.1.1.78.3",        ts = STORAGE_TS},
+  {name = "Subjective Refraction Measurements Storage",  uid = "1.2.840.10008.5.1.4.1.1.78.4",        ts = STORAGE_TS},
+  {name = "Visual Acuity Measurements Storage",          uid = "1.2.840.10008.5.1.4.1.1.78.5",        ts = STORAGE_TS},
+  {name = "Spectacle Prescription Report Storage",       uid = "1.2.840.10008.5.1.4.1.1.78.6",        ts = STORAGE_TS},
+  {name = "Ophthalmic Axial Measurements Storage",       uid = "1.2.840.10008.5.1.4.1.1.78.7",        ts = STORAGE_TS},
+  {name = "Intraocular Lens Calculations Storage",       uid = "1.2.840.10008.5.1.4.1.1.78.8",        ts = STORAGE_TS},
+  {name = "Macular Grid Thickness and Volume Report Storage", uid = "1.2.840.10008.5.1.4.1.1.79.1",   ts = STORAGE_TS},
+  {name = "Ophthalmic Visual Field Static Perimetry Measurements Storage", uid = "1.2.840.10008.5.1.4.1.1.80.1", ts = STORAGE_TS},
+  {name = "Ophthalmic Thickness Map Storage",            uid = "1.2.840.10008.5.1.4.1.1.81.1",        ts = STORAGE_TS},
+  {name = "Corneal Topography Map Storage",              uid = "1.2.840.10008.5.1.4.1.1.82.1",        ts = STORAGE_TS},
+  {name = "Enhanced SR Storage",                         uid = "1.2.840.10008.5.1.4.1.1.88.22",       ts = STORAGE_TS},
+  {name = "Comprehensive 3D SR Storage",                 uid = "1.2.840.10008.5.1.4.1.1.88.34",       ts = STORAGE_TS},
+  {name = "Procedure Log Storage",                       uid = "1.2.840.10008.5.1.4.1.1.88.40",       ts = STORAGE_TS},
+  {name = "Mammography CAD SR Storage",                  uid = "1.2.840.10008.5.1.4.1.1.88.50",       ts = STORAGE_TS},
+  {name = "Key Object Selection Document Storage",       uid = "1.2.840.10008.5.1.4.1.1.88.59",       ts = STORAGE_TS},
+  {name = "Chest CAD SR Storage",                        uid = "1.2.840.10008.5.1.4.1.1.88.65",       ts = STORAGE_TS},
+  {name = "X-Ray Radiation Dose SR Storage",             uid = "1.2.840.10008.5.1.4.1.1.88.67",       ts = STORAGE_TS},
+  {name = "Colon CAD SR Storage",                        uid = "1.2.840.10008.5.1.4.1.1.88.69",       ts = STORAGE_TS},
+  {name = "Implantation Plan SR Document Storage",       uid = "1.2.840.10008.5.1.4.1.1.88.70",       ts = STORAGE_TS},
+  {name = "Encapsulated CDA Storage",                    uid = "1.2.840.10008.5.1.4.1.1.104.2",       ts = STORAGE_TS},
+  {name = "Basic Structured Display Storage",            uid = "1.2.840.10008.5.1.4.1.1.131",         ts = STORAGE_TS},
+  {name = "RT Image Storage",                            uid = "1.2.840.10008.5.1.4.1.1.481.1",       ts = STORAGE_TS},
+  {name = "RT Dose Storage",                             uid = "1.2.840.10008.5.1.4.1.1.481.2",       ts = STORAGE_TS},
+  {name = "RT Structure Set Storage",                    uid = "1.2.840.10008.5.1.4.1.1.481.3",       ts = STORAGE_TS},
+  {name = "RT Beams Treatment Record Storage",           uid = "1.2.840.10008.5.1.4.1.1.481.4",       ts = STORAGE_TS},
+  {name = "RT Plan Storage",                             uid = "1.2.840.10008.5.1.4.1.1.481.5",       ts = STORAGE_TS},
+  {name = "RT Brachy Treatment Record Storage",          uid = "1.2.840.10008.5.1.4.1.1.481.6",       ts = STORAGE_TS},
+  {name = "RT Treatment Summary Record Storage",         uid = "1.2.840.10008.5.1.4.1.1.481.7",       ts = STORAGE_TS},
+  {name = "Hanging Protocol Storage",                    uid = "1.2.840.10008.5.1.4.38.1",            ts = STORAGE_TS},
+  {name = "Color Palette Storage",                       uid = "1.2.840.10008.5.1.4.39.1",            ts = STORAGE_TS},
+  {name = "Generic Implant Template Storage",            uid = "1.2.840.10008.5.1.4.43.1",            ts = STORAGE_TS},
+  {name = "Implant Assembly Template Storage",           uid = "1.2.840.10008.5.1.4.44.1",            ts = STORAGE_TS},
+  {name = "Implant Template Group Storage",              uid = "1.2.840.10008.5.1.4.45.1",            ts = STORAGE_TS},
+
+  -- Additional Query/Retrieve
+  {name = "Patient/Study Only Query/Retrieve - FIND (Retired)", uid = "1.2.840.10008.5.1.4.1.2.3.1",  ts = CMD_TS},
+  {name = "Patient/Study Only Query/Retrieve - MOVE (Retired)", uid = "1.2.840.10008.5.1.4.1.2.3.2",  ts = CMD_TS},
+  {name = "Patient/Study Only Query/Retrieve - GET (Retired)",  uid = "1.2.840.10008.5.1.4.1.2.3.3",  ts = CMD_TS},
+  {name = "Composite Instance Root Retrieve - MOVE",     uid = "1.2.840.10008.5.1.4.1.2.4.2",         ts = CMD_TS},
+  {name = "Composite Instance Root Retrieve - GET",      uid = "1.2.840.10008.5.1.4.1.2.4.3",         ts = CMD_TS},
+  {name = "Composite Instance Retrieve Without Bulk Data - GET", uid = "1.2.840.10008.5.1.4.1.2.5.3", ts = CMD_TS},
+  {name = "Hanging Protocol Information Model - FIND",    uid = "1.2.840.10008.5.1.4.38.2",            ts = CMD_TS},
+  {name = "Hanging Protocol Information Model - MOVE",    uid = "1.2.840.10008.5.1.4.38.3",            ts = CMD_TS},
+  {name = "Color Palette Information Model - FIND",       uid = "1.2.840.10008.5.1.4.39.2",            ts = CMD_TS},
+  {name = "Color Palette Information Model - MOVE",       uid = "1.2.840.10008.5.1.4.39.3",            ts = CMD_TS},
+  {name = "Color Palette Information Model - GET",        uid = "1.2.840.10008.5.1.4.39.4",            ts = CMD_TS},
+  {name = "General Relevant Patient Information Query",   uid = "1.2.840.10008.5.1.4.37.1",            ts = CMD_TS},
+  {name = "Breast Imaging Relevant Patient Information Query", uid = "1.2.840.10008.5.1.4.37.2",       ts = CMD_TS},
+  {name = "Cardiac Relevant Patient Information Query",   uid = "1.2.840.10008.5.1.4.37.3",            ts = CMD_TS},
+  {name = "Product Characteristics Query",               uid = "1.2.840.10008.5.1.4.41",              ts = CMD_TS},
+  {name = "Substance Approval Query",                    uid = "1.2.840.10008.5.1.4.42",              ts = CMD_TS},
+  {name = "Generic Implant Template Information Model - FIND", uid = "1.2.840.10008.5.1.4.43.2",       ts = CMD_TS},
+  {name = "Generic Implant Template Information Model - MOVE", uid = "1.2.840.10008.5.1.4.43.3",       ts = CMD_TS},
+  {name = "Generic Implant Template Information Model - GET",  uid = "1.2.840.10008.5.1.4.43.4",       ts = CMD_TS},
+  {name = "Implant Assembly Template Information Model - FIND", uid = "1.2.840.10008.5.1.4.44.2",      ts = CMD_TS},
+  {name = "Implant Assembly Template Information Model - MOVE", uid = "1.2.840.10008.5.1.4.44.3",      ts = CMD_TS},
+  {name = "Implant Assembly Template Information Model - GET",  uid = "1.2.840.10008.5.1.4.44.4",      ts = CMD_TS},
+  {name = "Implant Template Group Information Model - FIND", uid = "1.2.840.10008.5.1.4.45.2",         ts = CMD_TS},
+  {name = "Implant Template Group Information Model - MOVE", uid = "1.2.840.10008.5.1.4.45.3",         ts = CMD_TS},
+  {name = "Implant Template Group Information Model - GET",  uid = "1.2.840.10008.5.1.4.45.4",         ts = CMD_TS},
+
+  -- Additional Workflow / Management
+  {name = "Procedural Event Logging",                    uid = "1.2.840.10008.1.40",                  ts = CMD_TS},
+  {name = "Substance Administration Logging",            uid = "1.2.840.10008.1.42",                  ts = CMD_TS},
+  {name = "Modality Performed Procedure Step Retrieve",  uid = "1.2.840.10008.3.1.2.3.4",             ts = CMD_TS},
+  {name = "Modality Performed Procedure Step Notification", uid = "1.2.840.10008.3.1.2.3.5",          ts = CMD_TS},
+  {name = "Instance Availability Notification",          uid = "1.2.840.10008.5.1.4.33",              ts = CMD_TS},
+  {name = "Unified Procedure Step - Push",               uid = "1.2.840.10008.5.1.4.34.6.1",          ts = CMD_TS},
+  {name = "Unified Procedure Step - Watch",              uid = "1.2.840.10008.5.1.4.34.6.2",          ts = CMD_TS},
+  {name = "Unified Procedure Step - Pull",               uid = "1.2.840.10008.5.1.4.34.6.3",          ts = CMD_TS},
+  {name = "Unified Procedure Step - Event",              uid = "1.2.840.10008.5.1.4.34.6.4",          ts = CMD_TS},
+  {name = "RT Conventional Machine Verification",        uid = "1.2.840.10008.5.1.4.34.8",            ts = CMD_TS},
+  {name = "RT Ion Machine Verification",                 uid = "1.2.840.10008.5.1.4.34.9",            ts = CMD_TS},
+
+  -- Additional Print Management
+  {name = "Basic Color Print Management Meta",           uid = "1.2.840.10008.5.1.1.18",              ts = CMD_TS},
+  {name = "Basic Film Session SOP Class",                uid = "1.2.840.10008.5.1.1.1",               ts = CMD_TS},
+  {name = "Basic Film Box SOP Class",                    uid = "1.2.840.10008.5.1.1.2",               ts = CMD_TS},
+  {name = "Basic Grayscale Image Box SOP Class",         uid = "1.2.840.10008.5.1.1.4",               ts = CMD_TS},
+  {name = "Basic Color Image Box SOP Class",             uid = "1.2.840.10008.5.1.1.4.1",             ts = CMD_TS},
+  {name = "Print Job SOP Class",                         uid = "1.2.840.10008.5.1.1.14",              ts = CMD_TS},
+  {name = "Basic Annotation Box SOP Class",              uid = "1.2.840.10008.5.1.1.15",              ts = CMD_TS},
+  {name = "Printer SOP Class",                           uid = "1.2.840.10008.5.1.1.16",              ts = CMD_TS},
+  {name = "Printer Configuration Retrieval SOP Class",   uid = "1.2.840.10008.5.1.1.16.376",          ts = CMD_TS},
+  {name = "Presentation LUT SOP Class",                  uid = "1.2.840.10008.5.1.1.23",              ts = CMD_TS},
+  {name = "Basic Print Image Overlay Box SOP Class",     uid = "1.2.840.10008.5.1.1.24.1",            ts = CMD_TS},
+  {name = "Media Creation Management SOP Class",         uid = "1.2.840.10008.5.1.1.33",              ts = CMD_TS},
+}
+
+-- ---------- SOP-class coverage selection ----------
+
+-- Build the full list once (curated + extras), preserving order.
+local FULL_PC_LIST = {}
+for _, pc in ipairs(CURATED_PC_LIST) do FULL_PC_LIST[#FULL_PC_LIST + 1] = pc end
+for _, pc in ipairs(EXTRA_PC_LIST)   do FULL_PC_LIST[#FULL_PC_LIST + 1] = pc end
+
+-- PS3.8 §9.3.2.2: presentation context IDs are a single odd octet (1..255),
+-- so at most 128 contexts per A-ASSOCIATE-RQ.
+local PROTOCOL_MAX_PCS = 128
+
+-- Conservative byte budget for the presentation-context blob in one
+-- A-ASSOCIATE-RQ. The fixed preamble + application context + user info add
+-- ~170 bytes, so this keeps the whole request comfortably under the 16 KB
+-- that even cautious/embedded stacks accept.
+local PC_BLOB_BUDGET = 14000
+
+-- Estimate the on-the-wire size of one presentation-context item, mirroring
+-- item_presentation_context() in nselib/dicom.lua: a 0x20 item (4-byte
+-- header) wrapping a 4-byte PC header, the abstract-syntax sub-item
+-- (4 + UID), and one transfer-syntax sub-item (4 + UID) per TS.
+local function pc_wire_size(pc)
+  local n = 8 + 4 + #pc.uid
+  for _, ts in ipairs(pc.ts) do
+    n = n + 4 + #ts
+  end
+  return n
+end
+
+-- Greedily split a PC list into batches that respect both the 128-context
+-- ceiling and the byte budget. A single context that exceeds the budget on
+-- its own still goes out alone rather than being dropped.
+local function build_batches(pc_list, max_pcs)
+  local cap = math.min(max_pcs or PROTOCOL_MAX_PCS, PROTOCOL_MAX_PCS)
+  if cap < 1 then cap = 1 end
+  local batches, cur, cur_bytes = {}, {}, 0
+  for _, pc in ipairs(pc_list) do
+    local sz = pc_wire_size(pc)
+    if #cur > 0 and (#cur >= cap or cur_bytes + sz > PC_BLOB_BUDGET) then
+      batches[#batches + 1] = cur
+      cur, cur_bytes = {}, 0
+    end
+    cur[#cur + 1] = pc
+    cur_bytes = cur_bytes + sz
+  end
+  if #cur > 0 then batches[#batches + 1] = cur end
+  return batches
+end
+
+local function select_pc_list()
+  local sop = (stdnse.get_script_args("dicom-enum.sop") or "curated"):lower()
+  if sop == "full" or sop == "all" then
+    return FULL_PC_LIST, "full"
+  end
+  return CURATED_PC_LIST, "curated"
+end
+
 -- ---------- portrule ----------
 
 local COMMON_DICOM_PORTS = {104, 11112, 2761, 2762, 4242}
@@ -256,8 +489,6 @@ end
 -- emitted at debug level only; the normal-output table reports "accepted".
 local DEBUG_BUCKET_ORDER = {1, 3, 4, 2}
 
--- ---------- action ----------
-
 local function is_tls_port(port)
   if port.version and port.version.service_tunnel == "ssl" then return true end
   if port.version and type(port.version.name) == "string"
@@ -271,42 +502,88 @@ local function mark_dicom_service(host, port)
   nmap.set_port_version(host, port)
 end
 
+-- Render the A-ASSOCIATE-RJ details + an actionable hint into the output
+-- table. Shared by every batch that comes back rejected.
+local function report_reject(out, err)
+  out.dicom  = "DICOM Service Provider discovered!"
+  out.config = string.format("Association rejected: %s / %s / %s",
+    err.result_text or "?", err.source_text or "?", err.reason_text or "?")
+  if err.source == 1 and err.reason == 7 then
+    out.hint = "Called-AET not recognized — try dicom.called_aet=<AET>"
+  elseif err.source == 1 and err.reason == 3 then
+    out.hint = "Calling-AET not recognized — try dicom.calling_aet=<AET>"
+  elseif err.source == 2 and err.reason == 2 then
+    out.hint = "Protocol version mismatch"
+  elseif err.source == 3 and err.reason == 1 then
+    out.hint = "Server overloaded — retry later"
+  end
+end
+
+-- ---------- action ----------
+
 action = function(host, port)
   local out = stdnse.output_table()
 
   local called_aet  = stdnse.get_script_args("dicom.called_aet")
   local calling_aet = stdnse.get_script_args("dicom.calling_aet")
+  local max_pcs     = tonumber(stdnse.get_script_args("dicom-enum.max_pcs"))
 
-  -- Convert PC_LIST to the shape associate_extended expects.
-  local pcs = {}
-  for i, pc in ipairs(PC_LIST) do
-    pcs[i] = { abstract_syntax = pc.uid, transfer_syntaxes = pc.ts }
-  end
+  local pc_list, sop_mode = select_pc_list()
+  local batches = build_batches(pc_list, max_pcs)
 
-  local ok, err, pc_results, info =
-    dicom.associate_extended(host, port, calling_aet, called_aet, pcs)
+  -- Run each batch as its own association and merge the per-PC results. The
+  -- A-ASSOCIATE-RQ caps at 128 contexts / one PDU, so "full" coverage needs
+  -- several associations; "curated" fits in one.
+  local merged = {}     -- list of {name, result, accepted_ts, abstract_syntax}
+  local info   = nil    -- first AC PDU's user-info (max_pdu / impl_*)
+  local ok_batches = 0
 
-  if not ok then
-    if type(err) == "table" and err.err == "ASSOCIATE REJECT received" then
-      out.dicom  = "DICOM Service Provider discovered!"
-      out.config = string.format("Association rejected: %s / %s / %s",
-        err.result_text or "?", err.source_text or "?", err.reason_text or "?")
-      if err.source == 1 and err.reason == 7 then
-        out.hint = "Called-AET not recognized — try dicom.called_aet=<AET>"
-      elseif err.source == 1 and err.reason == 3 then
-        out.hint = "Calling-AET not recognized — try dicom.calling_aet=<AET>"
-      elseif err.source == 2 and err.reason == 2 then
-        out.hint = "Protocol version mismatch"
-      elseif err.source == 3 and err.reason == 1 then
-        out.hint = "Server overloaded — retry later"
-      end
-      mark_dicom_service(host, port)
-      return out
+  for bi, batch in ipairs(batches) do
+    local pcs = {}
+    for i, pc in ipairs(batch) do
+      pcs[i] = { abstract_syntax = pc.uid, transfer_syntaxes = pc.ts }
     end
-    local e = tostring(err or "")
-    out.dicom = "DICOM Service Provider discovered!"
-    out.error = e
-    return nil
+
+    local ok, err, pc_results, binfo =
+      dicom.associate_extended(host, port, calling_aet, called_aet, pcs)
+
+    if not ok then
+      -- A whole-association rejection (AET allowlist, app-context, protocol
+      -- version, congestion) hits before any PC is evaluated, so every other
+      -- batch would be rejected identically. Report it once and stop.
+      if type(err) == "table" and err.err == "ASSOCIATE REJECT received" then
+        if ok_batches == 0 then
+          report_reject(out, err)
+          mark_dicom_service(host, port)
+          return out
+        end
+        -- Already past the AET gate on an earlier batch: a reject here is
+        -- anomalous. Note it and keep the results we have.
+        stdnse.debug1("DICOM: batch %d/%d rejected after an earlier accept: %s / %s",
+          bi, #batches, err.result_text or "?", err.reason_text or "?")
+      else
+        -- Socket error / timeout / unexpected PDU.
+        local e = type(err) == "table" and (err.err or "error") or tostring(err or "")
+        if ok_batches == 0 then
+          out.dicom = "DICOM Service Provider discovered!"
+          out.error = e
+          return nil
+        end
+        stdnse.debug1("DICOM: batch %d/%d failed after an earlier accept: %s",
+          bi, #batches, e)
+      end
+    else
+      ok_batches = ok_batches + 1
+      info = info or binfo
+      for i, r in ipairs(pc_results) do
+        merged[#merged + 1] = {
+          name            = batch[i].name,
+          result          = r.result,
+          accepted_ts     = r.accepted_ts,
+          abstract_syntax = r.abstract_syntax,
+        }
+      end
+    end
   end
 
   -- Resolve vendor / version once and reuse for both port.version metadata
@@ -349,22 +626,28 @@ action = function(host, port)
     out.association = "accepted"
   end
 
+  -- Note the proposal scope when it spanned more than one association, so the
+  -- output is self-describing about how thorough the scan was.
+  if sop_mode == "full" or #batches > 1 then
+    out.scan = string.format("%s coverage: %d SOP classes in %d association(s)",
+      sop_mode, #pc_list, #batches)
+  end
+
   -- Bucket per-PC results and collect accepted service classes / UIDs.
   local buckets = { [0]={}, [1]={}, [2]={}, [3]={}, [4]={}, unknown={} }
   local accepted_services = {}
   local accepted_uids = {}
-  for i, r in ipairs(pc_results) do
-    local pc = PC_LIST[i]
+  for _, r in ipairs(merged) do
     local code = r.result
     if code == 0 then
-      table.insert(buckets[0], string.format("%s - %s", pc.name, ts_label(r.accepted_ts)))
+      table.insert(buckets[0], string.format("%s - %s", r.name, ts_label(r.accepted_ts)))
       accepted_uids[#accepted_uids + 1] = r.abstract_syntax
       local svc = dicom.service_class_for_uid(r.abstract_syntax)
       if svc then accepted_services[svc] = true end
     elseif code == 1 or code == 2 or code == 3 or code == 4 then
-      table.insert(buckets[code], pc.name)
+      table.insert(buckets[code], r.name)
     else
-      table.insert(buckets.unknown, pc.name)
+      table.insert(buckets.unknown, r.name)
     end
   end
 

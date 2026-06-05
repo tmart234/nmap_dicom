@@ -226,6 +226,47 @@ jobs:
           grep -qE '^[|]\s+service_classes:' "$OUT" \
             || { echo "::error::dicom-enum missing service_classes block"; tail -n 200 "$OUT"; exit 1; }
 
+      - name: Run Nmap dicom-enum full registry (${{ matrix.dicom_server.name }})
+        id: test_enum_full
+        if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.expect_vendor_version != 'false'
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+          OUT="artifacts/nmap_${{ matrix.dicom_server.name }}_enum_full.out"
+          ENUM_ARGS=$(echo "${{ matrix.dicom_server.nmap_args }}" | sed 's/dicom-ping\.ports/dicom-enum.ports/g')
+          # Append the full-registry SOP coverage flag to whatever script-args
+          # the row already carries (called_aet, ports, ...).
+          if echo "$ENUM_ARGS" | grep -q -- '--script-args'; then
+            ENUM_ARGS="$(echo "$ENUM_ARGS" | sed 's/\(--script-args[= ]\)/\1dicom-enum.sop=full,/')"
+          else
+            ENUM_ARGS="$ENUM_ARGS --script-args dicom-enum.sop=full"
+          fi
+          nmap -p ${{ matrix.dicom_server.host_port }} \
+               -n -Pn -dd -sV \
+               --script dicom-enum \
+               $ENUM_ARGS \
+               --script-trace \
+               localhost | tee "$OUT"
+          echo "enum_full_out=$OUT" >> $GITHUB_OUTPUT
+
+      - name: Assert dicom-enum full registry (${{ matrix.dicom_server.name }})
+        if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.expect_vendor_version != 'false'
+        run: |
+          OUT="${{ steps.test_enum_full.outputs.enum_full_out }}"
+          grep -qE 'association:\s+accepted' "$OUT" \
+            || { echo "::error::dicom-enum sop=full did not get an accept"; tail -n 200 "$OUT"; exit 1; }
+          # The full registry is >128 contexts and is split into batched
+          # associations; the self-describing scan line must report it.
+          grep -qE '^[|][[:space:]]+scan:.*full coverage:.*association' "$OUT" \
+            || { echo "::error::dicom-enum sop=full missing batched 'scan:' line"; tail -n 200 "$OUT"; exit 1; }
+          # Merged results across batches must still carry a non-zero accepted
+          # bucket and Verification (mandatory for any acceptor).
+          grep -A2 -E '^[|][[:space:]]+accepted:[[:space:]]*$' "$OUT" \
+            | grep -qE '^.*count:[[:space:]]*[1-9][0-9]*$' \
+            || { echo "::error::dicom-enum sop=full produced no accepted bucket with non-zero count"; tail -n 200 "$OUT"; exit 1; }
+          grep -qE '\bVerification\b' "$OUT" \
+            || { echo "::error::Verification not present in dicom-enum sop=full output"; tail -n 200 "$OUT"; exit 1; }
+
       - name: Assert TLS row (no vendor/version)
         if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.expect_vendor_version == 'false'
         run: |

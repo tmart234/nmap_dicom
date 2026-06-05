@@ -41,6 +41,20 @@ enough to trip association/abort-rate alarms in clinical nets). For a stack
 that cannot handle a multi-context request, shrink the batch with
 dicom-enum.max_pcs instead.
 
+Adaptive tier isolation: some non-conformant devices drop or abort the
+*entire* association merely because a Query/Retrieve abstract syntax is
+present in the request (PS3.8 §9.3.3.2 says they should reject the offending
+presentation context, not the association), and some enforce the AET
+allowlist on Storage/operations while leaving Verification open. A naive
+single-association scan just "fails" against these. So when the fast
+combined pass loses a batch wholesale, the script re-probes the failed
+contexts one tier at a time — Verification, then core (Storage/Worklist/
+MPPS/StgCmt/Print), then Query/Retrieve — so a hostile tier can't hide the
+capabilities of the others. The offending behavior is then reported as a
+quirk_* line, which is itself a strong device fingerprint. Pass
+dicom-enum.isolate to go straight to tiered probing for a known-hostile
+device.
+
 From the accepted SOP classes the script also derives:
   modalities         - the imaging modalities implied by accepted Storage
                        SOP classes (CT, MRI, Ultrasound, Mammography,
@@ -87,6 +101,12 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 --                            request. Default: 128 (the PS3.8 protocol
 --                            ceiling). Lower it (e.g. =1) for a stack that
 --                            cannot handle multi-context requests.
+-- @args dicom-enum.isolate   If set, skip the fast combined pass and probe
+--                            each tier (Verification / core / Query-Retrieve)
+--                            in its own association from the start. Use it for
+--                            a device already known to drop or abort the whole
+--                            association when a Q/R context is present, to
+--                            avoid the wasted failing combined association.
 -- @args dicom-enum.ports     Optional comma-separated list of ports to
 --                            probe (e.g. "104,11112,2761,2762,4242").
 --
@@ -519,6 +539,65 @@ local function report_reject(out, err)
   end
 end
 
+-- Classify a PC into an isolation tier. Some non-conformant SCPs drop or
+-- abort the *entire* association merely because a Query/Retrieve abstract
+-- syntax is present in the A-ASSOCIATE-RQ (a real, observed device class),
+-- and some enforce the AET allowlist on Storage/operations while leaving
+-- Verification open. Isolating these tiers keeps one hostile group from
+-- poisoning the rest of the scan.
+--   verification   - C-ECHO; mandatory for any acceptor, usually the most
+--                    permissive context (often no AET enforcement).
+--   query-retrieve - the Q/R Service Class information models
+--                    (1.2.840.10008.5.1.4.1.2.*: patient/study/patient-study
+--                    root + composite instance root + without-bulk).
+--   core           - everything else (Storage, Worklist, MPPS, StgCmt, Print).
+local QR_UID_PREFIX = "1.2.840.10008.5.1.4.1.2."
+local function pc_tier(pc)
+  if pc.uid == "1.2.840.10008.1.1" then return "verification" end
+  if pc.uid:sub(1, #QR_UID_PREFIX) == QR_UID_PREFIX then return "query-retrieve" end
+  return "core"
+end
+
+-- Size-batch a list of PC entries and run each batch as its own association,
+-- merging the per-PC results. Returns a table:
+--   { merged = {...}, info = AC-user-info-or-nil, ok = N_accepted_assocs,
+--     assoc = N_assocs_attempted, failures = { {err=, entries={...}}, ... } }
+-- A whole-association failure (RJ / abort / drop / timeout) yields a failures
+-- entry carrying that batch's PC entries, so the caller can re-probe them in
+-- isolation.
+local function associate_group(host, port, calling_aet, called_aet, entries, max_pcs)
+  local out = { merged = {}, info = nil, ok = 0, assoc = 0, failures = {} }
+  for _, batch in ipairs(build_batches(entries, max_pcs)) do
+    local pcs = {}
+    for i, pc in ipairs(batch) do
+      pcs[i] = { abstract_syntax = pc.uid, transfer_syntaxes = pc.ts }
+    end
+    out.assoc = out.assoc + 1
+    local ok, err, pc_results, binfo =
+      dicom.associate_extended(host, port, calling_aet, called_aet, pcs)
+    if ok then
+      out.ok   = out.ok + 1
+      out.info = out.info or binfo
+      for i, r in ipairs(pc_results) do
+        out.merged[#out.merged + 1] = {
+          name            = batch[i].name,
+          result          = r.result,
+          accepted_ts     = r.accepted_ts,
+          abstract_syntax = r.abstract_syntax,
+        }
+      end
+    else
+      out.failures[#out.failures + 1] = { err = err, entries = batch }
+    end
+  end
+  return out
+end
+
+-- Is this failure a clean A-ASSOCIATE-RJ (vs. a drop / abort / timeout)?
+local function is_reject(err)
+  return type(err) == "table" and err.err == "ASSOCIATE REJECT received"
+end
+
 -- ---------- action ----------
 
 action = function(host, port)
@@ -529,61 +608,88 @@ action = function(host, port)
   local max_pcs     = tonumber(stdnse.get_script_args("dicom-enum.max_pcs"))
 
   local pc_list, sop_mode = select_pc_list()
-  local batches = build_batches(pc_list, max_pcs)
+  -- Skip the fast combined pass and go straight to per-tier isolation when
+  -- the operator already knows the device is hostile to mixed requests.
+  local force_isolate = stdnse.get_script_args("dicom-enum.isolate") ~= nil
 
-  -- Run each batch as its own association and merge the per-PC results. The
-  -- A-ASSOCIATE-RQ caps at 128 contexts / one PDU, so "full" coverage needs
-  -- several associations; "curated" fits in one.
-  local merged = {}     -- list of {name, result, accepted_ts, abstract_syntax}
-  local info   = nil    -- first AC PDU's user-info (max_pdu / impl_*)
-  local ok_batches = 0
+  local merged       = {}    -- list of {name, result, accepted_ts, abstract_syntax}
+  local info         = nil   -- first AC PDU's user-info (max_pdu / impl_*)
+  local ok_assocs    = 0
+  local assoc_total  = 0
+  local first_reject = nil   -- a representative A-ASSOCIATE-RJ, for reporting
+  local first_error  = nil   -- a representative drop/abort/timeout, for reporting
+  local tier_failed  = {}    -- [tier] = "rejects" | "drops"
+  local isolated     = false -- did we fall back to per-tier isolation?
 
-  for bi, batch in ipairs(batches) do
-    local pcs = {}
-    for i, pc in ipairs(batch) do
-      pcs[i] = { abstract_syntax = pc.uid, transfer_syntaxes = pc.ts }
+  local function absorb(group)
+    assoc_total = assoc_total + group.assoc
+    ok_assocs   = ok_assocs + group.ok
+    info        = info or group.info
+    for _, m in ipairs(group.merged) do merged[#merged + 1] = m end
+  end
+
+  -- Pass 1 (fast path): propose the whole list, size-batched. Normal SCPs
+  -- accept this in one association ("curated") or a few ("full"). The
+  -- contexts in any batch that fails wholesale are queued for isolation.
+  local to_isolate = {}
+  if force_isolate then
+    isolated = true
+    for _, pc in ipairs(pc_list) do to_isolate[#to_isolate + 1] = pc end
+  else
+    local g1 = associate_group(host, port, calling_aet, called_aet, pc_list, max_pcs)
+    absorb(g1)
+    for _, f in ipairs(g1.failures) do
+      if is_reject(f.err) then first_reject = first_reject or f.err
+      else first_error = first_error or f.err end
+      for _, pc in ipairs(f.entries) do to_isolate[#to_isolate + 1] = pc end
     end
+  end
 
-    local ok, err, pc_results, binfo =
-      dicom.associate_extended(host, port, calling_aet, called_aet, pcs)
-
-    if not ok then
-      -- A whole-association rejection (AET allowlist, app-context, protocol
-      -- version, congestion) hits before any PC is evaluated, so every other
-      -- batch would be rejected identically. Report it once and stop.
-      if type(err) == "table" and err.err == "ASSOCIATE REJECT received" then
-        if ok_batches == 0 then
-          report_reject(out, err)
-          mark_dicom_service(host, port)
-          return out
+  -- Pass 2 (isolation): a wholesale failure tells us nothing about *which*
+  -- context caused it — a single Q/R abstract syntax can make some devices
+  -- drop the entire association (PS3.8 §9.3.3.2 says they should reject the
+  -- PC, not the association, but non-conformant devices exist). Re-probe the
+  -- failed contexts one tier at a time, most-permissive first, so a hostile
+  -- tier can't hide the capabilities of the others.
+  if #to_isolate > 0 then
+    isolated = true
+    local tiers = {
+      { name = "verification",   list = {} },
+      { name = "core",           list = {} },
+      { name = "query-retrieve", list = {} },
+    }
+    local by_name = {}
+    for _, t in ipairs(tiers) do by_name[t.name] = t.list end
+    for _, pc in ipairs(to_isolate) do
+      local bucket = by_name[pc_tier(pc)]
+      bucket[#bucket + 1] = pc
+    end
+    for _, t in ipairs(tiers) do
+      if #t.list > 0 then
+        local g = associate_group(host, port, calling_aet, called_aet, t.list, max_pcs)
+        absorb(g)
+        if #g.failures > 0 then
+          local rep = g.failures[1].err
+          tier_failed[t.name] = is_reject(rep) and "rejects" or "drops"
+          if is_reject(rep) then first_reject = first_reject or rep
+          else first_error = first_error or rep end
         end
-        -- Already past the AET gate on an earlier batch: a reject here is
-        -- anomalous. Note it and keep the results we have.
-        stdnse.debug1("DICOM: batch %d/%d rejected after an earlier accept: %s / %s",
-          bi, #batches, err.result_text or "?", err.reason_text or "?")
-      else
-        -- Socket error / timeout / unexpected PDU.
-        local e = type(err) == "table" and (err.err or "error") or tostring(err or "")
-        if ok_batches == 0 then
-          out.dicom = "DICOM Service Provider discovered!"
-          out.error = e
-          return nil
-        end
-        stdnse.debug1("DICOM: batch %d/%d failed after an earlier accept: %s",
-          bi, #batches, e)
-      end
-    else
-      ok_batches = ok_batches + 1
-      info = info or binfo
-      for i, r in ipairs(pc_results) do
-        merged[#merged + 1] = {
-          name            = batch[i].name,
-          result          = r.result,
-          accepted_ts     = r.accepted_ts,
-          abstract_syntax = r.abstract_syntax,
-        }
       end
     end
+  end
+
+  -- Nothing accepted anywhere: fall back to the single-failure report so the
+  -- AET / protocol-version hints still surface (today's behavior).
+  if ok_assocs == 0 then
+    if first_reject then
+      report_reject(out, first_reject)
+      mark_dicom_service(host, port)
+      return out
+    end
+    out.dicom = "DICOM Service Provider discovered!"
+    out.error = type(first_error) == "table" and (first_error.err or "error")
+                or tostring(first_error or "unknown error")
+    return nil
   end
 
   -- Resolve vendor / version once and reuse for both port.version metadata
@@ -628,9 +734,33 @@ action = function(host, port)
 
   -- Note the proposal scope when it spanned more than one association, so the
   -- output is self-describing about how thorough the scan was.
-  if sop_mode == "full" or #batches > 1 then
-    out.scan = string.format("%s coverage: %d SOP classes in %d association(s)",
-      sop_mode, #pc_list, #batches)
+  if sop_mode == "full" or assoc_total > 1 then
+    out.scan = string.format("%s coverage: %d SOP classes across %d association(s)%s",
+      sop_mode, #pc_list, assoc_total,
+      isolated and "; isolated failing groups by tier" or "")
+  end
+
+  -- Surface non-conformant negotiation behavior discovered during isolation.
+  -- These are strong device fingerprints in their own right (and explain why
+  -- a naive single-association scan "just fails" against such a device).
+  if tier_failed["query-retrieve"] then
+    out.quirk_query_retrieve = string.format(
+      "%s the whole association when a Query/Retrieve SOP class is proposed "
+      .. "(non-conformant; Q/R isolated so other contexts still enumerate). "
+      .. "Often a Q/R *SCU* — it queries other nodes rather than serving Q/R.",
+      tier_failed["query-retrieve"] == "rejects" and "Rejects" or "Drops/aborts")
+  end
+  if tier_failed["core"] then
+    out.quirk_operations = string.format(
+      "%s associations proposing non-Verification operations while accepting "
+      .. "Verification — AET/allowlist enforcement likely applies to "
+      .. "Storage/operations but not to C-ECHO.",
+      tier_failed["core"] == "rejects" and "Rejects" or "Drops/aborts")
+  end
+  if tier_failed["verification"] then
+    out.quirk_verification = string.format(
+      "%s a Verification-only association.",
+      tier_failed["verification"] == "rejects" and "Rejects" or "Drops/aborts")
   end
 
   -- Bucket per-PC results and collect accepted service classes / UIDs.

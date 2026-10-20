@@ -25,11 +25,27 @@ The library hooks into Nmap's port.version.service_tunnel property to automatica
 
 ## dicom-enum
 
-`dicom-enum.nse` proposes ~28 curated presentation contexts (Verification, the major Storage SOP classes, Modality Worklist FIND, Patient/Study Root Q/R, Storage Commitment, MPPS, and Print) in a single A-ASSOCIATE request and parses the per-PC result map returned in the A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2). Each PC is reported as `accepted`, `user-rejection`, `no-reason`, `abstract-syntax-not-supported`, or `transfer-syntaxes-not-supported`. Storage SOP classes propose the full transfer-syntax matrix (Implicit/Explicit VR, Deflate, JPEG Baseline/Lossless, JPEG-LS, JPEG2000 lossless+lossy, RLE, HTJ2K). Accepted abstract syntaxes are mapped to DICOM service classes and an `inferred_device_class` line (PACS/VNA, Modality, RIS gateway, Archive front-end, Print server) is rendered. Output shape mirrors `ssh2-enum-algos`. Categories are `discovery, safe` (not `default`) — same call the maintainers made for `ssh2-enum-algos`.
+`dicom-enum.nse` proposes a curated set of presentation contexts (Verification, the Storage SOP classes, Modality Worklist FIND, Patient/Study Root Q/R, Storage Commitment, MPPS, UPS, and Print) in a **single A-ASSOCIATE request** and parses the per-PC result map returned in the A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2). Each PC is reported as `accepted`, `user-rejection`, `no-reason`, `abstract-syntax-not-supported`, or `transfer-syntaxes-not-supported`. Accepted abstract syntaxes are mapped to DICOM service classes, imaging `modalities`, DIMSE `service_commands` (C-ECHO/C-STORE/C-FIND/C-MOVE/C-GET), and an `inferred_device_class` line (PACS/VNA, Modality, RIS gateway, Archive front-end, Print server). Output shape mirrors `ssh2-enum-algos`. Categories are `discovery, safe` (not `default`) — same call the maintainers made for `ssh2-enum-algos`.
+
+This script is the merge of two independent efforts (`dicom-enum` + Paulino Calderon's `dicom-info`), keeping the single-association engine and this repo's non-impersonating library while folding in the richer SOP catalogue, DICOM-over-TLS certificate inspection, and the security assessment from `dicom-info`.
+
+### Ubiquity (old and new devices)
+
+Every presentation context is proposed with **Implicit VR Little Endian** — the one transfer syntax every conformant SCP must support (PS3.5 §10.1) — so even the oldest modality negotiates at least one context. The breadth/PDU-size trade-off is controlled by `--script-args dicom-enum.probe`:
+
+| Depth | SOP classes | Storage transfer syntaxes | A-ASSOCIATE-RQ | Use for |
+|-------|-------------|---------------------------|----------------|---------|
+| `basic` | core | Implicit + Explicit VR only | ~3 KB | fragile/embedded legacy devices |
+| `standard` *(default)* | core | commonly-negotiated set (Implicit/Explicit, Deflate, JPEG Baseline/Lossless, JPEG2000 lossless+lossy, RLE) | ~7 KB | everyday scanning |
+| `full` | core **+ long tail** (Multi-frame SC, RT, extended SR, UPS, ophthalmic, waveform/ECG, segmentation, parametric map, whole-slide, ...) | the complete matrix incl. JPEG-LS, Explicit VR BE, HTJ2K | ~21 KB | exhaustive codec/SOP fingerprinting of modern devices |
+
+### Transport & security
+
+Transport adapts to Nmap's own `-sV` SSL/TLS detection, or is forced with `--script-args dicom.tls=true|false`. On a TLS association the peer certificate (subject, issuer, validity, key strength, signature algorithm) is reported, and a `security` block flags findings derived **purely from the single association** — no DIMSE commands or patient data are ever sent: unauthenticated (no AE-title allowlist) access, Query/Retrieve C-FIND/C-MOVE/C-GET exfiltration surface, unauthenticated C-STORE surface, plaintext PHI, a weak or self-signed TLS certificate, and absent mutual TLS (IHE ATNA node authentication).
 
 The library identifies itself with an ITU-T X.667 self-issued OID (`2.25.<UUID>`) and Implementation Version Name `NMAP_NSE`. It does not impersonate DCMTK, OFFIS, or any registered vendor. After a successful association the script sends an A-RELEASE-RQ for an orderly close so SCPs do not log the scan as an abort; pass `--script-args dicom.no_release` to skip the release.
 
-Capability-only: `dicom-enum` does **not** brute-force AETs. If the target enforces an AET allowlist, run `dicom-brute` first to learn a valid pair, then pass it via `--script-args dicom.called_aet=<X> dicom.calling_aet=<Y>` to either `dicom-ping` or `dicom-enum`.
+Capability-only: `dicom-enum` does **not** brute-force AETs or send DIMSE commands. If the target enforces an AET allowlist, run `dicom-brute` first to learn a valid pair, then pass it via `--script-args dicom.called_aet=<X> dicom.calling_aet=<Y>` to either `dicom-ping` or `dicom-enum`.
 
 ## DICOM Web script
 Detect DICOM-related HTTP endpoints

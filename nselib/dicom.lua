@@ -306,6 +306,18 @@ SOP_MODALITY_BY_UID = {
   {uid = "1.2.840.10008.5.1.4.1.1.77.1.4",      modality = "VL Photographic"},
   -- Radiotherapy
   {uid = "1.2.840.10008.5.1.4.1.1.481.1",       modality = "RT Image"},
+  -- Ophthalmology
+  {uid = "1.2.840.10008.5.1.4.1.1.77.1.5.1",    modality = "Ophthalmic Photography"},
+  {uid = "1.2.840.10008.5.1.4.1.1.77.1.5.2",    modality = "Ophthalmic Photography"},
+  {uid = "1.2.840.10008.5.1.4.1.1.77.1.5.4",    modality = "Ophthalmic Tomography (OCT)"},
+  -- Cardiology / physiological waveforms
+  {uid = "1.2.840.10008.5.1.4.1.1.9.1.1",       modality = "ECG (Waveform)"},
+  {uid = "1.2.840.10008.5.1.4.1.1.9.1.2",       modality = "ECG (Waveform)"},
+  {uid = "1.2.840.10008.5.1.4.1.1.9.1.3",       modality = "ECG (Waveform)"},
+  -- Digital pathology / microscopy
+  {uid = "1.2.840.10008.5.1.4.1.1.77.1.2",      modality = "Microscopy"},
+  {uid = "1.2.840.10008.5.1.4.1.1.77.1.2.1",    modality = "Microscopy"},
+  {uid = "1.2.840.10008.5.1.4.1.1.77.1.6",      modality = "Whole Slide Imaging"},
   -- Document / non-image objects (no implied physical modality)
   {uid = "1.2.840.10008.5.1.4.1.1.7",           modality = "Secondary Capture"},
   {uid = "1.2.840.10008.5.1.4.1.1.104.1",       modality = "Encapsulated Document"},
@@ -436,15 +448,27 @@ function start_connection(host, port)
   local dcm = {}
   dcm['socket'] = nmap.new_socket()
 
-  -- Dynamically adapt to SSL/TLS if detected by Nmap core
+  -- Transport selection (PS3.15 §B.1 DICOM-over-TLS):
+  --   dicom.tls=true  -> force a TLS association
+  --   dicom.tls=false -> force plaintext
+  --   unset           -> adapt to Nmap's own SSL/TLS service detection
+  -- (so `-sV` on an stunnel-fronted SCP, or the dicom-tls service name, is
+  -- honoured without a script-arg).
   local protocol = "tcp"
   local is_ssl = false
 
-  if port.version and port.version.service_tunnel == "ssl" then
+  local tls_arg = stdnse.get_script_args("dicom.tls")
+  if tls_arg == "true" then
     is_ssl = true
-  end
-  if port.version and type(port.version.name) == "string" and port.version.name:match("tls") then
-    is_ssl = true
+  elseif tls_arg == "false" then
+    is_ssl = false
+  else
+    if port.version and port.version.service_tunnel == "ssl" then
+      is_ssl = true
+    end
+    if port.version and type(port.version.name) == "string" and port.version.name:match("tls") then
+      is_ssl = true
+    end
   end
 
   if is_ssl then
@@ -460,6 +484,9 @@ function start_connection(host, port)
   local t = tonumber(stdnse.get_script_args("dicom.timeout_ms")) or 3000
   dcm['socket']:set_timeout(t)
 
+  -- Record the negotiated transport so association helpers can report it and
+  -- fetch the peer certificate.
+  dcm['is_ssl'] = is_ssl
   return true, dcm
 end
 
@@ -952,6 +979,15 @@ function associate_extended(host, port, calling_aet, called_aet, presentation_co
 
   local parsed = parse_associate_accept(response_data)
 
+  -- On a TLS association, grab the peer certificate before we close the
+  -- socket so the caller can report issuer/validity/key-strength. Best-effort:
+  -- a stack without get_ssl_certificate just yields a nil cert.
+  local peer_cert
+  if dcm['is_ssl'] then
+    local okc, cert = pcall(function() return dcm['socket']:get_ssl_certificate() end)
+    if okc then peer_cert = cert end
+  end
+
   -- Send A-RELEASE-RQ for an orderly close (PS3.8 §9.1, §9.3.6). Skipping it
   -- causes SCPs to log the association as an abort, which fires abort-rate
   -- alerts in clinical environments. Opt out via dicom.no_release for the
@@ -986,6 +1022,8 @@ function associate_extended(host, port, calling_aet, called_aet, presentation_co
     max_pdu      = parsed.max_pdu,
     impl_uid     = parsed.impl_uid,
     impl_version = parsed.impl_version,
+    tls          = dcm['is_ssl'] or false,
+    cert         = peer_cert,
   }
 
   return true, nil, pc_results, info

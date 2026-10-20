@@ -14,17 +14,30 @@ at debug level only (-d), since "everything we proposed that this SCP
 doesn't serve" is useful for triage but noise in default output.
 
 This is a capability fingerprint: it identifies which Storage SOP classes
-the SCP serves (CT/MR/US/CR/DX/Mammo/PET/NM/XA/XRF/Endoscopy/...), whether
-it supports Modality Worklist FIND, Patient/Study Root Query/Retrieve,
-Storage Commitment, MPPS, and Print Management, and which transfer
-syntaxes it negotiates.
+the SCP serves (CT/MR/US/CR/DX/Mammo/PET/NM/XA/XRF/Endoscopy/RT/SR/ECG/
+Ophthalmic/Whole-Slide/...), whether it supports Modality Worklist FIND,
+Patient/Study Root Query/Retrieve, Storage Commitment, MPPS, UPS, and Print
+Management, and which transfer syntaxes it negotiates.
+
+Ubiquity: every presentation context is proposed with Implicit VR Little
+Endian (the one transfer syntax every conformant SCP must support, PS3.5
+§10.1), so even the oldest modalities negotiate at least one context. Three
+probe depths trade breadth against A-ASSOCIATE-RQ size:
+  basic    - core SOP classes, Implicit+Explicit VR only (smallest PDU;
+             best for fragile/embedded legacy devices)
+  standard - core SOP classes with the commonly-negotiated transfer-syntax
+             set (default)
+  full     - core + long-tail SOP classes (Multi-frame SC, RT, extended SR,
+             UPS, ophthalmic, waveform, segmentation, whole-slide, ...) with
+             the complete transfer-syntax matrix
 
 From the accepted SOP classes the script also derives:
   modalities         - the imaging modalities implied by accepted Storage
                        SOP classes (CT, MRI, Ultrasound, Mammography,
                        X-Ray, X-Ray Angiography, Fluoroscopy, PET, PET-CT,
-                       Nuclear Medicine, Endoscopy, ...). PET-CT is
-                       reported when both PET and CT are accepted.
+                       Nuclear Medicine, Endoscopy, ECG, Ophthalmic,
+                       Whole Slide Imaging, ...). PET-CT is reported when
+                       both PET and CT are accepted.
   service_commands   - the DIMSE commands implied by the accepted SOP
                        classes: C-ECHO (Verification), C-STORE (Storage),
                        C-FIND (Q/R FIND or Modality Worklist FIND),
@@ -34,6 +47,13 @@ From the accepted SOP classes the script also derives:
                        practitioner consensus, not a normative DICOM
                        concept; treat it as a fingerprint, not a
                        classification.
+  security           - transport (plaintext vs DICOM-over-TLS), the TLS peer
+                       certificate when present, and findings derived purely
+                       from what the single association already revealed
+                       (unauthenticated access, Query/Retrieve exfiltration
+                       surface, unauthenticated C-STORE surface, plaintext
+                       PHI, weak/mismatched TLS certificate, absent mutual
+                       TLS). No DIMSE commands or patient data are ever sent.
 
 This script does NOT brute-force Application Entity Titles. If the target
 PACS enforces an AET allowlist, the association is rejected before any
@@ -47,14 +67,21 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- @usage nmap -p 4242 --script dicom-enum <target>
 -- @usage nmap -sV -p 4242 --script dicom-enum <target>
 -- @usage nmap -p 11112 --script dicom-enum --script-args dicom.called_aet=ORTHANC <target>
+-- @usage nmap -p 2762 --script dicom-enum --script-args dicom.tls=true <target>
+-- @usage nmap --script dicom-enum --script-args dicom-enum.probe=full <target>
 -- @usage nmap --script dicom-enum --script-args dicom-enum.ports=11114,11115 <target>
 --
 -- @args dicom.called_aet     Called AET. Default: ANY-SCP
 -- @args dicom.calling_aet    Calling AET. Default: ECHOSCU
 -- @args dicom.timeout_ms     Socket timeout in ms. Default: 3000
+-- @args dicom.tls            Transport override: "true" forces DICOM-over-TLS,
+--                            "false" forces plaintext. Default: unset (adapt
+--                            to Nmap's own -sV SSL/TLS service detection).
 -- @args dicom.no_release     If set, the script omits A-RELEASE-RQ and lets
 --                            the SCP see an aborted association. Default:
 --                            unset (release is sent).
+-- @args dicom-enum.probe     Probe depth: "basic", "standard" (default), or
+--                            "full". See the description for the trade-off.
 -- @args dicom-enum.ports     Optional comma-separated list of ports to
 --                            probe (e.g. "104,11112,2761,2762,4242").
 --
@@ -89,7 +116,14 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- |       items:
 -- |         Verification - Implicit VR Little Endian
 -- |         CT Image Storage - Explicit VR Little Endian
--- |_        MR Image Storage - JPEG 2000 Image Compression (Lossless Only)
+-- |         MR Image Storage - JPEG 2000 Image Compression (Lossless Only)
+-- |   security:
+-- |     transport: plaintext (no TLS)
+-- |     findings:
+-- |       Any called-AET accepted — no AE-title allowlist enforced
+-- |       Query/Retrieve C-MOVE accepted — bulk retrieval to an arbitrary AE
+-- |       15 Storage SOP classes accepted — unauthenticated C-STORE surface
+-- |_      Plaintext transport — associations and PHI exposed on the wire
 --
 -- @output
 -- PORT     STATE SERVICE
@@ -129,9 +163,15 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 --     </table>
 --   </table>
 -- </table>
+-- <table key="security">
+--   <elem key="transport">plaintext (no TLS)</elem>
+--   <table key="findings">
+--     <elem>Any called-AET accepted — no AE-title allowlist enforced</elem>
+--   </table>
+-- </table>
 ---
 
-author     = "Tyler M <tmart234()gmail.com>"
+author     = "Tyler M <tmart234()gmail.com>, Paulino Calderon <paulino()calderonpale.com>"
 license    = "Same as Nmap--See https://nmap.org/book/man-legal.html"
 categories = {"discovery", "safe"}
 
@@ -142,12 +182,11 @@ local nmap      = require "nmap"
 local table     = require "table"
 local string    = require "string"
 
--- ---------- Curated Presentation Context list ----------
+-- ---------- Transfer syntaxes ----------
 -- Abstract syntax UIDs are taken from PS3.4 (Storage / Worklist / Q-R) and
--- PS3.6 (registry of UIDs). The list is fixed for v1; per-profile presets
--- (storage-only, qr-only, ...) are an obvious follow-on PR.
+-- PS3.6 (registry of UIDs).
 
-local TS_I       = "1.2.840.10008.1.2"        -- Implicit VR LE
+local TS_I       = "1.2.840.10008.1.2"        -- Implicit VR LE  (mandatory)
 local TS_E       = "1.2.840.10008.1.2.1"      -- Explicit VR LE
 local TS_EBE     = "1.2.840.10008.1.2.2"      -- Explicit VR Big Endian
 local TS_DEFLATE = "1.2.840.10008.1.2.1.99"   -- Deflated Explicit VR LE
@@ -161,67 +200,141 @@ local TS_HTJ2K_L = "1.2.840.10008.1.2.4.201"  -- HTJ2K Lossless (Sup235)
 local TS_HTJ2K_R = "1.2.840.10008.1.2.4.202"  -- HTJ2K Lossless RPCL
 local TS_HTJ2K   = "1.2.840.10008.1.2.4.203"  -- HTJ2K (Lossy)
 
--- Storage SOP classes accept the full transfer-syntax matrix. PDU-size
--- sanity: 25 storage PCs × 13 TS sub-items × ~30 bytes/TS ≈ 9.8 KB plus
--- ~2 KB of non-storage PCs and headers — well under the 16 KB max PDU.
-local STORAGE_TS = {
+-- Storage transfer-syntax sets, chosen per probe depth. Implicit VR LE is
+-- always first so that even an SCP that negotiates nothing else still
+-- accepts the context (PS3.5 §10.1 makes Implicit VR LE mandatory).
+--
+--   basic    - Implicit + Explicit VR only; smallest A-ASSOCIATE-RQ, best
+--              for fragile/embedded legacy devices that choke on large PDUs.
+--   standard - the transfer syntaxes a SCP realistically negotiates in the
+--              field; moderate PDU size (default).
+--   full     - the complete matrix, for exhaustive codec fingerprinting of
+--              modern devices.
+local TS_STORAGE_BASIC    = { TS_I, TS_E }
+local TS_STORAGE_STANDARD = {
+  TS_I, TS_E, TS_DEFLATE, TS_JPEG_BL, TS_JPEG_LL, TS_J2K_LL, TS_J2K, TS_RLE,
+}
+local TS_STORAGE_FULL = {
   TS_I, TS_E, TS_EBE, TS_DEFLATE,
   TS_JPEG_BL, TS_JPEG_LL, TS_JLS_LL,
   TS_J2K_LL, TS_J2K, TS_RLE,
   TS_HTJ2K_L, TS_HTJ2K_R, TS_HTJ2K,
 }
 
--- Non-storage classes (Verification, Q/R, MWL, MPPS, StgCmt, Print) do not
--- benefit from compressed transfer syntaxes; keep the proposal minimal.
-local CMD_TS = {TS_I, TS_E}
+-- Non-storage classes (Verification, Q/R, MWL, MPPS, StgCmt, UPS, Print) do
+-- not benefit from compressed transfer syntaxes; keep the proposal minimal.
+local CMD_TS = { TS_I, TS_E }
 
-local PC_LIST = {
+-- ---------- Master presentation-context catalogue ----------
+-- kind  = "storage" (gets the depth-selected storage TS set) or "cmd"
+--         (always CMD_TS).
+-- depth = "core" (proposed at every depth) or "ext" (proposed only in
+--         "full"). The "core" set is the broadly-supported capability
+--         surface; "ext" is the long tail that matters for exhaustive
+--         fingerprinting of modern systems.
+local PC_MASTER = {
   -- Verification
-  {name = "Verification",                                uid = "1.2.840.10008.1.1",                   ts = CMD_TS},
+  {name = "Verification",                                uid = "1.2.840.10008.1.1",                   kind = "cmd",     depth = "core"},
 
-  -- Storage SOP classes
-  {name = "CT Image Storage",                            uid = "1.2.840.10008.5.1.4.1.1.2",           ts = STORAGE_TS},
-  {name = "Enhanced CT Image Storage",                   uid = "1.2.840.10008.5.1.4.1.1.2.1",         ts = STORAGE_TS},
-  {name = "MR Image Storage",                            uid = "1.2.840.10008.5.1.4.1.1.4",           ts = STORAGE_TS},
-  {name = "Enhanced MR Image Storage",                   uid = "1.2.840.10008.5.1.4.1.1.4.1",         ts = STORAGE_TS},
-  {name = "Ultrasound Image Storage",                    uid = "1.2.840.10008.5.1.4.1.1.6.1",         ts = STORAGE_TS},
-  {name = "Ultrasound Multi-frame Image Storage",        uid = "1.2.840.10008.5.1.4.1.1.3.1",         ts = STORAGE_TS},
-  {name = "Computed Radiography Image Storage",          uid = "1.2.840.10008.5.1.4.1.1.1",           ts = STORAGE_TS},
-  {name = "Digital X-Ray Image Storage - For Presentation", uid = "1.2.840.10008.5.1.4.1.1.1.1",      ts = STORAGE_TS},
-  {name = "Digital X-Ray Image Storage - For Processing",   uid = "1.2.840.10008.5.1.4.1.1.1.1.1",    ts = STORAGE_TS},
-  {name = "Digital Mammography X-Ray Image Storage - For Presentation", uid = "1.2.840.10008.5.1.4.1.1.1.2",   ts = STORAGE_TS},
-  {name = "Digital Mammography X-Ray Image Storage - For Processing",   uid = "1.2.840.10008.5.1.4.1.1.1.2.1", ts = STORAGE_TS},
-  {name = "X-Ray Angiographic Image Storage",            uid = "1.2.840.10008.5.1.4.1.1.12.1",        ts = STORAGE_TS},
-  {name = "Enhanced X-Ray Angiographic Image Storage",   uid = "1.2.840.10008.5.1.4.1.1.12.1.1",      ts = STORAGE_TS},
-  {name = "X-Ray Radiofluoroscopic Image Storage",       uid = "1.2.840.10008.5.1.4.1.1.12.2",        ts = STORAGE_TS},
-  {name = "Enhanced X-Ray Radiofluoroscopic Image Storage", uid = "1.2.840.10008.5.1.4.1.1.12.2.1",   ts = STORAGE_TS},
-  {name = "Nuclear Medicine Image Storage",              uid = "1.2.840.10008.5.1.4.1.1.20",          ts = STORAGE_TS},
-  {name = "Positron Emission Tomography Image Storage",  uid = "1.2.840.10008.5.1.4.1.1.128",         ts = STORAGE_TS},
-  {name = "Enhanced PET Image Storage",                  uid = "1.2.840.10008.5.1.4.1.1.130",         ts = STORAGE_TS},
-  {name = "VL Endoscopic Image Storage",                 uid = "1.2.840.10008.5.1.4.1.1.77.1.1",      ts = STORAGE_TS},
-  {name = "Video Endoscopic Image Storage",              uid = "1.2.840.10008.5.1.4.1.1.77.1.1.1",    ts = STORAGE_TS},
-  {name = "Secondary Capture Image Storage",             uid = "1.2.840.10008.5.1.4.1.1.7",           ts = STORAGE_TS},
-  {name = "Encapsulated PDF Storage",                    uid = "1.2.840.10008.5.1.4.1.1.104.1",       ts = STORAGE_TS},
-  {name = "Basic Text SR Storage",                       uid = "1.2.840.10008.5.1.4.1.1.88.11",       ts = STORAGE_TS},
-  {name = "Comprehensive SR Storage",                    uid = "1.2.840.10008.5.1.4.1.1.88.33",       ts = STORAGE_TS},
-  {name = "Grayscale Softcopy Presentation State Storage", uid = "1.2.840.10008.5.1.4.1.1.11.1",      ts = STORAGE_TS},
+  -- Storage SOP classes (core)
+  {name = "CT Image Storage",                            uid = "1.2.840.10008.5.1.4.1.1.2",           kind = "storage", depth = "core"},
+  {name = "Enhanced CT Image Storage",                   uid = "1.2.840.10008.5.1.4.1.1.2.1",         kind = "storage", depth = "core"},
+  {name = "MR Image Storage",                            uid = "1.2.840.10008.5.1.4.1.1.4",           kind = "storage", depth = "core"},
+  {name = "Enhanced MR Image Storage",                   uid = "1.2.840.10008.5.1.4.1.1.4.1",         kind = "storage", depth = "core"},
+  {name = "Ultrasound Image Storage",                    uid = "1.2.840.10008.5.1.4.1.1.6.1",         kind = "storage", depth = "core"},
+  {name = "Ultrasound Multi-frame Image Storage",        uid = "1.2.840.10008.5.1.4.1.1.3.1",         kind = "storage", depth = "core"},
+  {name = "Computed Radiography Image Storage",          uid = "1.2.840.10008.5.1.4.1.1.1",           kind = "storage", depth = "core"},
+  {name = "Digital X-Ray Image Storage - For Presentation", uid = "1.2.840.10008.5.1.4.1.1.1.1",      kind = "storage", depth = "core"},
+  {name = "Digital X-Ray Image Storage - For Processing",   uid = "1.2.840.10008.5.1.4.1.1.1.1.1",    kind = "storage", depth = "core"},
+  {name = "Digital Mammography X-Ray Image Storage - For Presentation", uid = "1.2.840.10008.5.1.4.1.1.1.2",   kind = "storage", depth = "core"},
+  {name = "Digital Mammography X-Ray Image Storage - For Processing",   uid = "1.2.840.10008.5.1.4.1.1.1.2.1", kind = "storage", depth = "core"},
+  {name = "X-Ray Angiographic Image Storage",            uid = "1.2.840.10008.5.1.4.1.1.12.1",        kind = "storage", depth = "core"},
+  {name = "Enhanced X-Ray Angiographic Image Storage",   uid = "1.2.840.10008.5.1.4.1.1.12.1.1",      kind = "storage", depth = "core"},
+  {name = "X-Ray Radiofluoroscopic Image Storage",       uid = "1.2.840.10008.5.1.4.1.1.12.2",        kind = "storage", depth = "core"},
+  {name = "Enhanced X-Ray Radiofluoroscopic Image Storage", uid = "1.2.840.10008.5.1.4.1.1.12.2.1",   kind = "storage", depth = "core"},
+  {name = "Nuclear Medicine Image Storage",              uid = "1.2.840.10008.5.1.4.1.1.20",          kind = "storage", depth = "core"},
+  {name = "Positron Emission Tomography Image Storage",  uid = "1.2.840.10008.5.1.4.1.1.128",         kind = "storage", depth = "core"},
+  {name = "Enhanced PET Image Storage",                  uid = "1.2.840.10008.5.1.4.1.1.130",         kind = "storage", depth = "core"},
+  {name = "VL Endoscopic Image Storage",                 uid = "1.2.840.10008.5.1.4.1.1.77.1.1",      kind = "storage", depth = "core"},
+  {name = "Video Endoscopic Image Storage",              uid = "1.2.840.10008.5.1.4.1.1.77.1.1.1",    kind = "storage", depth = "core"},
+  {name = "Secondary Capture Image Storage",             uid = "1.2.840.10008.5.1.4.1.1.7",           kind = "storage", depth = "core"},
+  {name = "Encapsulated PDF Storage",                    uid = "1.2.840.10008.5.1.4.1.1.104.1",       kind = "storage", depth = "core"},
+  {name = "Basic Text SR Storage",                       uid = "1.2.840.10008.5.1.4.1.1.88.11",       kind = "storage", depth = "core"},
+  {name = "Comprehensive SR Storage",                    uid = "1.2.840.10008.5.1.4.1.1.88.33",       kind = "storage", depth = "core"},
+  {name = "Grayscale Softcopy Presentation State Storage", uid = "1.2.840.10008.5.1.4.1.1.11.1",      kind = "storage", depth = "core"},
 
-  -- Worklist + Query/Retrieve
-  {name = "Modality Worklist Information Model - FIND",  uid = "1.2.840.10008.5.1.4.31",              ts = CMD_TS},
-  {name = "Patient Root Query/Retrieve - FIND",          uid = "1.2.840.10008.5.1.4.1.2.1.1",         ts = CMD_TS},
-  {name = "Patient Root Query/Retrieve - MOVE",          uid = "1.2.840.10008.5.1.4.1.2.1.2",         ts = CMD_TS},
-  {name = "Patient Root Query/Retrieve - GET",           uid = "1.2.840.10008.5.1.4.1.2.1.3",         ts = CMD_TS},
-  {name = "Study Root Query/Retrieve - FIND",            uid = "1.2.840.10008.5.1.4.1.2.2.1",         ts = CMD_TS},
-  {name = "Study Root Query/Retrieve - MOVE",            uid = "1.2.840.10008.5.1.4.1.2.2.2",         ts = CMD_TS},
-  {name = "Study Root Query/Retrieve - GET",             uid = "1.2.840.10008.5.1.4.1.2.2.3",         ts = CMD_TS},
+  -- Storage SOP classes (extended / long tail — full probe only)
+  {name = "Multi-frame Single Bit SC Image Storage",     uid = "1.2.840.10008.5.1.4.1.1.7.1",         kind = "storage", depth = "ext"},
+  {name = "Multi-frame Grayscale Byte SC Image Storage", uid = "1.2.840.10008.5.1.4.1.1.7.2",         kind = "storage", depth = "ext"},
+  {name = "Multi-frame Grayscale Word SC Image Storage", uid = "1.2.840.10008.5.1.4.1.1.7.3",         kind = "storage", depth = "ext"},
+  {name = "Multi-frame True Color SC Image Storage",     uid = "1.2.840.10008.5.1.4.1.1.7.4",         kind = "storage", depth = "ext"},
+  {name = "Enhanced SR Storage",                         uid = "1.2.840.10008.5.1.4.1.1.88.22",       kind = "storage", depth = "ext"},
+  {name = "Comprehensive 3D SR Storage",                 uid = "1.2.840.10008.5.1.4.1.1.88.34",       kind = "storage", depth = "ext"},
+  {name = "Key Object Selection Document Storage",       uid = "1.2.840.10008.5.1.4.1.1.88.59",       kind = "storage", depth = "ext"},
+  {name = "Color Softcopy Presentation State Storage",   uid = "1.2.840.10008.5.1.4.1.1.11.2",        kind = "storage", depth = "ext"},
+  {name = "Segmentation Storage",                        uid = "1.2.840.10008.5.1.4.1.1.66.4",        kind = "storage", depth = "ext"},
+  {name = "Parametric Map Storage",                      uid = "1.2.840.10008.5.1.4.1.1.30",          kind = "storage", depth = "ext"},
+  {name = "Raw Data Storage",                            uid = "1.2.840.10008.5.1.4.1.1.66",          kind = "storage", depth = "ext"},
+  {name = "VL Microscopic Image Storage",                uid = "1.2.840.10008.5.1.4.1.1.77.1.2",      kind = "storage", depth = "ext"},
+  {name = "VL Photographic Image Storage",               uid = "1.2.840.10008.5.1.4.1.1.77.1.4",      kind = "storage", depth = "ext"},
+  {name = "VL Whole Slide Microscopy Image Storage",     uid = "1.2.840.10008.5.1.4.1.1.77.1.6",      kind = "storage", depth = "ext"},
+  {name = "Ophthalmic Photography 8 Bit Image Storage",  uid = "1.2.840.10008.5.1.4.1.1.77.1.5.1",    kind = "storage", depth = "ext"},
+  {name = "Ophthalmic Photography 16 Bit Image Storage", uid = "1.2.840.10008.5.1.4.1.1.77.1.5.2",    kind = "storage", depth = "ext"},
+  {name = "Ophthalmic Tomography Image Storage",         uid = "1.2.840.10008.5.1.4.1.1.77.1.5.4",    kind = "storage", depth = "ext"},
+  {name = "12-lead ECG Waveform Storage",                uid = "1.2.840.10008.5.1.4.1.1.9.1.1",       kind = "storage", depth = "ext"},
+  {name = "General ECG Waveform Storage",                uid = "1.2.840.10008.5.1.4.1.1.9.1.2",       kind = "storage", depth = "ext"},
+  {name = "Ambulatory ECG Waveform Storage",             uid = "1.2.840.10008.5.1.4.1.1.9.1.3",       kind = "storage", depth = "ext"},
+  {name = "RT Image Storage",                            uid = "1.2.840.10008.5.1.4.1.1.481.1",       kind = "storage", depth = "ext"},
+  {name = "RT Dose Storage",                             uid = "1.2.840.10008.5.1.4.1.1.481.2",       kind = "storage", depth = "ext"},
+  {name = "RT Structure Set Storage",                    uid = "1.2.840.10008.5.1.4.1.1.481.3",       kind = "storage", depth = "ext"},
+  {name = "RT Plan Storage",                             uid = "1.2.840.10008.5.1.4.1.1.481.5",       kind = "storage", depth = "ext"},
+  {name = "RT Ion Plan Storage",                         uid = "1.2.840.10008.5.1.4.1.1.481.8",       kind = "storage", depth = "ext"},
+  {name = "Encapsulated CDA Storage",                    uid = "1.2.840.10008.5.1.4.1.1.104.2",       kind = "storage", depth = "ext"},
+  {name = "Encapsulated STL Storage",                    uid = "1.2.840.10008.5.1.4.1.1.104.3",       kind = "storage", depth = "ext"},
+  {name = "Surface Scan Mesh Storage",                   uid = "1.2.840.10008.5.1.4.1.1.68.1",        kind = "storage", depth = "ext"},
 
-  -- Workflow
-  {name = "Storage Commitment Push Model",               uid = "1.2.840.10008.1.20.1",                ts = CMD_TS},
-  {name = "Modality Performed Procedure Step",           uid = "1.2.840.10008.3.1.2.3.3",             ts = CMD_TS},
+  -- Worklist + Query/Retrieve (core)
+  {name = "Modality Worklist Information Model - FIND",  uid = "1.2.840.10008.5.1.4.31",              kind = "cmd",     depth = "core"},
+  {name = "Patient Root Query/Retrieve - FIND",          uid = "1.2.840.10008.5.1.4.1.2.1.1",         kind = "cmd",     depth = "core"},
+  {name = "Patient Root Query/Retrieve - MOVE",          uid = "1.2.840.10008.5.1.4.1.2.1.2",         kind = "cmd",     depth = "core"},
+  {name = "Patient Root Query/Retrieve - GET",           uid = "1.2.840.10008.5.1.4.1.2.1.3",         kind = "cmd",     depth = "core"},
+  {name = "Study Root Query/Retrieve - FIND",            uid = "1.2.840.10008.5.1.4.1.2.2.1",         kind = "cmd",     depth = "core"},
+  {name = "Study Root Query/Retrieve - MOVE",            uid = "1.2.840.10008.5.1.4.1.2.2.2",         kind = "cmd",     depth = "core"},
+  {name = "Study Root Query/Retrieve - GET",             uid = "1.2.840.10008.5.1.4.1.2.2.3",         kind = "cmd",     depth = "core"},
 
-  -- Print
-  {name = "Basic Grayscale Print Management Meta",       uid = "1.2.840.10008.5.1.1.9",               ts = CMD_TS},
+  -- Workflow (core)
+  {name = "Storage Commitment Push Model",               uid = "1.2.840.10008.1.20.1",                kind = "cmd",     depth = "core"},
+  {name = "Modality Performed Procedure Step",           uid = "1.2.840.10008.3.1.2.3.3",             kind = "cmd",     depth = "core"},
+
+  -- Workflow (extended / full probe only)
+  {name = "Unified Procedure Step - Push",               uid = "1.2.840.10008.5.1.4.34.6.1",          kind = "cmd",     depth = "ext"},
+  {name = "Unified Procedure Step - Watch",              uid = "1.2.840.10008.5.1.4.34.6.2",          kind = "cmd",     depth = "ext"},
+
+  -- Print (core)
+  {name = "Basic Grayscale Print Management Meta",       uid = "1.2.840.10008.5.1.1.9",               kind = "cmd",     depth = "core"},
 }
+
+-- Build the list of presentation contexts (and the parallel metadata list)
+-- for the requested probe depth.
+local function storage_ts_for_depth(depth)
+  if depth == "basic" then return TS_STORAGE_BASIC end
+  if depth == "full"  then return TS_STORAGE_FULL  end
+  return TS_STORAGE_STANDARD
+end
+
+local function build_pcs(depth)
+  local want_ext   = (depth == "full")
+  local storage_ts = storage_ts_for_depth(depth)
+  local pcs, meta = {}, {}
+  for _, e in ipairs(PC_MASTER) do
+    if e.depth == "core" or want_ext then
+      local ts = (e.kind == "storage") and storage_ts or CMD_TS
+      pcs[#pcs + 1]  = { abstract_syntax = e.uid, transfer_syntaxes = ts }
+      meta[#meta + 1] = e
+    end
+  end
+  return pcs, meta
+end
 
 -- ---------- portrule ----------
 
@@ -256,7 +369,7 @@ end
 -- emitted at debug level only; the normal-output table reports "accepted".
 local DEBUG_BUCKET_ORDER = {1, 3, 4, 2}
 
--- ---------- action ----------
+local VALID_PROBES = { basic = true, standard = true, full = true }
 
 local function is_tls_port(port)
   if port.version and port.version.service_tunnel == "ssl" then return true end
@@ -271,17 +384,130 @@ local function mark_dicom_service(host, port)
   nmap.set_port_version(host, port)
 end
 
+-- Format a certificate validity date, which Nmap may hand back as a string
+-- or as a broken-out date table.
+local function fmt_cert_date(d)
+  if type(d) == "table" then
+    if d.year then
+      return string.format("%04d-%02d-%02d %02d:%02d:%02d",
+        d.year or 0, d.month or 0, d.day or 0,
+        d.hour or 0, d.min or 0, d.sec or 0)
+    end
+    return "?"
+  end
+  return tostring(d)
+end
+
+-- Summarise a TLS certificate as an ordered output table.
+local function cert_table(cert)
+  local t = stdnse.output_table()
+  t.subject = cert.subject and cert.subject.commonName or "?"
+  t.issuer  = cert.issuer  and cert.issuer.commonName  or "?"
+  if cert.validity and cert.validity.notAfter then
+    t.not_after = fmt_cert_date(cert.validity.notAfter)
+  end
+  if cert.pubkey then
+    local kline = tostring(cert.pubkey.type or "?")
+    if cert.pubkey.bits then kline = kline .. " " .. tostring(cert.pubkey.bits) .. "-bit" end
+    t.public_key = kline
+  end
+  if cert.sig_algorithm then
+    t.signature = tostring(cert.sig_algorithm)
+  end
+  return t
+end
+
+-- Weak-crypto / trust warnings derived from a TLS certificate.
+local function cert_findings(cert, out)
+  if cert.pubkey and cert.pubkey.type == "rsa" and cert.pubkey.bits
+     and cert.pubkey.bits < 2048 then
+    out[#out + 1] = "TLS certificate uses a weak RSA key (< 2048-bit)"
+  end
+  if cert.sig_algorithm then
+    local low = tostring(cert.sig_algorithm):lower()
+    if low:find("sha1") or low:find("md5") then
+      out[#out + 1] = "TLS certificate uses a weak signature algorithm (SHA-1/MD5)"
+    end
+  end
+  local subj = cert.subject and cert.subject.commonName
+  local iss  = cert.issuer  and cert.issuer.commonName
+  if subj and iss and subj == iss then
+    out[#out + 1] = "TLS certificate is self-signed (no CA trust chain)"
+  end
+end
+
+-- Count how many accepted abstract syntaxes are Storage SOP classes, and
+-- which Query/Retrieve DIMSE operations (FIND/MOVE/GET) were accepted.
+local QR_PREFIX = "1.2.840.10008.5.1.4.1.2."
+local STORAGE_PREFIX = "1.2.840.10008.5.1.4.1.1."
+
+local function security_findings(accepted_uids, called_aet, info)
+  local findings = {}
+
+  -- Unauthenticated association: we proposed a default/empty called-AET and
+  -- the SCP still accepted, so it enforces no AE-title allowlist.
+  if not called_aet or called_aet == "" or called_aet == "ANY-SCP" then
+    findings[#findings + 1] = "Any called-AET accepted — no AE-title allowlist enforced"
+  end
+
+  -- Query/Retrieve exfiltration surface.
+  local has_find, has_move, has_get = false, false, false
+  local storage_count = 0
+  for _, uid in ipairs(accepted_uids) do
+    if uid:sub(1, #QR_PREFIX) == QR_PREFIX then
+      local tail = uid:match("%.([123])$")
+      if     tail == "1" then has_find = true
+      elseif tail == "2" then has_move = true
+      elseif tail == "3" then has_get  = true
+      end
+    elseif uid:sub(1, #STORAGE_PREFIX) == STORAGE_PREFIX then
+      storage_count = storage_count + 1
+    end
+  end
+  if has_find then
+    findings[#findings + 1] = "Query/Retrieve C-FIND accepted — patient/study metadata enumeration possible (dicom-brute, then a C-FIND client)"
+  end
+  if has_move then
+    findings[#findings + 1] = "Query/Retrieve C-MOVE accepted — bulk image retrieval to an arbitrary destination AE possible"
+  end
+  if has_get then
+    findings[#findings + 1] = "Query/Retrieve C-GET accepted — direct image retrieval possible"
+  end
+  if storage_count > 0 then
+    findings[#findings + 1] = string.format(
+      "%d Storage SOP class%s accepted — unauthenticated C-STORE (data/malware injection) surface",
+      storage_count, storage_count == 1 and "" or "es")
+  end
+
+  -- Transport.
+  if info and info.tls then
+    findings[#findings + 1] =
+      "TLS server did not request a client certificate — no mutual TLS / IHE ATNA node authentication"
+    if info.cert then cert_findings(info.cert, findings) end
+  else
+    findings[#findings + 1] =
+      "Plaintext transport — associations and PHI exposed on the wire (consider DICOM-over-TLS, PS3.15 §B)"
+  end
+
+  return findings
+end
+
+-- ---------- action ----------
+
 action = function(host, port)
   local out = stdnse.output_table()
 
   local called_aet  = stdnse.get_script_args("dicom.called_aet")
   local calling_aet = stdnse.get_script_args("dicom.calling_aet")
 
-  -- Convert PC_LIST to the shape associate_extended expects.
-  local pcs = {}
-  for i, pc in ipairs(PC_LIST) do
-    pcs[i] = { abstract_syntax = pc.uid, transfer_syntaxes = pc.ts }
+  local probe = (stdnse.get_script_args("dicom-enum.probe") or "standard"):lower()
+  if not VALID_PROBES[probe] then
+    stdnse.debug1("DICOM: unknown probe depth %q, falling back to 'standard'", probe)
+    probe = "standard"
   end
+
+  local pcs, pcmeta = build_pcs(probe)
+  stdnse.debug1("DICOM: probe=%s, proposing %d presentation contexts", probe, #pcs)
 
   local ok, err, pc_results, info =
     dicom.associate_extended(host, port, calling_aet, called_aet, pcs)
@@ -354,7 +580,7 @@ action = function(host, port)
   local accepted_services = {}
   local accepted_uids = {}
   for i, r in ipairs(pc_results) do
-    local pc = PC_LIST[i]
+    local pc = pcmeta[i]
     local code = r.result
     if code == 0 then
       table.insert(buckets[0], string.format("%s - %s", pc.name, ts_label(r.accepted_ts)))
@@ -408,6 +634,23 @@ action = function(host, port)
     results[dicom.PC_RESULT_NAMES[0]] = sub
   end
   out.results = results
+
+  -- Security assessment, derived entirely from the single association above
+  -- (no DIMSE commands or patient data sent).
+  local security = stdnse.output_table()
+  if info and info.tls then
+    security.transport = "DICOM over TLS"
+    if info.cert then
+      security.certificate = cert_table(info.cert)
+    end
+  else
+    security.transport = "plaintext (no TLS)"
+  end
+  local findings = security_findings(accepted_uids, called_aet, info)
+  if #findings > 0 then
+    security.findings = findings
+  end
+  out.security = security
 
   for _, code in ipairs(DEBUG_BUCKET_ORDER) do
     local items = buckets[code]

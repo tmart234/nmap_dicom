@@ -1,8 +1,11 @@
 --[[
 Enumerates the SOP classes and transfer syntaxes a DICOM Service Provider
-accepts by proposing a curated set of presentation contexts in a single
+accepts by proposing a curated set of presentation contexts in an
 A-ASSOCIATE request and parsing the per-PC result map returned in the
-A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2).
+A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2). Proposals larger than the
+per-association limits (dicom.max_pcs, dicom.max_rq_bytes) are split across
+sequential associations; at the default limits only the "full" probe needs
+more than one.
 
 Each presentation context is reported as one of:
   accepted (0), user-rejection (1), no-reason (2),
@@ -13,11 +16,20 @@ the SCP's positive capability surface. The other four buckets are emitted
 at debug level only (-d), since "everything we proposed that this SCP
 doesn't serve" is useful for triage but noise in default output.
 
-This is a capability fingerprint: it identifies which Storage SOP classes
-the SCP serves (CT/MR/US/CR/DX/Mammo/PET/NM/XA/XRF/Endoscopy/RT/SR/ECG/
-Ophthalmic/Whole-Slide/...), whether it supports Modality Worklist FIND,
-Patient/Study Root Query/Retrieve, Storage Commitment, MPPS, UPS, and Print
-Management, and which transfer syntaxes it negotiates.
+This is a capability fingerprint. It reports which Storage SOP classes the
+SCP accepts (CT/MR/US/CR/DX/Mammo/PET/NM/XA/XRF/Endoscopy/RT/SR/ECG/
+Ophthalmic/Whole-Slide/...), which transfer syntaxes it negotiates, and
+whether each PS3.4 Service Class is negotiable: Verification (C-ECHO),
+Storage (C-STORE), Query/Retrieve (C-FIND / C-MOVE / C-GET), Modality
+Worklist (C-FIND), Storage Commitment (N-ACTION / N-EVENT-REPORT), MPPS
+(N-CREATE / N-SET), UPS (C-FIND / N-CREATE / N-ACTION / N-GET across the
+Push and Watch SOP classes probed) and Print Management (N-CREATE / N-SET /
+N-ACTION / N-DELETE / N-GET / N-EVENT-REPORT). It reports these as a
+yes / no / not probed summary derived from the accepted presentation
+contexts. An accepted context means the SCP will accept a request for that
+SOP Class; it does not mean the operation will succeed. Destination AE
+allowlists, storage policy and DIMSE-level refusals are separate layers that
+this script does not test.
 
 Ubiquity: every presentation context is proposed with Implicit VR Little
 Endian (the one transfer syntax every conformant SCP must support, PS3.5
@@ -29,19 +41,41 @@ probe depths trade breadth against A-ASSOCIATE-RQ size:
              set (default)
   full     - core + long-tail SOP classes (Multi-frame SC, RT, extended SR,
              UPS, ophthalmic, waveform, segmentation, whole-slide, ...) with
-             the complete transfer-syntax matrix
+             the complete transfer-syntax matrix (two associations at the
+             default limits)
+
+Associations to a host run one at a time, shared with other DICOM scripts,
+so a scan never holds more than one slot of the SCP's association pool. A
+transient reject (temporary-congestion / local-limit-exceeded) is retried
+with backoff, and any error after the request goes out sends A-ABORT so the
+SCP frees the slot at once.
 
 From the accepted SOP classes the script also derives:
+  services           - one line per PS3.4 Service Class (keys verification,
+                       storage, query, retrieve, modality_worklist,
+                       storage_commitment, mpps, ups, print): "yes" with the
+                       negotiated DIMSE operations and the Q/R information
+                       models or UPS / Print SOP classes behind them, "no"
+                       when every proposed context was rejected, or
+                       "not probed" when this probe depth proposed none
+                       (UPS is proposed only by the full probe). C-FIND is
+                       attributed to query or modality_worklist by the
+                       information model it runs against.
+  service_classes    - the accepted Service Classes as PS3.4 Service Class
+                       names, with Query/Retrieve abbreviated by information
+                       model (QR-Patient-Root, QR-Study-Root,
+                       QR-Patient-Study).
   modalities         - the imaging modalities implied by accepted Storage
                        SOP classes (CT, MRI, Ultrasound, Mammography,
                        X-Ray, X-Ray Angiography, Fluoroscopy, PET, PET-CT,
                        Nuclear Medicine, Endoscopy, ECG, Ophthalmic,
                        Whole Slide Imaging, ...). PET-CT is reported when
                        both PET and CT are accepted.
-  service_commands   - the DIMSE commands implied by the accepted SOP
-                       classes: C-ECHO (Verification), C-STORE (Storage),
-                       C-FIND (Q/R FIND or Modality Worklist FIND),
-                       C-MOVE (Q/R MOVE), C-GET (Q/R GET).
+  service_commands   - the flat DIMSE view of the accepted SOP classes:
+                       C-ECHO, C-STORE, C-FIND, C-MOVE and C-GET from the
+                       composite services, and N-CREATE, N-SET, N-ACTION,
+                       N-EVENT-REPORT, N-GET and N-DELETE from MPPS, Storage
+                       Commitment, UPS and Print Management.
   inferred_device_class - PACS/VNA, Modality, RIS gateway, Archive
                        front-end, or Print server. This taxonomy is a
                        practitioner consensus, not a normative DICOM
@@ -77,9 +111,17 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- @args dicom.tls            Transport override: "true" forces DICOM-over-TLS,
 --                            "false" forces plaintext. Default: unset (adapt
 --                            to Nmap's own -sV SSL/TLS service detection).
--- @args dicom.no_release     If set, the script omits A-RELEASE-RQ and lets
---                            the SCP see an aborted association. Default:
---                            unset (release is sent).
+-- @args dicom.no_release     If set, the script closes with A-ABORT instead
+--                            of A-RELEASE-RQ, so the SCP sees an aborted
+--                            association. Default: unset (release is sent).
+-- @args dicom.max_pcs        Most presentation contexts per A-ASSOCIATE-RQ.
+--                            Default: 64
+-- @args dicom.max_rq_bytes   Largest A-ASSOCIATE-RQ PDU in bytes. Default:
+--                            16384
+-- @args dicom.retries        Retries after a temporary-congestion /
+--                            local-limit-exceeded reject. Default: 2
+-- @args dicom.backoff_ms     First retry delay in ms, doubled per retry.
+--                            Default: 2000
 -- @args dicom-enum.probe     Probe depth: "basic", "standard" (default), or
 --                            "full". See the description for the trade-off.
 -- @args dicom-enum.ports     Optional comma-separated list of ports to
@@ -90,6 +132,16 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- 4242/tcp open  dicom
 -- | dicom-enum:
 -- |   association: accepted (max_pdu=16384, vendor=Orthanc 1.11.0)
+-- |   services:
+-- |     verification: yes - C-ECHO
+-- |     storage: yes - C-STORE (15 SOP classes)
+-- |     query: yes - C-FIND (Patient Root, Study Root)
+-- |     retrieve: yes - C-GET, C-MOVE (Patient Root, Study Root)
+-- |     modality_worklist: no
+-- |     storage_commitment: no
+-- |     mpps: no
+-- |     ups: not probed
+-- |     print: no
 -- |   service_classes:
 -- |     QR-Patient-Root
 -- |     QR-Study-Root
@@ -135,6 +187,17 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 --
 -- @xmloutput
 -- <elem key="association">accepted (max_pdu=16384, vendor=Orthanc 1.11.0)</elem>
+-- <table key="services">
+--   <elem key="verification">yes - C-ECHO</elem>
+--   <elem key="storage">yes - C-STORE (15 SOP classes)</elem>
+--   <elem key="query">yes - C-FIND (Patient Root, Study Root)</elem>
+--   <elem key="retrieve">yes - C-GET, C-MOVE (Patient Root, Study Root)</elem>
+--   <elem key="modality_worklist">no</elem>
+--   <elem key="storage_commitment">no</elem>
+--   <elem key="mpps">no</elem>
+--   <elem key="ups">not probed</elem>
+--   <elem key="print">no</elem>
+-- </table>
 -- <table key="service_classes">
 --   <elem>QR-Patient-Root</elem>
 --   <elem>QR-Study-Root</elem>
@@ -436,6 +499,54 @@ local function cert_findings(cert, out)
   end
 end
 
+-- One line per PS3.4 Service Class: "yes - <DIMSE ops> (<models>)", "no",
+-- or "not probed" when this probe depth proposed no context for it. Ops that
+-- cover the same models share a group, e.g.
+-- "yes - C-GET, C-MOVE (Patient Root, Study Root)".
+local function service_line(key, s)
+  if not s then return "not probed" end
+  if not s.accepted then return "no" end
+  if key == "storage" then
+    return string.format("yes - C-STORE (%d SOP class%s)",
+      s.sop_classes, s.sop_classes == 1 and "" or "es")
+  end
+  local ops = {}
+  for op in pairs(s.ops) do ops[#ops + 1] = op end
+  table.sort(ops)
+  local groups, order = {}, {}
+  for _, op in ipairs(ops) do
+    local labels = table.concat(s.ops[op], ", ")
+    if not groups[labels] then
+      groups[labels] = {}
+      order[#order + 1] = labels
+    end
+    table.insert(groups[labels], op)
+  end
+  local parts = {}
+  for _, labels in ipairs(order) do
+    local part = table.concat(groups[labels], ", ")
+    if labels ~= "" then part = part .. " (" .. labels .. ")" end
+    parts[#parts + 1] = part
+  end
+  return "yes - " .. table.concat(parts, "; ")
+end
+
+-- Contexts left unanswered by a failed follow-up association count as not
+-- probed rather than rejected.
+local function services_table(pc_results)
+  local proposed, accepted = {}, {}
+  for _, r in ipairs(pc_results) do
+    if r.result ~= nil then proposed[#proposed + 1] = r.abstract_syntax end
+    if r.result == 0 then accepted[#accepted + 1] = r.abstract_syntax end
+  end
+  local summary = dicom.infer_services(proposed, accepted)
+  local t = stdnse.output_table()
+  for _, key in ipairs(dicom.SERVICE_KEYS) do
+    t[key] = service_line(key, summary[key])
+  end
+  return t
+end
+
 -- Count how many accepted abstract syntaxes are Storage SOP classes, and
 -- which Query/Retrieve DIMSE operations (FIND/MOVE/GET) were accepted.
 local QR_PREFIX = "1.2.840.10008.5.1.4.1.2."
@@ -523,8 +634,8 @@ action = function(host, port)
         out.hint = "Calling-AET not recognized — try dicom.calling_aet=<AET>"
       elseif err.source == 2 and err.reason == 2 then
         out.hint = "Protocol version mismatch"
-      elseif err.source == 3 and err.reason == 1 then
-        out.hint = "Server overloaded — retry later"
+      elseif err.source == 3 and (err.reason == 1 or err.reason == 2) then
+        out.hint = "SCP busy (association pool full) after retries — rescan later"
       end
       mark_dicom_service(host, port)
       return out
@@ -569,10 +680,16 @@ action = function(host, port)
   if device_vendor then
     detail[#detail + 1] = "device=" .. device_vendor
   end
+  if info and info.associations and info.associations > 1 then
+    detail[#detail + 1] = string.format("associations=%d", info.associations)
+  end
   if #detail > 0 then
     out.association = string.format("accepted (%s)", table.concat(detail, ", "))
   else
     out.association = "accepted"
+  end
+  if info and info.errors then
+    out.warning = string.format("results are partial: %s", table.concat(info.errors, "; "))
   end
 
   -- Bucket per-PC results and collect accepted service classes / UIDs.
@@ -594,6 +711,9 @@ action = function(host, port)
     end
   end
 
+  -- Per-Service-Class negotiation summary (PS3.4), in SERVICE_KEYS order.
+  out.services = services_table(pc_results)
+
   -- Service-class summary (sorted for stable output).
   local svc_list = {}
   for s in pairs(accepted_services) do svc_list[#svc_list + 1] = s end
@@ -602,9 +722,8 @@ action = function(host, port)
     out.service_classes = svc_list
   end
 
-  -- DIMSE service commands implied by the accepted SOP classes
-  -- (C-ECHO from Verification, C-STORE from Storage, C-FIND/MOVE/GET from
-  -- Q/R + Modality Worklist).
+  -- Flat DIMSE view of the accepted SOP classes: C-* from the composite
+  -- services, N-* from MPPS, Storage Commitment, UPS and Print.
   local cmds = dicom.infer_service_commands(accepted_uids)
   if #cmds > 0 then
     out.service_commands = cmds

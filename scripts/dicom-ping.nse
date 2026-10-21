@@ -138,6 +138,7 @@ action = function(host, port)
                  (port.version and type(port.version.name) == "string" and port.version.name:match("tls"))
 
   -- Returns: ok, err, version, vendor, uid, impl_version_name, device_vendor
+  -- (on a reject, the third value is the decoded A-ASSOCIATE-RJ instead)
   local ok, err, version, vendor, uid, impl_version_name, device_vendor = dicom.associate(host, port, nil, called_aet)
 
   if not ok then
@@ -148,8 +149,12 @@ action = function(host, port)
       port.version.name = is_tls and "dicom-tls" or "dicom"
       nmap.set_port_version(host, port)
 
+      local reject = type(version) == "table" and version or {}
       out.dicom  = "DICOM Service Provider discovered!"
-      if not called_aet or called_aet == "ANY-SCP" then
+      if reject.source == 3 then
+        -- Provider-side reject (congestion / association limit), not an AET check.
+        out.config = string.format("Association rejected: SCP busy (%s)", reject.reason_text or "?")
+      elseif not called_aet or called_aet == "ANY-SCP" then
         out.config = "Called AET check enabled"
       else
         out.config = string.format("Association Rejected (Tried AET: %s)", called_aet)

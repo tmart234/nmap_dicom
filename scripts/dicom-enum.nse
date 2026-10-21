@@ -31,6 +31,13 @@ SOP Class; it does not mean the operation will succeed. Destination AE
 allowlists, storage policy and DIMSE-level refusals are separate layers that
 this script does not test.
 
+Transfer syntaxes: an accepted presentation context carries the one transfer
+syntax the SCP chose from those proposed (PS3.8 §9.3.3.2), listed per SOP
+class under results.accepted.items. The other syntaxes proposed are neither
+accepted nor rejected, so the storage line's SOP class count says nothing
+about codec breadth. A context with none acceptable shows up at -d as
+transfer-syntaxes-not-supported.
+
 Ubiquity: every presentation context is proposed with Implicit VR Little
 Endian (the one transfer syntax every conformant SCP must support, PS3.5
 §10.1), so even the oldest modalities negotiate at least one context. Three

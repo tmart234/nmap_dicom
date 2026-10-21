@@ -1,22 +1,24 @@
+description = [[
+Detect DICOM-related HTTP endpoints and flag common DICOMweb misconfigurations.
+
+Finds:
+  - Orthanc REST API (/system) and (best-effort) version
+  - DICOMweb bases (Orthanc: /dicom-web; dcm4chee: /dcm4chee-arc/rs; dcm4chee AET: /dcm4chee-arc/aets/DCM4CHEE/rs)
+  - OHIF viewer
+  - Dicoogle and Kheops proxies
+
+Security checks (non-intrusive):
+  - http instead of https (suppressed if cleanly upgraded to same-host https)  [advisory]
+  - Unauthenticated QIDO-RS listing (/studies?limit=1) with DICOM JSON         [vuln]
+    (tries Accept: application/dicom+json, then falls back to application/json on 406)
+  - risky CORS (ACAO: * with credentials=true)                                 [advisory]
+  - (advisory) STOW-RS appears allowed via OPTIONS without auth
+  - (advisory) missing Content-Security-Policy on known UIs
+  - (info) WWW-Authenticate scheme on 401 (e.g., Basic/Bearer)
+  - (vuln) Orthanc default creds accepted (orthanc:orthanc); disable with dicom-web.no-defaults=true
+]]
+
 ---
--- Detect DICOM-related HTTP endpoints and flag common DICOMweb misconfigurations.
---
--- Finds:
---   - Orthanc REST API (/system) and (best-effort) version
---   - DICOMweb bases (Orthanc: /dicom-web; dcm4chee: /dcm4chee-arc/rs; dcm4chee AET: /dcm4chee-arc/aets/DCM4CHEE/rs)
---   - OHIF viewer
---   - Dicoogle and Kheops proxies
---
--- Security checks (non-intrusive):
---   - http instead of https (suppressed if cleanly upgraded to same-host https)  [advisory]
---   - Unauthenticated QIDO-RS listing (/studies?limit=1) with DICOM JSON         [vuln]
---     (tries Accept: application/dicom+json, then falls back to application/json on 406)
---   - risky CORS (ACAO: * with credentials=true)                                 [advisory]
---   - (advisory) STOW-RS appears allowed via OPTIONS without auth
---   - (advisory) missing Content-Security-Policy on known UIs
---   - (info) WWW-Authenticate scheme on 401 (e.g., Basic/Bearer)
---   - (vuln) Orthanc default creds accepted (orthanc:orthanc); disable with dicom-web.no-defaults=true
---
 -- @usage
 -- nmap -p 8042,3000 --script dicom-web-info <target>
 --

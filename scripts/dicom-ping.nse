@@ -1,4 +1,4 @@
---[[
+description = [[
 Attempts to discover DICOM servers (DICOM Service Provider) through a partial C-ECHO request.
 It also detects if the server allows any called Application Entity Title or not.
 

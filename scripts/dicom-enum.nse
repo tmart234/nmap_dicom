@@ -1,4 +1,4 @@
---[[
+description = [[
 Enumerates the SOP classes and transfer syntaxes a DICOM Service Provider
 accepts by proposing a curated set of presentation contexts in an
 A-ASSOCIATE request and parsing the per-PC result map returned in the

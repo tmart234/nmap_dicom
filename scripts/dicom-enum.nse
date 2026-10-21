@@ -43,6 +43,10 @@ probe depths trade breadth against A-ASSOCIATE-RQ size:
              UPS, ophthalmic, waveform, segmentation, whole-slide, ...) with
              the complete transfer-syntax matrix (two associations at the
              default limits)
+The probe line of the output records the depth used, the number of
+presentation contexts it proposed and the associations that carried them,
+so a "not probed" service, or a difference between two scans of one host,
+can be traced to the probe depth.
 
 Associations to a host run one at a time, shared with other DICOM scripts,
 so a scan never holds more than one slot of the SCP's association pool. A
@@ -132,6 +136,7 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- 4242/tcp open  dicom
 -- | dicom-enum:
 -- |   association: accepted (max_pdu=16384, vendor=Orthanc 1.11.0)
+-- |   probe: standard (36 presentation contexts proposed, 1 association)
 -- |   services:
 -- |     verification: yes - C-ECHO
 -- |     storage: yes - C-STORE (15 SOP classes)
@@ -187,6 +192,7 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 --
 -- @xmloutput
 -- <elem key="association">accepted (max_pdu=16384, vendor=Orthanc 1.11.0)</elem>
+-- <elem key="probe">standard (36 presentation contexts proposed, 1 association)</elem>
 -- <table key="services">
 --   <elem key="verification">yes - C-ECHO</elem>
 --   <elem key="storage">yes - C-STORE (15 SOP classes)</elem>
@@ -680,15 +686,27 @@ action = function(host, port)
   if device_vendor then
     detail[#detail + 1] = "device=" .. device_vendor
   end
-  if info and info.associations and info.associations > 1 then
-    detail[#detail + 1] = string.format("associations=%d", info.associations)
-  end
   if #detail > 0 then
     out.association = string.format("accepted (%s)", table.concat(detail, ", "))
   else
     out.association = "accepted"
   end
-  if info and info.errors then
+
+  -- Probe depth and how it went out, so a "not probed" service, or a
+  -- difference between two scans of one host, can be traced to the depth.
+  local n = info.associations
+  if info.errors then
+    local answered = 0
+    for _, r in ipairs(pc_results) do
+      if r.result ~= nil then answered = answered + 1 end
+    end
+    out.probe = string.format("%s (%d of %d presentation contexts answered, %d of %d associations)",
+      probe, answered, #pcs, n, info.associations_planned)
+  else
+    out.probe = string.format("%s (%d presentation contexts proposed, %d association%s)",
+      probe, #pcs, n, n == 1 and "" or "s")
+  end
+  if info.errors then
     out.warning = string.format("results are partial: %s", table.concat(info.errors, "; "))
   end
 

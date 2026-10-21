@@ -1283,11 +1283,12 @@ end
 -- where:
 --   pc_results[i] = {pc_id, result, accepted_ts, abstract_syntax, transfer_syntaxes}
 --   info          = {max_pdu, impl_uid, impl_version, tls, cert,
---                    associations, errors}
+--                    associations, associations_planned, errors}
 -- pc_results is keyed by the index of the input list (1..N), preserving order.
--- info.associations counts the accepted associations; info.errors (nil when
--- complete) describes a failed follow-up association, whose contexts and any
--- after it have a nil result.
+-- info.associations counts the accepted associations out of the
+-- info.associations_planned the proposal was split into; info.errors (nil
+-- when complete) describes a failed follow-up association, whose contexts and
+-- any after it have a nil result.
 -- If the first association fails, returns false, err (a string, or a table
 -- decoding the A-ASSOCIATE-RJ).
 function associate_extended(host, port, calling_aet, called_aet, presentation_contexts)
@@ -1337,6 +1338,7 @@ function associate_extended(host, port, calling_aet, called_aet, presentation_co
   end
 
   info.associations = accepted
+  info.associations_planned = #batches
   info.errors = (#errors > 0) and errors or nil
   return true, nil, pc_results, info
 end

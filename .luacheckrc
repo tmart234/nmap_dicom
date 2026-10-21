@@ -44,7 +44,7 @@ files["nselib/dicom.lua"] = {
     "start_connection", "send", "receive", "pdu_header_encode",
     "parse_associate_accept", "parse_implementation_version",
     "identify_vendor_from_uid", "identify_toolkit", "extract_clean_version",
-    "resolve_vendor_info", "associate_extended", "associate",
+    "resolve_vendor_info", "associate_extended", "associate", "abort",
     "send_pdata", "extract_uid_root",
   },
 }

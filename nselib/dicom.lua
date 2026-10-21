@@ -21,9 +21,28 @@
 -- *<code>calling_aet</code> - If set it changes the calling Application Entity Title
 --                            used in the requests. Default: ECHOSCU
 --
+-- Associations are kept gentle on production SCPs, whose association pool
+-- is shared with clinical traffic: associations to a host are serialized
+-- across all DICOM scripts, a transient A-ASSOCIATE-RJ (temporary-congestion
+-- / local-limit-exceeded) is retried with exponential backoff, large
+-- proposals are split across sequential associations, and every error path
+-- after the A-ASSOCIATE-RQ sends A-ABORT so the SCP frees the slot at once.
+--
 -- @args dicom.called_aet Called Application Entity Title. Default: ANY-SCP
 -- @args dicom.calling_aet Calling Application Entity Title. Default: ECHOSCU
 -- @args dicom.timeout_ms Socket timeout in milliseconds. Default: 3000
+-- @args dicom.retries Retries after a transient A-ASSOCIATE-RJ
+--                     (temporary-congestion / local-limit-exceeded). Default: 2
+-- @args dicom.backoff_ms Delay before the first retry in milliseconds,
+--                        doubled for each retry after it. Default: 2000
+-- @args dicom.max_pcs Most presentation contexts proposed in one
+--                     A-ASSOCIATE-RQ; larger proposals are split across
+--                     sequential associations. Default: 64 (range 2-128)
+-- @args dicom.max_rq_bytes Largest A-ASSOCIATE-RQ PDU sent, in bytes; larger
+--                          proposals are split across sequential
+--                          associations. Default: 16384
+-- @args dicom.no_release If set, an accepted association is closed with
+--                        A-ABORT instead of A-RELEASE-RQ. Default: unset
 --
 -- @author Paulino Calderon <paulino@calderonpale.com> and Tyler M <tmart234@gmail.com>
 -- @copyright Same as Nmap--See https://nmap.org/book/man-legal.html
@@ -49,6 +68,36 @@ local IMPLEMENTATION_CLASS_UID = "2.25.205477355541376756296906656564391676347"
 -- whenever Nmap ships. Embed the Nmap version in port.version at the
 -- script layer where it belongs, not in the wire-level identifier.
 local IMPLEMENTATION_VERSION_NAME = "NMAP_NSE"
+
+local APPLICATION_CONTEXT_NAME = "1.2.840.10008.3.1.1.1"
+local MAX_PDU_LEN = 16384
+-- A-ASSOCIATE-RQ fixed fields between the PDU header and the first variable
+-- item: protocol version, reserved, called/calling AE titles, reserved
+-- (PS3.8 §9.3.2).
+local RQ_FIXED_LEN = 68
+
+-- Presentation context IDs are odd integers 1-255 (PS3.8 §9.3.2.2), so one
+-- A-ASSOCIATE-RQ can carry at most 128. Some real SCPs (older DCMTK builds,
+-- GE, embedded modality stacks) refuse far smaller RQ PDUs, so proposals are
+-- split well below that ceiling by default.
+local MAX_PCS_PER_RQ       = 128
+local DEFAULT_MAX_PCS      = 64
+local DEFAULT_MAX_RQ_BYTES = 16384
+
+local DEFAULT_RETRIES    = 2
+local DEFAULT_BACKOFF_MS = 2000
+-- Pause before each follow-up association of a split proposal. SCPs can free
+-- a pool slot a moment after sending A-RELEASE-RP (pynetdicom with a
+-- one-slot pool rejected 4 of 10 immediate re-associations), so starting the
+-- next one at once can draw a local-limit-exceeded reject.
+local BATCH_GAP_MS = 250
+
+-- A-ABORT source and reason/diag values (PS3.8 §9.3.8). The reason is only
+-- significant when the source is the UL service-provider.
+local ABORT_SOURCE_USER           = 0
+local ABORT_SOURCE_PROVIDER       = 2
+local ABORT_REASON_NOT_SPECIFIED  = 0
+local ABORT_REASON_UNEXPECTED_PDU = 2
 
 -- A-ASSOCIATE-AC PDU layout (PS3.8 §9.3.3 Table 9-17).
 -- 6-byte PDU header + 68-byte fixed preamble = 74; first variable item starts
@@ -548,6 +597,33 @@ function pdu_header_encode(pdu_type, length)
   return true, header
 end
 
+-- Close the transport once; repeat calls are no-ops so error paths can tear
+-- down unconditionally.
+local function close(dcm)
+  if dcm['socket'] and not dcm['closed'] then
+    dcm['closed'] = true
+    dcm['socket']:close()
+  end
+end
+
+---
+-- abort(dcm, source, reason) sends an A-ABORT PDU (PS3.8 §9.3.8) and closes
+-- the transport. Used on every error path once the A-ASSOCIATE-RQ is out, so
+-- the SCP frees the association slot immediately instead of holding it until
+-- its own ARTIM or idle timer fires. Best-effort: send errors are ignored.
+-- @param source 0 = DICOM UL service-user (default), 2 = UL service-provider
+-- @param reason Reason/diag, significant only when source is 2. Default: 0
+---
+function abort(dcm, source, reason)
+  if not dcm or not dcm['socket'] or dcm['closed'] then return end
+  source = source or ABORT_SOURCE_USER
+  reason = reason or ABORT_REASON_NOT_SPECIFIED
+  local _, header = pdu_header_encode(PDU_CODES["ABORT"], 4)
+  stdnse.debug1("DICOM: Sending A-ABORT (source=%d, reason=%d)", source, reason)
+  send(dcm, header .. string.pack(">B B B B", 0, 0, source, reason))
+  close(dcm)
+end
+
 -- ==================== Parse Sub-Routines ====================
 
 ---
@@ -876,105 +952,90 @@ function resolve_vendor_info(received_version_str, received_uid_str)
   return final_version, parsed_vendor, parsed_clean_version, device_vendor, impl_version_name
 end
 
----
--- associate_extended(host, port, calling_aet, called_aet, presentation_contexts)
--- Generalized A-ASSOCIATE that accepts a list of presentation contexts:
---   { {abstract_syntax = uid, transfer_syntaxes = {uid, ...}}, ... }
--- On accept, returns:
---   true, nil, pc_results, info
--- where:
---   pc_results[i] = {pc_id, result, accepted_ts, abstract_syntax, transfer_syntaxes}
---   info          = {max_pdu, impl_uid, impl_version}
--- pc_results is keyed by the index of the input list (1..N), preserving order.
--- On failure, returns false, err_string.
-function associate_extended(host, port, calling_aet, called_aet, presentation_contexts)
-  if not presentation_contexts or #presentation_contexts == 0 then
-    return false, "presentation_contexts must contain at least one entry"
+-- ==================== Association ====================
+
+-- Close an accepted association with A-RELEASE-RQ and wait for A-RELEASE-RP
+-- (PS3.8 §9.1, §9.3.6). Skipping the release makes SCPs log an abort, which
+-- fires abort-rate alerts in clinical environments. If the RP never arrives
+-- (timeout, stray PDU), fall back to A-ABORT rather than leaving the
+-- association half-released on the SCP.
+local function release(dcm)
+  local _, header = pdu_header_encode(PDU_CODES["RELEASE_REQUEST"], 4)
+  local ok, resp = send(dcm, header .. "\0\0\0\0")
+  if ok then
+    ok, resp = receive(dcm)
   end
-  if #presentation_contexts > 128 then
-    return false, "too many presentation contexts (PS3.8 limit is 128)"
+  local resp_type = ok and string.byte(resp, 1) or nil
+  if resp_type == PDU_CODES["RELEASE_RESPONSE"] or resp_type == PDU_CODES["ABORT"] then
+    close(dcm)
+  else
+    stdnse.debug1("DICOM: No A-RELEASE-RP (%s); aborting",
+      ok and ("got PDU type " .. tostring(resp_type)) or tostring(resp))
+    abort(dcm)
   end
+end
 
-  local status, dcm = start_connection(host, port)
-  if not status then
-    return false, dcm
-  end
-
-  local application_context_name = "1.2.840.10008.3.1.1.1"
-  local called_ae_title_val  = pad16(called_aet  or "ANY-SCP")
-  local calling_ae_title_val = pad16(calling_aet or "ECHOSCU")
-  local implementation_id      = IMPLEMENTATION_CLASS_UID
-  local implementation_version = IMPLEMENTATION_VERSION_NAME
-  local max_pdu_len            = 16384
-
-  local application_context  = item_application_context(application_context_name)
-  local userinfo_context     = item_user_information(implementation_id, implementation_version, max_pdu_len)
-
+-- Run one association over a connected transport: send the A-ASSOCIATE-RQ,
+-- read the reply, then release. Every exit either ends cleanly (release
+-- completed, or the SCP already ended it with A-ASSOCIATE-RJ / A-ABORT) or
+-- sends A-ABORT. On accept returns true, nil, results, info where
+-- results[k] is the outcome of presentation_contexts[k].
+local function negotiate(dcm, calling_aet, called_aet, presentation_contexts)
   local pc_blocks = {}
-  local index_to_pc_id = {}
-  for i, pc in ipairs(presentation_contexts) do
-    local pc_id = (i - 1) * 2 + 1 -- odd IDs per PS3.7
-    if pc_id > 255 then
-      dcm['socket']:close()
-      return false, "presentation context ID overflow"
-    end
-    index_to_pc_id[i] = pc_id
-    pc_blocks[#pc_blocks + 1] = item_presentation_context(pc_id, pc.abstract_syntax, pc.transfer_syntaxes)
+  for k, pc in ipairs(presentation_contexts) do
+    -- odd IDs per PS3.8 §9.3.2.2
+    pc_blocks[k] = item_presentation_context(2 * k - 1, pc.abstract_syntax, pc.transfer_syntaxes)
   end
-  local presentation_blob = table.concat(pc_blocks)
 
   local fixed = string.pack(">I2 I2 c16 c16 c32",
-    0x0001, 0x0000, called_ae_title_val, calling_ae_title_val, string.rep("\0", 32))
-  local assoc_body = fixed .. application_context .. presentation_blob .. userinfo_context
-
-  local header_ok, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"], #assoc_body)
-  if not header_ok then
-    dcm['socket']:close()
-    return false, "Failed to encode PDU header"
-  end
+    0x0001, 0x0000, pad16(called_aet or "ANY-SCP"), pad16(calling_aet or "ECHOSCU"), string.rep("\0", 32))
+  local assoc_body = fixed .. item_application_context(APPLICATION_CONTEXT_NAME)
+    .. table.concat(pc_blocks)
+    .. item_user_information(IMPLEMENTATION_CLASS_UID, IMPLEMENTATION_VERSION_NAME, MAX_PDU_LEN)
+  local _, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"], #assoc_body)
 
   local send_status, send_err = send(dcm, header .. assoc_body)
   if not send_status then
-    dcm['socket']:close()
+    abort(dcm)
     return false, string.format("Couldn't send ASSOCIATE request: %s", send_err or "Unknown error")
   end
 
   local receive_status, response_data = receive(dcm)
-
   if not receive_status then
-    dcm['socket']:close()
+    -- Timeout or short read: the SCP may still hold a half-open association.
+    abort(dcm)
     return false, string.format("Couldn't read ASSOCIATE response: %s", response_data)
   end
-  if #response_data < MIN_HEADER_LEN then
-    dcm['socket']:close()
-    return false, "Received response too short for PDU header"
-  end
 
-  local resp_type = string.unpack(">B", response_data)
-  if resp_type ~= PDU_CODES["ASSOCIATE_ACCEPT"] then
-    dcm['socket']:close()
-    if resp_type == PDU_CODES["ASSOCIATE_REJECT"] then
-      -- PS3.8 §9.3.4 Table 9-21: A-ASSOCIATE-RJ body bytes after the 6-byte
-      -- PDU header are: reserved, result, source, reason/diag.
-      local result, source, reason
-      if #response_data >= 10 then
-        result = string.byte(response_data, 8)
-        source = string.byte(response_data, 9)
-        reason = string.byte(response_data, 10)
-      end
-      return false, {
-        err         = "ASSOCIATE REJECT received",
-        result      = result,
-        source      = source,
-        reason      = reason,
-        result_text = result and ASSOC_RJ_RESULT[result] or nil,
-        source_text = source and ASSOC_RJ_SOURCE[source] or nil,
-        reason_text = (source and ASSOC_RJ_REASON[source] and reason)
-                      and ASSOC_RJ_REASON[source][reason] or nil,
-      }
-    else
-      return false, "Received unexpected response PDU type: " .. tostring(resp_type)
+  local resp_type = string.byte(response_data, 1)
+  if resp_type == PDU_CODES["ASSOCIATE_REJECT"] then
+    -- The SCP closes the transport after A-ASSOCIATE-RJ; nothing to abort.
+    close(dcm)
+    -- PS3.8 §9.3.4 Table 9-21: A-ASSOCIATE-RJ body bytes after the 6-byte
+    -- PDU header are: reserved, result, source, reason/diag.
+    local result, source, reason
+    if #response_data >= 10 then
+      result = string.byte(response_data, 8)
+      source = string.byte(response_data, 9)
+      reason = string.byte(response_data, 10)
     end
+    return false, {
+      err         = "ASSOCIATE REJECT received",
+      result      = result,
+      source      = source,
+      reason      = reason,
+      result_text = result and ASSOC_RJ_RESULT[result] or nil,
+      source_text = source and ASSOC_RJ_SOURCE[source] or nil,
+      reason_text = (source and ASSOC_RJ_REASON[source] and reason)
+                    and ASSOC_RJ_REASON[source][reason] or nil,
+    }
+  elseif resp_type == PDU_CODES["ABORT"] then
+    close(dcm)
+    return false, string.format("Received A-ABORT (source=%s, reason=%s)",
+      tostring(string.byte(response_data, 9)), tostring(string.byte(response_data, 10)))
+  elseif resp_type ~= PDU_CODES["ASSOCIATE_ACCEPT"] then
+    abort(dcm, ABORT_SOURCE_PROVIDER, ABORT_REASON_UNEXPECTED_PDU)
+    return false, "Received unexpected response PDU type: " .. tostring(resp_type)
   end
 
   local parsed = parse_associate_accept(response_data)
@@ -988,44 +1049,200 @@ function associate_extended(host, port, calling_aet, called_aet, presentation_co
     if okc then peer_cert = cert end
   end
 
-  -- Send A-RELEASE-RQ for an orderly close (PS3.8 §9.1, §9.3.6). Skipping it
-  -- causes SCPs to log the association as an abort, which fires abort-rate
-  -- alerts in clinical environments. Opt out via dicom.no_release for the
-  -- timing-measurement edge case. Best-effort: failures here don't affect
-  -- the AC results we already have.
-  local no_release = stdnse.get_script_args("dicom.no_release") ~= nil
-  if not no_release then
-    local rel_ok, rel_hdr = pdu_header_encode(PDU_CODES["RELEASE_REQUEST"], 4)
-    if rel_ok then
-      send(dcm, rel_hdr .. "\0\0\0\0")
-      receive(dcm)  -- best-effort drain of A-RELEASE-RP (PDU 0x06)
-    end
+  if stdnse.get_script_args("dicom.no_release") ~= nil then
+    abort(dcm)
+  else
+    release(dcm)
   end
-  dcm['socket']:close()
 
-  -- Re-key results back to the original proposal index, attaching the
-  -- abstract syntax string so the caller doesn't need to cross-reference.
-  local pc_results = {}
-  for i, pc in ipairs(presentation_contexts) do
-    local pc_id = index_to_pc_id[i]
+  local results = {}
+  for k in ipairs(presentation_contexts) do
+    local pc_id = 2 * k - 1
     local raw   = parsed.pc_results[pc_id] or {}
-    pc_results[i] = {
-      pc_id             = pc_id,
-      abstract_syntax   = pc.abstract_syntax,
-      transfer_syntaxes = pc.transfer_syntaxes,
-      result            = raw.result,
-      accepted_ts       = raw.accepted_ts,
-    }
+    results[k] = { pc_id = pc_id, result = raw.result, accepted_ts = raw.accepted_ts }
   end
 
-  local info = {
+  return true, nil, results, {
     max_pdu      = parsed.max_pdu,
     impl_uid     = parsed.impl_uid,
     impl_version = parsed.impl_version,
     tls          = dcm['is_ssl'] or false,
     cert         = peer_cert,
   }
+end
 
+-- One association attempt. A Lua error mid-negotiation (say, a parser bug
+-- tripped by a malformed A-ASSOCIATE-AC) still sends A-ABORT before it
+-- propagates.
+local function associate_once(host, port, calling_aet, called_aet, pcs)
+  local status, dcm = start_connection(host, port)
+  if not status then
+    return false, dcm
+  end
+  local r = table.pack(pcall(negotiate, dcm, calling_aet, called_aet, pcs))
+  if not r[1] then
+    abort(dcm)
+    error(r[2], 0)
+  end
+  return table.unpack(r, 2, r.n)
+end
+
+-- A-ASSOCIATE-RJ from the UL service-provider (presentation related) with
+-- temporary-congestion or local-limit-exceeded: the SCP's association pool
+-- is full, so a later attempt may succeed (PS3.8 §9.3.4).
+local function is_busy_reject(err)
+  return type(err) == "table" and err.source == 3 and (err.reason == 1 or err.reason == 2)
+end
+
+local function associate_with_retry(host, port, calling_aet, called_aet, pcs)
+  local retries = math.max(0, math.floor(tonumber(stdnse.get_script_args("dicom.retries")) or DEFAULT_RETRIES))
+  local backoff = tonumber(stdnse.get_script_args("dicom.backoff_ms")) or DEFAULT_BACKOFF_MS
+  local r
+  for attempt = 0, retries do
+    if attempt > 0 then
+      local delay = math.floor(backoff * 2 ^ (attempt - 1))
+      stdnse.debug1("DICOM: SCP busy (%s); retry %d/%d in %d ms",
+        r[2].reason_text or "?", attempt, retries, delay)
+      stdnse.sleep(delay / 1000)
+    end
+    r = table.pack(associate_once(host, port, calling_aet, called_aet, pcs))
+    if r[1] or not is_busy_reject(r[2]) then break end
+  end
+  return table.unpack(r, 1, r.n)
+end
+
+-- Serialize associations to one host across every DICOM script in the run.
+-- SCPs cap concurrent associations (often 10-50, shared with modalities and
+-- workstations), and parallel NSE threads -- several DICOM ports on one PACS,
+-- or dicom-ping and dicom-enum together -- could otherwise fill the pool and
+-- lock out clinical traffic. The lock is held through retry backoff so the
+-- wait is genuinely quiet on the wire.
+local function associate_serialized(host, port, calling_aet, called_aet, pcs)
+  local key = type(host) == "table" and host.ip or tostring(host)
+  local mutex = nmap.mutex("dicom-association-" .. key)
+  mutex "lock"
+  local r = table.pack(pcall(associate_with_retry, host, port, calling_aet, called_aet, pcs))
+  mutex "done"
+  if not r[1] then error(r[2], 0) end
+  return table.unpack(r, 2, r.n)
+end
+
+-- Encoded length of one presentation-context item. The PC ID is a fixed
+-- one-byte field, so a placeholder ID gives the exact size.
+local function pc_item_len(pc)
+  return #item_presentation_context(1, pc.abstract_syntax, pc.transfer_syntaxes)
+end
+
+-- A-ASSOCIATE-RQ size before any presentation-context items.
+local RQ_BASE_LEN = MIN_HEADER_LEN + RQ_FIXED_LEN
+  + #item_application_context(APPLICATION_CONTEXT_NAME)
+  + #item_user_information(IMPLEMENTATION_CLASS_UID, IMPLEMENTATION_VERSION_NAME, MAX_PDU_LEN)
+
+-- Follow-up associations also propose Verification, which virtually every
+-- SCP accepts. SCPs that reject or abort a request with no acceptable
+-- context (pynetdicom aborts) would otherwise turn "nothing in this batch is
+-- supported" into a failed association.
+local ANCHOR_PC = {
+  abstract_syntax   = "1.2.840.10008.1.1",
+  transfer_syntaxes = { TRANSFER_SYNTAX_UIDS.IMPLICIT_VR_LE },
+}
+
+-- Split proposal indices into per-association batches under max_pcs and
+-- max_bytes. Batches after the first start with the anchor (index 0). A
+-- context too large to share an RQ still goes out, in a batch of its own.
+local function plan_batches(pcs, max_pcs, max_bytes)
+  local anchor_len = pc_item_len(ANCHOR_PC)
+  local batches = {}
+  local cur, real, size = {}, 0, RQ_BASE_LEN
+  for i, pc in ipairs(pcs) do
+    local len = pc_item_len(pc)
+    if real > 0 and (#cur >= max_pcs or size + len > max_bytes) then
+      batches[#batches + 1] = cur
+      cur, real, size = { 0 }, 0, RQ_BASE_LEN + anchor_len
+    end
+    cur[#cur + 1] = i
+    real = real + 1
+    size = size + len
+  end
+  batches[#batches + 1] = cur
+  return batches
+end
+
+local function err_text(err)
+  if type(err) == "table" then
+    return string.format("%s (%s / %s / %s)", err.err,
+      err.result_text or "?", err.source_text or "?", err.reason_text or "?")
+  end
+  return tostring(err)
+end
+
+---
+-- associate_extended(host, port, calling_aet, called_aet, presentation_contexts)
+-- Generalized A-ASSOCIATE that accepts a list of presentation contexts:
+--   { {abstract_syntax = uid, transfer_syntaxes = {uid, ...}}, ... }
+-- A proposal over dicom.max_pcs contexts or dicom.max_rq_bytes bytes is split
+-- across sequential associations. If a follow-up association fails, the
+-- remaining ones are skipped rather than pressing a struggling SCP further.
+-- On accept, returns:
+--   true, nil, pc_results, info
+-- where:
+--   pc_results[i] = {pc_id, result, accepted_ts, abstract_syntax, transfer_syntaxes}
+--   info          = {max_pdu, impl_uid, impl_version, tls, cert,
+--                    associations, errors}
+-- pc_results is keyed by the index of the input list (1..N), preserving order.
+-- info.associations counts the accepted associations; info.errors (nil when
+-- complete) describes a failed follow-up association, whose contexts and any
+-- after it have a nil result.
+-- If the first association fails, returns false, err (a string, or a table
+-- decoding the A-ASSOCIATE-RJ).
+function associate_extended(host, port, calling_aet, called_aet, presentation_contexts)
+  if not presentation_contexts or #presentation_contexts == 0 then
+    return false, "presentation_contexts must contain at least one entry"
+  end
+
+  local max_pcs = math.floor(tonumber(stdnse.get_script_args("dicom.max_pcs")) or DEFAULT_MAX_PCS)
+  max_pcs = math.max(2, math.min(MAX_PCS_PER_RQ, max_pcs))
+  local max_bytes = tonumber(stdnse.get_script_args("dicom.max_rq_bytes")) or DEFAULT_MAX_RQ_BYTES
+
+  local batches = plan_batches(presentation_contexts, max_pcs, max_bytes)
+  if #batches > 1 then
+    stdnse.debug1("DICOM: Splitting %d presentation contexts across %d associations",
+      #presentation_contexts, #batches)
+  end
+
+  local pc_results, info, errors, accepted = {}, nil, {}, 0
+  for b, batch in ipairs(batches) do
+    local pcs = {}
+    for k, i in ipairs(batch) do
+      pcs[k] = (i == 0) and ANCHOR_PC or presentation_contexts[i]
+    end
+    if b > 1 then
+      stdnse.sleep(BATCH_GAP_MS / 1000)
+    end
+    local ok, err, results, batch_info = associate_serialized(host, port, calling_aet, called_aet, pcs)
+    if not ok then
+      if b == 1 then return false, err end
+      errors[#errors + 1] = string.format("association %d of %d failed: %s", b, #batches, err_text(err))
+      break
+    end
+    accepted = accepted + 1
+    info = info or batch_info
+    for k, i in ipairs(batch) do
+      if i > 0 then pc_results[i] = results[k] end
+    end
+  end
+
+  -- Attach the proposal to each result so the caller doesn't need to
+  -- cross-reference.
+  for i, pc in ipairs(presentation_contexts) do
+    local r = pc_results[i] or {}
+    r.abstract_syntax   = pc.abstract_syntax
+    r.transfer_syntaxes = pc.transfer_syntaxes
+    pc_results[i] = r
+  end
+
+  info.associations = accepted
+  info.errors = (#errors > 0) and errors or nil
   return true, nil, pc_results, info
 end
 
@@ -1035,6 +1252,9 @@ end
 -- syntaxes (still ping-shaped — one PC, ~22 bytes more on the wire).
 -- Returns on success:
 --   true, nil, version, vendor, uid, impl_version_name, device_vendor
+-- On failure:
+--   false, err_string[, reject] where reject is the decoded A-ASSOCIATE-RJ
+--   table (see associate_extended) when the SCP rejected the association.
 --
 function associate(host, port, calling_aet, called_aet)
   local pcs = {{
@@ -1047,9 +1267,9 @@ function associate(host, port, calling_aet, called_aet)
 
   local ok, err, _pc_results, info = associate_extended(host, port, calling_aet, called_aet, pcs)
   if not ok then
-    -- Preserve the legacy string contract for callers (dicom-ping.nse) that
+    -- Preserve the legacy string contract for callers (dicom-brute.nse) that
     -- pre-date the structured RJ table return.
-    if type(err) == "table" then return false, err.err end
+    if type(err) == "table" then return false, err.err, err end
     return false, err
   end
 

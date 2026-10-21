@@ -1,8 +1,11 @@
 --[[
 Enumerates the SOP classes and transfer syntaxes a DICOM Service Provider
-accepts by proposing a curated set of presentation contexts in a single
+accepts by proposing a curated set of presentation contexts in an
 A-ASSOCIATE request and parsing the per-PC result map returned in the
-A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2).
+A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2). Proposals larger than the
+per-association limits (dicom.max_pcs, dicom.max_rq_bytes) are split across
+sequential associations; at the default limits only the "full" probe needs
+more than one.
 
 Each presentation context is reported as one of:
   accepted (0), user-rejection (1), no-reason (2),
@@ -29,7 +32,14 @@ probe depths trade breadth against A-ASSOCIATE-RQ size:
              set (default)
   full     - core + long-tail SOP classes (Multi-frame SC, RT, extended SR,
              UPS, ophthalmic, waveform, segmentation, whole-slide, ...) with
-             the complete transfer-syntax matrix
+             the complete transfer-syntax matrix (two associations at the
+             default limits)
+
+Associations to a host run one at a time, shared with other DICOM scripts,
+so a scan never holds more than one slot of the SCP's association pool. A
+transient reject (temporary-congestion / local-limit-exceeded) is retried
+with backoff, and any error after the request goes out sends A-ABORT so the
+SCP frees the slot at once.
 
 From the accepted SOP classes the script also derives:
   modalities         - the imaging modalities implied by accepted Storage
@@ -77,9 +87,17 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- @args dicom.tls            Transport override: "true" forces DICOM-over-TLS,
 --                            "false" forces plaintext. Default: unset (adapt
 --                            to Nmap's own -sV SSL/TLS service detection).
--- @args dicom.no_release     If set, the script omits A-RELEASE-RQ and lets
---                            the SCP see an aborted association. Default:
---                            unset (release is sent).
+-- @args dicom.no_release     If set, the script closes with A-ABORT instead
+--                            of A-RELEASE-RQ, so the SCP sees an aborted
+--                            association. Default: unset (release is sent).
+-- @args dicom.max_pcs        Most presentation contexts per A-ASSOCIATE-RQ.
+--                            Default: 64
+-- @args dicom.max_rq_bytes   Largest A-ASSOCIATE-RQ PDU in bytes. Default:
+--                            16384
+-- @args dicom.retries        Retries after a temporary-congestion /
+--                            local-limit-exceeded reject. Default: 2
+-- @args dicom.backoff_ms     First retry delay in ms, doubled per retry.
+--                            Default: 2000
 -- @args dicom-enum.probe     Probe depth: "basic", "standard" (default), or
 --                            "full". See the description for the trade-off.
 -- @args dicom-enum.ports     Optional comma-separated list of ports to
@@ -523,8 +541,8 @@ action = function(host, port)
         out.hint = "Calling-AET not recognized — try dicom.calling_aet=<AET>"
       elseif err.source == 2 and err.reason == 2 then
         out.hint = "Protocol version mismatch"
-      elseif err.source == 3 and err.reason == 1 then
-        out.hint = "Server overloaded — retry later"
+      elseif err.source == 3 and (err.reason == 1 or err.reason == 2) then
+        out.hint = "SCP busy (association pool full) after retries — rescan later"
       end
       mark_dicom_service(host, port)
       return out
@@ -569,10 +587,16 @@ action = function(host, port)
   if device_vendor then
     detail[#detail + 1] = "device=" .. device_vendor
   end
+  if info and info.associations and info.associations > 1 then
+    detail[#detail + 1] = string.format("associations=%d", info.associations)
+  end
   if #detail > 0 then
     out.association = string.format("accepted (%s)", table.concat(detail, ", "))
   else
     out.association = "accepted"
+  end
+  if info and info.errors then
+    out.warning = string.format("results are partial: %s", table.concat(info.errors, "; "))
   end
 
   -- Bucket per-PC results and collect accepted service classes / UIDs.

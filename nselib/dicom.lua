@@ -402,33 +402,128 @@ function infer_modalities(accepted_uids)
   return list
 end
 
+-- PS3.4 Service Classes reported by infer_services(), in output order. Query/
+-- Retrieve (Annex C) is split into its query (C-FIND) and retrieve (C-MOVE,
+-- C-GET) halves; Modality Worklist is the Basic Worklist Management Service
+-- (Annex K), a separate Service Class whose C-FIND runs against a different
+-- information model.
+SERVICE_KEYS = {
+  "verification",        -- Annex A
+  "storage",             -- Annex B
+  "query",               -- Annex C, C-FIND
+  "retrieve",            -- Annex C, C-MOVE / C-GET
+  "modality_worklist",   -- Annex K
+  "storage_commitment",  -- Annex J
+  "mpps",                -- Annex F
+  "ups",                 -- Annex CC
+  "print",               -- Annex H
+}
+
+-- DIMSE operations each SOP Class carries (PS3.4; DIMSE services per PS3.7).
+-- Composite services use DIMSE-C, the normalized workflow and print services
+-- use DIMSE-N. A Meta SOP Class lists the union of its member SOP Classes.
+local PRINT_META_OPS = {"N-ACTION", "N-CREATE", "N-DELETE", "N-EVENT-REPORT", "N-GET", "N-SET"}
+local DIMSE_BY_UID = {
+  ["1.2.840.10008.1.1"]          = {service = "verification",       ops = {"C-ECHO"}},
+  ["1.2.840.10008.5.1.4.31"]     = {service = "modality_worklist",  ops = {"C-FIND"}},
+  ["1.2.840.10008.1.20.1"]       = {service = "storage_commitment", ops = {"N-ACTION", "N-EVENT-REPORT"}},
+  ["1.2.840.10008.3.1.2.3.3"]    = {service = "mpps",               ops = {"N-CREATE", "N-SET"}},
+  -- Each UPS SOP Class carries a different slice of the service (Annex CC).
+  ["1.2.840.10008.5.1.4.34.6.1"] = {service = "ups", label = "Push",  ops = {"N-ACTION", "N-CREATE", "N-GET"}},
+  ["1.2.840.10008.5.1.4.34.6.2"] = {service = "ups", label = "Watch", ops = {"C-FIND", "N-ACTION", "N-GET"}},
+  ["1.2.840.10008.5.1.4.34.6.3"] = {service = "ups", label = "Pull",  ops = {"C-FIND", "N-ACTION", "N-GET", "N-SET"}},
+  ["1.2.840.10008.5.1.4.34.6.4"] = {service = "ups", label = "Event", ops = {"N-EVENT-REPORT"}},
+  ["1.2.840.10008.5.1.1.9"]      = {service = "print", label = "Basic Grayscale", ops = PRINT_META_OPS},
+  ["1.2.840.10008.5.1.1.18"]     = {service = "print", label = "Basic Color",     ops = PRINT_META_OPS},
+}
+
+local STORAGE_UID_PREFIX = "1.2.840.10008.5.1.4.1.1."
+-- Q/R SOP Class UIDs are <information model>.<op>: .1 FIND, .2 MOVE, .3 GET.
+local QR_UID_PREFIX = "1.2.840.10008.5.1.4.1.2."
+local QR_OPS = { ["1"] = "C-FIND", ["2"] = "C-MOVE", ["3"] = "C-GET" }
+local QR_MODEL_NAMES = {
+  ["1.2.840.10008.5.1.4.1.2.1"] = "Patient Root",
+  ["1.2.840.10008.5.1.4.1.2.2"] = "Study Root",
+  ["1.2.840.10008.5.1.4.1.2.3"] = "Patient/Study Only",
+}
+
+-- Map a SOP Class UID to its SERVICE_KEYS entry, DIMSE ops, and an optional
+-- label naming the Q/R information model or UPS / Print SOP Class.
+local function dimse_for_uid(uid)
+  local d = DIMSE_BY_UID[uid]
+  if d then return d.service, d.ops, d.label end
+  if uid:sub(1, #STORAGE_UID_PREFIX) == STORAGE_UID_PREFIX then
+    return "storage", {"C-STORE"}, nil
+  end
+  if uid:sub(1, #QR_UID_PREFIX) == QR_UID_PREFIX then
+    local model, tail = uid:match("^(.*)%.([123])$")
+    local op = tail and QR_OPS[tail]
+    if op then
+      return (op == "C-FIND") and "query" or "retrieve", {op}, QR_MODEL_NAMES[model] or model
+    end
+  end
+  return nil
+end
+
+local function sorted_keys(set)
+  local list = {}
+  for k in pairs(set) do list[#list + 1] = k end
+  table.sort(list)
+  return list
+end
+
 ---
--- Infer DIMSE service commands from accepted abstract syntax UIDs. Mapping
--- follows the Q/R model UIDs (PS3.4 Annex C) where the trailing component
--- selects FIND (.1), MOVE (.2), or GET (.3), plus Verification (C-ECHO),
--- Storage (C-STORE), and Modality Worklist (C-FIND).
+-- Infer DIMSE service commands from accepted abstract syntax UIDs: C-ECHO,
+-- C-STORE, C-FIND, C-MOVE and C-GET for the composite services, and the
+-- N-* operations (N-CREATE, N-SET, N-ACTION, N-EVENT-REPORT, N-GET,
+-- N-DELETE) for MPPS, Storage Commitment, UPS and Print Management.
+-- @return sorted list of DIMSE operation names.
 function infer_service_commands(accepted_uids)
-  if not accepted_uids then return {} end
   local cmds = {}
-  for _, uid in ipairs(accepted_uids) do
-    if uid == "1.2.840.10008.1.1" then
-      cmds["C-ECHO"] = true
-    elseif uid:sub(1, #"1.2.840.10008.5.1.4.1.1.") == "1.2.840.10008.5.1.4.1.1." then
-      cmds["C-STORE"] = true
-    elseif uid == "1.2.840.10008.5.1.4.31" then
-      cmds["C-FIND"] = true
-    elseif uid:sub(1, #"1.2.840.10008.5.1.4.1.2.") == "1.2.840.10008.5.1.4.1.2." then
-      local tail = uid:match("%.([123])$")
-      if     tail == "1" then cmds["C-FIND"] = true
-      elseif tail == "2" then cmds["C-MOVE"] = true
-      elseif tail == "3" then cmds["C-GET"]  = true
+  for _, uid in ipairs(accepted_uids or {}) do
+    local _, ops = dimse_for_uid(uid)
+    for _, op in ipairs(ops or {}) do cmds[op] = true end
+  end
+  return sorted_keys(cmds)
+end
+
+---
+-- Summarize negotiation per PS3.4 Service Class (see SERVICE_KEYS).
+-- @param proposed_uids abstract syntaxes the SCP answered, accepted or not
+-- @param accepted_uids abstract syntaxes it accepted
+-- @return table keyed by SERVICE_KEYS entry. A key is absent when no context
+--         for that service was proposed; otherwise it maps to
+--         {accepted = bool, sop_classes = n, ops = {[op] = sorted labels}},
+--         where labels name the Q/R information models or UPS / Print SOP
+--         Classes that carry the op (empty for single-SOP-Class services).
+function infer_services(proposed_uids, accepted_uids)
+  local out = {}
+  local function entry(svc)
+    out[svc] = out[svc] or { accepted = false, sop_classes = 0, ops = {} }
+    return out[svc]
+  end
+  for _, uid in ipairs(proposed_uids or {}) do
+    local svc = dimse_for_uid(uid)
+    if svc then entry(svc) end
+  end
+  local seen = {}
+  for _, uid in ipairs(accepted_uids or {}) do
+    local svc, ops, label = dimse_for_uid(uid)
+    if svc and not seen[uid] then
+      seen[uid] = true
+      local s = entry(svc)
+      s.accepted = true
+      s.sop_classes = s.sop_classes + 1
+      for _, op in ipairs(ops) do
+        s.ops[op] = s.ops[op] or {}
+        if label then s.ops[op][label] = true end
       end
     end
   end
-  local list = {}
-  for c in pairs(cmds) do list[#list + 1] = c end
-  table.sort(list)
-  return list
+  for _, s in pairs(out) do
+    for op, labels in pairs(s.ops) do s.ops[op] = sorted_keys(labels) end
+  end
+  return out
 end
 
 -- UID tables: "toolkit" = DICOM library on the wire (CVE target),

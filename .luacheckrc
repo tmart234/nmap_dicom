@@ -41,6 +41,7 @@ files["nselib/dicom.lua"] = {
     "SERVICE_CLASS_BY_UID", "SOP_MODALITY_BY_UID",
     "service_class_for_uid", "infer_device_class",
     "modality_for_uid", "infer_modalities", "infer_service_commands",
+    "SERVICE_KEYS", "infer_services",
     "start_connection", "send", "receive", "pdu_header_encode",
     "parse_associate_accept", "parse_implementation_version",
     "identify_vendor_from_uid", "identify_toolkit", "extract_clean_version",

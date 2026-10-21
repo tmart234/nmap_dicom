@@ -39,6 +39,8 @@ Every presentation context is proposed with **Implicit VR Little Endian** — th
 | `standard` *(default)* | core | commonly-negotiated set (Implicit/Explicit, Deflate, JPEG Baseline/Lossless, JPEG2000 lossless+lossy, RLE) | ~7 KB | everyday scanning |
 | `full` | core **+ long tail** (Multi-frame SC, RT, extended SR, UPS, ophthalmic, waveform/ECG, segmentation, parametric map, whole-slide, ...) | the complete matrix incl. JPEG-LS, Explicit VR BE, HTJ2K | ~21 KB, split into two sequential associations (~16 KB + ~5 KB) | exhaustive codec/SOP fingerprinting of modern devices |
 
+The output's `probe` line records the depth used, e.g. `probe: standard (36 presentation contexts proposed, 1 association)`. A `not probed` service, or a difference between two scans of the same host, can then be traced to a probe-depth mismatch.
+
 ### Transport & security
 
 Transport adapts to Nmap's own `-sV` SSL/TLS detection, or is forced with `--script-args dicom.tls=true|false`. On a TLS association the peer certificate (subject, issuer, validity, key strength, signature algorithm) is reported, and a `security` block flags findings derived **purely from the single association** — no DIMSE commands or patient data are ever sent: unauthenticated (no AE-title allowlist) access, Query/Retrieve C-FIND/C-MOVE/C-GET exfiltration surface, unauthenticated C-STORE surface, plaintext PHI, a weak or self-signed TLS certificate, and absent mutual TLS (IHE ATNA node authentication).

@@ -135,8 +135,10 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 --                            Default: 2000
 -- @args dicom-enum.probe     Probe depth: "basic", "standard" (default), or
 --                            "full". See the description for the trade-off.
--- @args dicom-enum.ports     Optional comma-separated list of ports to
---                            probe (e.g. "104,11112,2761,2762,4242").
+-- @args dicom-enum.ports     Comma-separated ports to probe in addition to
+--                            the common DICOM ports (104, 11112, 2761, 2762,
+--                            4242) and ports identified as dicom / dicom-tls
+--                            (e.g. "11114,11115").
 --
 -- @output
 -- PORT     STATE SERVICE
@@ -624,6 +626,15 @@ action = function(host, port)
   local called_aet  = stdnse.get_script_args("dicom.called_aet")
   local calling_aet = stdnse.get_script_args("dicom.calling_aet")
 
+  -- AE titles are at most 16 bytes (PS3.5 section 6.2). The library cuts a
+  -- longer one to 16, which would probe with an AET nobody asked for.
+  for _, a in ipairs({{"dicom.called_aet", called_aet}, {"dicom.calling_aet", calling_aet}}) do
+    if a[2] and #a[2] > 16 then
+      out.error = string.format("%s exceeds 16 bytes", a[1])
+      return out
+    end
+  end
+
   local probe = (stdnse.get_script_args("dicom-enum.probe") or "standard"):lower()
   if not VALID_PROBES[probe] then
     stdnse.debug1("DICOM: unknown probe depth %q, falling back to 'standard'", probe)
@@ -653,10 +664,10 @@ action = function(host, port)
       mark_dicom_service(host, port)
       return out
     end
-    local e = tostring(err or "")
-    out.dicom = "DICOM Service Provider discovered!"
-    out.error = e
-    return nil
+    -- Without an A-ASSOCIATE-RJ nothing shows the peer speaks DICOM UL, so
+    -- report why the association failed but claim no DICOM service.
+    out.error = tostring(err or "association failed")
+    return out
   end
 
   -- Resolve vendor / version once and reuse for both port.version metadata

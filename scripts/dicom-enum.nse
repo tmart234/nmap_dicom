@@ -11,10 +11,13 @@ Each presentation context is reported as one of:
   accepted (0), user-rejection (1), no-reason (2),
   abstract-syntax-not-supported (3), transfer-syntaxes-not-supported (4)
 
-Only the "accepted" bucket is rendered in normal script output - that is
-the SCP's positive capability surface. The other four buckets are emitted
-at debug level only (-d), since "everything we proposed that this SCP
-doesn't serve" is useful for triage but noise in default output.
+Normal script output lists the "accepted" bucket in full - that is the
+SCP's positive capability surface - and a one-line-per-reason count of the
+rejected ones (e.g. "3 abstract-syntax-not-supported"), which explains a
+"no" services line without -d. The full list of which contexts landed in
+each rejection bucket is a fingerprint of what the SCP doesn't serve:
+useful for triage but noise in default output, so it stays at debug level
+only (-d).
 
 This is a capability fingerprint. It reports which Storage SOP classes the
 SCP accepts (CT/MR/US/CR/DX/Mammo/PET/NM/XA/XRF/Endoscopy/RT/SR/ECG/
@@ -181,6 +184,8 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- |         Verification - Implicit VR Little Endian
 -- |         CT Image Storage - Explicit VR Little Endian
 -- |         MR Image Storage - JPEG 2000 Image Compression (Lossless Only)
+-- |     rejected:
+-- |       3 abstract-syntax-not-supported
 -- |   security:
 -- |     transport: plaintext (no TLS)
 -- |     findings:
@@ -237,6 +242,9 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 --     <table key="items">
 --       <elem>Verification - Implicit VR Little Endian</elem>
 --     </table>
+--   </table>
+--   <table key="rejected">
+--     <elem>3 abstract-syntax-not-supported</elem>
 --   </table>
 -- </table>
 -- <table key="security">
@@ -767,15 +775,29 @@ action = function(host, port)
     out.inferred_device_class = device_class
   end
 
-  -- Structured results in normal output: only the accepted bucket. The
-  -- non-accepted buckets are a fingerprint of what the SCP *doesn't* serve;
-  -- emit them at debug level so normal output stays focused on capabilities.
+  -- Structured results in normal output: the accepted bucket in full, plus a
+  -- one-line-per-reason count of the rejected ones. The full rejected PC lists
+  -- are a fingerprint of what the SCP *doesn't* serve: still debug-only, so
+  -- normal output stays focused on capabilities, but the counts explain a
+  -- "no" services line without needing -d.
   local results = stdnse.output_table()
   if #buckets[0] > 0 then
     local sub = stdnse.output_table()
     sub.count = #buckets[0]
     sub.items = buckets[0]
     results[dicom.PC_RESULT_NAMES[0]] = sub
+  end
+  local rejected = {}
+  for _, code in ipairs(DEBUG_BUCKET_ORDER) do
+    if #buckets[code] > 0 then
+      rejected[#rejected + 1] = string.format("%d %s", #buckets[code], dicom.PC_RESULT_NAMES[code])
+    end
+  end
+  if #buckets.unknown > 0 then
+    rejected[#rejected + 1] = string.format("%d unknown-result", #buckets.unknown)
+  end
+  if #rejected > 0 then
+    results.rejected = rejected
   end
   out.results = results
 

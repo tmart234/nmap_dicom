@@ -1,8 +1,8 @@
---[[
+description = [[
 Enumerates the SOP classes and transfer syntaxes a DICOM Service Provider
 accepts by proposing a curated set of presentation contexts in an
 A-ASSOCIATE request and parsing the per-PC result map returned in the
-A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2). Proposals larger than the
+A-ASSOCIATE-AC PDU (PS3.8 section 9.3.3.2). Proposals larger than the
 per-association limits (dicom.max_pcs, dicom.max_rq_bytes) are split across
 sequential associations; at the default limits only the "full" probe needs
 more than one.
@@ -11,7 +11,7 @@ Each presentation context is reported as one of:
   accepted (0), user-rejection (1), no-reason (2),
   abstract-syntax-not-supported (3), transfer-syntaxes-not-supported (4)
 
-Only the "accepted" bucket is rendered in normal script output — that is
+Only the "accepted" bucket is rendered in normal script output - that is
 the SCP's positive capability surface. The other four buckets are emitted
 at debug level only (-d), since "everything we proposed that this SCP
 doesn't serve" is useful for triage but noise in default output.
@@ -32,7 +32,7 @@ allowlists, storage policy and DIMSE-level refusals are separate layers that
 this script does not test.
 
 Transfer syntaxes: an accepted presentation context carries the one transfer
-syntax the SCP chose from those proposed (PS3.8 §9.3.3.2), listed per SOP
+syntax the SCP chose from those proposed (PS3.8 section 9.3.3.2), listed per SOP
 class under results.accepted.items. The other syntaxes proposed are neither
 accepted nor rejected, so the storage line's SOP class count says nothing
 about codec breadth. A context with none acceptable shows up at -d as
@@ -40,7 +40,7 @@ transfer-syntaxes-not-supported.
 
 Ubiquity: every presentation context is proposed with Implicit VR Little
 Endian (the one transfer syntax every conformant SCP must support, PS3.5
-§10.1), so even the oldest modalities negotiate at least one context. Three
+section 10.1), so even the oldest modalities negotiate at least one context. Three
 probe depths trade breadth against A-ASSOCIATE-RQ size:
   basic    - core SOP classes, Implicit+Explicit VR only (smallest PDU;
              best for fragile/embedded legacy devices)
@@ -102,7 +102,7 @@ From the accepted SOP classes the script also derives:
 
 This script does NOT brute-force Application Entity Titles. If the target
 PACS enforces an AET allowlist, the association is rejected before any
-PC results come back — use dicom-brute first to discover a valid AET pair,
+PC results come back - use dicom-brute first to discover a valid AET pair,
 then pass it via dicom.called_aet / dicom.calling_aet here.
 
 Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
@@ -184,10 +184,10 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- |   security:
 -- |     transport: plaintext (no TLS)
 -- |     findings:
--- |       Any called-AET accepted — no AE-title allowlist enforced
--- |       Query/Retrieve C-MOVE accepted — bulk retrieval to an arbitrary AE
--- |       15 Storage SOP classes accepted — unauthenticated C-STORE surface
--- |_      Plaintext transport — associations and PHI exposed on the wire
+-- |       Any called-AET accepted - no AE-title allowlist enforced
+-- |       Query/Retrieve C-MOVE accepted - bulk retrieval to an arbitrary AE
+-- |       15 Storage SOP classes accepted - unauthenticated C-STORE surface
+-- |_      Plaintext transport - associations and PHI exposed on the wire
 --
 -- @output
 -- PORT     STATE SERVICE
@@ -195,7 +195,7 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- | dicom-enum:
 -- |   dicom: DICOM Service Provider discovered!
 -- |   config: Association rejected: rejected-permanent / DICOM-UL-service-user / called-AE-title-not-recognized
--- |_  hint: Called-AET not recognized — try dicom.called_aet=<AET>
+-- |_  hint: Called-AET not recognized - try dicom.called_aet=<AET>
 --
 -- @xmloutput
 -- <elem key="association">accepted (max_pdu=16384, vendor=Orthanc 1.11.0)</elem>
@@ -242,7 +242,7 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- <table key="security">
 --   <elem key="transport">plaintext (no TLS)</elem>
 --   <table key="findings">
---     <elem>Any called-AET accepted — no AE-title allowlist enforced</elem>
+--     <elem>Any called-AET accepted - no AE-title allowlist enforced</elem>
 --   </table>
 -- </table>
 ---
@@ -278,7 +278,7 @@ local TS_HTJ2K   = "1.2.840.10008.1.2.4.203"  -- HTJ2K (Lossy)
 
 -- Storage transfer-syntax sets, chosen per probe depth. Implicit VR LE is
 -- always first so that even an SCP that negotiates nothing else still
--- accepts the context (PS3.5 §10.1 makes Implicit VR LE mandatory).
+-- accepts the context (PS3.5 section 10.1 makes Implicit VR LE mandatory).
 --
 --   basic    - Implicit + Explicit VR only; smallest A-ASSOCIATE-RQ, best
 --              for fragile/embedded legacy devices that choke on large PDUs.
@@ -339,7 +339,7 @@ local PC_MASTER = {
   {name = "Comprehensive SR Storage",                    uid = "1.2.840.10008.5.1.4.1.1.88.33",       kind = "storage", depth = "core"},
   {name = "Grayscale Softcopy Presentation State Storage", uid = "1.2.840.10008.5.1.4.1.1.11.1",      kind = "storage", depth = "core"},
 
-  -- Storage SOP classes (extended / long tail — full probe only)
+  -- Storage SOP classes (extended / long tail - full probe only)
   {name = "Multi-frame Single Bit SC Image Storage",     uid = "1.2.840.10008.5.1.4.1.1.7.1",         kind = "storage", depth = "ext"},
   {name = "Multi-frame Grayscale Byte SC Image Storage", uid = "1.2.840.10008.5.1.4.1.1.7.2",         kind = "storage", depth = "ext"},
   {name = "Multi-frame Grayscale Word SC Image Storage", uid = "1.2.840.10008.5.1.4.1.1.7.3",         kind = "storage", depth = "ext"},
@@ -571,7 +571,7 @@ local function security_findings(accepted_uids, called_aet, info)
   -- Unauthenticated association: we proposed a default/empty called-AET and
   -- the SCP still accepted, so it enforces no AE-title allowlist.
   if not called_aet or called_aet == "" or called_aet == "ANY-SCP" then
-    findings[#findings + 1] = "Any called-AET accepted — no AE-title allowlist enforced"
+    findings[#findings + 1] = "Any called-AET accepted - no AE-title allowlist enforced"
   end
 
   -- Query/Retrieve exfiltration surface.
@@ -589,28 +589,28 @@ local function security_findings(accepted_uids, called_aet, info)
     end
   end
   if has_find then
-    findings[#findings + 1] = "Query/Retrieve C-FIND accepted — patient/study metadata enumeration possible (dicom-brute, then a C-FIND client)"
+    findings[#findings + 1] = "Query/Retrieve C-FIND accepted - patient/study metadata enumeration possible (dicom-brute, then a C-FIND client)"
   end
   if has_move then
-    findings[#findings + 1] = "Query/Retrieve C-MOVE accepted — bulk image retrieval to an arbitrary destination AE possible"
+    findings[#findings + 1] = "Query/Retrieve C-MOVE accepted - bulk image retrieval to an arbitrary destination AE possible"
   end
   if has_get then
-    findings[#findings + 1] = "Query/Retrieve C-GET accepted — direct image retrieval possible"
+    findings[#findings + 1] = "Query/Retrieve C-GET accepted - direct image retrieval possible"
   end
   if storage_count > 0 then
     findings[#findings + 1] = string.format(
-      "%d Storage SOP class%s accepted — unauthenticated C-STORE (data/malware injection) surface",
+      "%d Storage SOP class%s accepted - unauthenticated C-STORE (data/malware injection) surface",
       storage_count, storage_count == 1 and "" or "es")
   end
 
   -- Transport.
   if info and info.tls then
     findings[#findings + 1] =
-      "TLS server did not request a client certificate — no mutual TLS / IHE ATNA node authentication"
+      "TLS server did not request a client certificate - no mutual TLS / IHE ATNA node authentication"
     if info.cert then cert_findings(info.cert, findings) end
   else
     findings[#findings + 1] =
-      "Plaintext transport — associations and PHI exposed on the wire (consider DICOM-over-TLS, PS3.15 §B)"
+      "Plaintext transport - associations and PHI exposed on the wire (consider DICOM-over-TLS, PS3.15 Annex B)"
   end
 
   return findings
@@ -642,13 +642,13 @@ action = function(host, port)
       out.config = string.format("Association rejected: %s / %s / %s",
         err.result_text or "?", err.source_text or "?", err.reason_text or "?")
       if err.source == 1 and err.reason == 7 then
-        out.hint = "Called-AET not recognized — try dicom.called_aet=<AET>"
+        out.hint = "Called-AET not recognized - try dicom.called_aet=<AET>"
       elseif err.source == 1 and err.reason == 3 then
-        out.hint = "Calling-AET not recognized — try dicom.calling_aet=<AET>"
+        out.hint = "Calling-AET not recognized - try dicom.calling_aet=<AET>"
       elseif err.source == 2 and err.reason == 2 then
         out.hint = "Protocol version mismatch"
       elseif err.source == 3 and (err.reason == 1 or err.reason == 2) then
-        out.hint = "SCP busy (association pool full) after retries — rescan later"
+        out.hint = "SCP busy (association pool full) after retries - rescan later"
       end
       mark_dicom_service(host, port)
       return out

@@ -1,6 +1,25 @@
 # nmap_dicom
 PR work for nmap dicom
 
+## Upstream rebase (Nmap 7.992+)
+
+Nmap 7.992 shipped Paulino Calderon's rewritten `nselib/dicom.lua` (a full
+DIMSE toolkit) and eight new DICOM scripts (`dicom-info`, `dicom-cfind-ls`,
+`dicom-cmove`, `dicom-get`, `dicom-store-fuzzer`, `dicom-store-inject`,
+`dicom-slowloris`, `dicom-web-enum`). For the release this repo is **rebased
+onto that `dicom.lua`** rather than replacing it: the upstream file is taken
+verbatim as the base, and `dicom-enum`'s engine is added to it as two new
+sections — presentation-context negotiation (`associate_extended` and its
+PACS-safety machinery) and implementation identification
+(`resolve_vendor_info`). Nothing upstream is removed, so all eight shipped
+scripts keep running unchanged against the merged library (verified: their
+output is byte-identical whether loaded against upstream `dicom.lua` or this
+one).
+
+`dicom-enum` is pitched as the **single-association, no-DIMSE, PACS-safe**
+capability enumerator, complementary to `dicom-info` (which sends a C-ECHO
+and spends one association per transfer syntax it tests).
+
 ## Overview
 ### Vendor & Version Fingerprinting
 The script extracts two fields from the User Information item of the A-ASSOCIATE-AC PDU:
@@ -27,7 +46,7 @@ The library hooks into Nmap's port.version.service_tunnel property to automatica
 
 `dicom-enum.nse` proposes a curated set of presentation contexts (Verification, the Storage SOP classes, Modality Worklist FIND, Patient/Study Root Q/R, Storage Commitment, MPPS, UPS, and Print) in **one A-ASSOCIATE request** (two for the `full` probe; see [Safe on production PACS](#safe-on-production-pacs)) and parses the per-PC result map returned in the A-ASSOCIATE-AC PDU (PS3.8 §9.3.3.2). Each PC is reported as `accepted`, `user-rejection`, `no-reason`, `abstract-syntax-not-supported`, or `transfer-syntaxes-not-supported`. Accepted abstract syntaxes are mapped to a `services` summary with one line per PS3.4 Service Class (verification, storage, query, retrieve, modality_worklist, storage_commitment, mpps, ups, print). Each line reads `yes` with the negotiated DIMSE operations and the Q/R information models or SOP classes behind them, `no`, or `not probed` at the chosen probe depth. The mapping also yields `service_classes`, imaging `modalities`, the flat DIMSE `service_commands` list (C-ECHO/C-STORE/C-FIND/C-MOVE/C-GET plus N-CREATE/N-SET/N-ACTION/N-EVENT-REPORT/N-GET/N-DELETE for the workflow and print services), and an `inferred_device_class` line (PACS/VNA, Modality, RIS gateway, Archive front-end, Print server). Output shape mirrors `ssh2-enum-algos`. Categories are `discovery, safe` (not `default`) — same call the maintainers made for `ssh2-enum-algos`.
 
-This script is the merge of two independent efforts (`dicom-enum` + Paulino Calderon's `dicom-info`), keeping the single-association engine and this repo's non-impersonating library while folding in the richer SOP catalogue, DICOM-over-TLS certificate inspection, and the security assessment from `dicom-info`.
+This script keeps the single-association engine while folding in a rich SOP catalogue, DICOM-over-TLS certificate inspection, and a security assessment. Its negotiation engine and identification helpers live in `nselib/dicom.lua` (see [Upstream rebase](#upstream-rebase-nmap-7992)); `dicom-ping` in this repo consumes the same `associate_extended` / `resolve_vendor_info` API.
 
 ### Ubiquity (old and new devices)
 
@@ -45,7 +64,7 @@ The output's `probe` line records the depth used, e.g. `probe: standard (36 pres
 
 Transport adapts to Nmap's own `-sV` SSL/TLS detection, or is forced with `--script-args dicom.tls=true|false`. On a TLS association the peer certificate (subject, issuer, validity, key strength, signature algorithm) is reported, and a `security` block flags findings derived **purely from the single association** — no DIMSE commands or patient data are ever sent: unauthenticated (no AE-title allowlist) access, Query/Retrieve C-FIND/C-MOVE/C-GET exfiltration surface, unauthenticated C-STORE surface, plaintext PHI, a weak or self-signed TLS certificate, and absent mutual TLS (IHE ATNA node authentication).
 
-The library identifies itself with an ITU-T X.667 self-issued OID (`2.25.<UUID>`) and Implementation Version Name `NMAP_NSE`. It does not impersonate DCMTK, OFFIS, or any registered vendor. After a successful association the script sends an A-RELEASE-RQ for an orderly close so SCPs do not log the scan as an abort; pass `--script-args dicom.no_release` to close with A-ABORT instead.
+The library advertises the Implementation Class UID (`1.2.276.0.7230010.3.0.3.6.7`) and Implementation Version Name (`OFFIS_DCMTK_367`) inherited from the upstream Nmap `dicom.lua` it is rebased onto (see [Upstream rebase](#upstream-rebase-nmap-7992)), which the shipped DICOM scripts use for maximum compatibility with SCPs that validate the calling implementation. After a successful association the script sends an A-RELEASE-RQ for an orderly close so SCPs do not log the scan as an abort; pass `--script-args dicom.no_release` to close with A-ABORT instead.
 
 ### Safe on production PACS
 

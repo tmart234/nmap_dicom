@@ -1,160 +1,118 @@
+local datetime = require "datetime"
+local dicom = require "dicom"
+local nmap = require "nmap"
+local shortport = require "shortport"
+local stdnse = require "stdnse"
+local string = require "string"
+local table = require "table"
+
 description = [[
 Enumerates the SOP classes and transfer syntaxes a DICOM Service Provider
-accepts by proposing a curated set of presentation contexts in an
-A-ASSOCIATE request and parsing the per-PC result map returned in the
-A-ASSOCIATE-AC PDU (PS3.8 section 9.3.3.2). Proposals larger than the
-per-association limits (dicom.max_pcs, dicom.max_rq_bytes) are split across
-sequential associations; at the default limits only the "full" probe needs
-more than one.
+(SCP) accepts, by proposing a curated set of presentation contexts in an
+A-ASSOCIATE request and reading the per-context result map in the
+A-ASSOCIATE-AC (PS3.8 section 9.3.3.2).
 
-Each presentation context is reported as one of:
-  accepted (0), user-rejection (1), no-reason (2),
-  abstract-syntax-not-supported (3), transfer-syntaxes-not-supported (4)
+No DIMSE messages or patient data are sent, and the whole catalogue goes out
+in one association (two for the "full" probe at the default limits), so the
+script holds at most one slot of the SCP's association pool at a time. This
+is the main difference from dicom-info, which sends a C-ECHO and spends a
+separate association on each transfer syntax it tests.
 
-Only the "accepted" bucket is rendered in normal script output - that is
-the SCP's positive capability surface. The other four buckets are emitted
-at debug level only (-d), since "everything we proposed that this SCP
-doesn't serve" is useful for triage but noise in default output.
+From the accepted contexts the script reports:
+  services          one line per PS3.4 Service Class (verification,
+                    storage, query, retrieve, modality_worklist,
+                    storage_commitment, mpps, ups, print): "yes" with the
+                    negotiated DIMSE operations and the Q/R information
+                    models or UPS / Print SOP classes behind them, "no" when
+                    every proposed context was rejected, or "not probed"
+                    when this probe depth proposed none. C-FIND is
+                    attributed to query or modality_worklist by the
+                    information model it runs against.
+  service_classes   the accepted Service Classes, with Query/Retrieve named
+                    by information model (QR-Patient-Root, QR-Study-Root,
+                    QR-Patient-Study).
+  service_commands  the DIMSE-C and DIMSE-N operations those SOP classes
+                    carry.
+  modalities        the imaging modalities implied by the accepted Storage
+                    SOP classes. PET-CT is reported when both PET and CT are
+                    accepted.
+  inferred_device_class
+                    PACS/VNA, Modality, RIS gateway, Archive front-end or
+                    Print server. This is a practitioner taxonomy, not a
+                    DICOM concept; treat it as a fingerprint.
+  results           each accepted context with the transfer syntax the SCP
+                    chose for it. Rejected contexts (user-rejection,
+                    no-reason, abstract-syntax-not-supported,
+                    transfer-syntaxes-not-supported) are listed at debug
+                    level (-d).
+  security          the transport, the TLS certificate when there is one,
+                    and findings drawn from the association alone: no
+                    AE-title allowlist, Query/Retrieve and C-STORE exposure,
+                    plaintext transport, a weak or self-signed certificate,
+                    and no mutual TLS.
 
-This is a capability fingerprint. It reports which Storage SOP classes the
-SCP accepts (CT/MR/US/CR/DX/Mammo/PET/NM/XA/XRF/Endoscopy/RT/SR/ECG/
-Ophthalmic/Whole-Slide/...), which transfer syntaxes it negotiates, and
-whether each PS3.4 Service Class is negotiable: Verification (C-ECHO),
-Storage (C-STORE), Query/Retrieve (C-FIND / C-MOVE / C-GET), Modality
-Worklist (C-FIND), Storage Commitment (N-ACTION / N-EVENT-REPORT), MPPS
-(N-CREATE / N-SET), UPS (C-FIND / N-CREATE / N-ACTION / N-GET across the
-Push and Watch SOP classes probed) and Print Management (N-CREATE / N-SET /
-N-ACTION / N-DELETE / N-GET / N-EVENT-REPORT). It reports these as a
-yes / no / not probed summary derived from the accepted presentation
-contexts. An accepted context means the SCP will accept a request for that
-SOP Class; it does not mean the operation will succeed. Destination AE
-allowlists, storage policy and DIMSE-level refusals are separate layers that
-this script does not test.
+An accepted context means the SCP will accept requests for that SOP class,
+not that an operation will succeed: destination AE allowlists, storage
+policy and DIMSE-level refusals are separate layers. Each accepted context
+also carries only the one transfer syntax the SCP chose from those proposed;
+the others are neither accepted nor rejected. Scripts such as dicom-cfind-ls,
+dicom-cmove, dicom-get and dicom-store-inject test the operations
+themselves.
 
-Transfer syntaxes: an accepted presentation context carries the one transfer
-syntax the SCP chose from those proposed (PS3.8 section 9.3.3.2), listed per SOP
-class under results.accepted.items. The other syntaxes proposed are neither
-accepted nor rejected, so the storage line's SOP class count says nothing
-about codec breadth. A context with none acceptable shows up at -d as
-transfer-syntaxes-not-supported.
+Every context is proposed with Implicit VR Little Endian, the transfer
+syntax every SCP must support (PS3.5 section 10.1), so even old devices
+negotiate. The dicom-enum.probe argument trades breadth against
+A-ASSOCIATE-RQ size:
+  basic     core SOP classes, Implicit and Explicit VR only (about 3 KB;
+            for fragile or embedded legacy devices)
+  standard  core SOP classes with the commonly negotiated compressed
+            transfer syntaxes (about 7 KB; the default)
+  full      core and long-tail SOP classes (multi-frame SC, RT, extended SR,
+            UPS, ophthalmic, waveform, segmentation, whole-slide, ...) with
+            every transfer syntax (about 21 KB, split across two
+            associations at the default dicom.max_pcs / dicom.max_rq_bytes)
+The probe line records the depth, the contexts proposed and the
+associations used, so a "not probed" service or a difference between two
+scans can be traced to the depth.
 
-Ubiquity: every presentation context is proposed with Implicit VR Little
-Endian (the one transfer syntax every conformant SCP must support, PS3.5
-section 10.1), so even the oldest modalities negotiate at least one context. Three
-probe depths trade breadth against A-ASSOCIATE-RQ size:
-  basic    - core SOP classes, Implicit+Explicit VR only (smallest PDU;
-             best for fragile/embedded legacy devices)
-  standard - core SOP classes with the commonly-negotiated transfer-syntax
-             set (default)
-  full     - core + long-tail SOP classes (Multi-frame SC, RT, extended SR,
-             UPS, ophthalmic, waveform, segmentation, whole-slide, ...) with
-             the complete transfer-syntax matrix (two associations at the
-             default limits)
-The probe line of the output records the depth used, the number of
-presentation contexts it proposed and the associations that carried them,
-so a "not probed" service, or a difference between two scans of one host,
-can be traced to the probe depth.
-
-Associations to a host run one at a time, shared with other DICOM scripts,
-so a scan never holds more than one slot of the SCP's association pool. A
-transient reject (temporary-congestion / local-limit-exceeded) is retried
-with backoff, and any error after the request goes out sends A-ABORT so the
-SCP frees the slot at once.
-
-From the accepted SOP classes the script also derives:
-  services           - one line per PS3.4 Service Class (keys verification,
-                       storage, query, retrieve, modality_worklist,
-                       storage_commitment, mpps, ups, print): "yes" with the
-                       negotiated DIMSE operations and the Q/R information
-                       models or UPS / Print SOP classes behind them, "no"
-                       when every proposed context was rejected, or
-                       "not probed" when this probe depth proposed none
-                       (UPS is proposed only by the full probe). C-FIND is
-                       attributed to query or modality_worklist by the
-                       information model it runs against.
-  service_classes    - the accepted Service Classes as PS3.4 Service Class
-                       names, with Query/Retrieve abbreviated by information
-                       model (QR-Patient-Root, QR-Study-Root,
-                       QR-Patient-Study).
-  modalities         - the imaging modalities implied by accepted Storage
-                       SOP classes (CT, MRI, Ultrasound, Mammography,
-                       X-Ray, X-Ray Angiography, Fluoroscopy, PET, PET-CT,
-                       Nuclear Medicine, Endoscopy, ECG, Ophthalmic,
-                       Whole Slide Imaging, ...). PET-CT is reported when
-                       both PET and CT are accepted.
-  service_commands   - the flat DIMSE view of the accepted SOP classes:
-                       C-ECHO, C-STORE, C-FIND, C-MOVE and C-GET from the
-                       composite services, and N-CREATE, N-SET, N-ACTION,
-                       N-EVENT-REPORT, N-GET and N-DELETE from MPPS, Storage
-                       Commitment, UPS and Print Management.
-  inferred_device_class - PACS/VNA, Modality, RIS gateway, Archive
-                       front-end, or Print server. This taxonomy is a
-                       practitioner consensus, not a normative DICOM
-                       concept; treat it as a fingerprint, not a
-                       classification.
-  security           - transport (plaintext vs DICOM-over-TLS), the TLS peer
-                       certificate when present, and findings derived purely
-                       from what the single association already revealed
-                       (unauthenticated access, Query/Retrieve exfiltration
-                       surface, unauthenticated C-STORE surface, plaintext
-                       PHI, weak/mismatched TLS certificate, absent mutual
-                       TLS). No DIMSE commands or patient data are ever sent.
-
-This script does NOT brute-force Application Entity Titles. If the target
-PACS enforces an AET allowlist, the association is rejected before any
-PC results come back - use dicom-brute first to discover a valid AET pair,
-then pass it via dicom.called_aet / dicom.calling_aet here.
-
-Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
+The script does not guess Application Entity Titles. If the SCP enforces an
+AE-title allowlist it rejects the association and the script reports the
+reason; find a valid title with dicom-brute and pass it with
+dicom.called_aet or dicom.calling_aet.
 ]]
 
 ---
--- @usage nmap -p 4242 --script dicom-enum <target>
--- @usage nmap -sV -p 4242 --script dicom-enum <target>
+-- @usage nmap -p 104,4242,11112 --script dicom-enum <target>
+-- @usage nmap -sV --script dicom-enum --script-args dicom-enum.probe=full <target>
 -- @usage nmap -p 11112 --script dicom-enum --script-args dicom.called_aet=ORTHANC <target>
 -- @usage nmap -p 2762 --script dicom-enum --script-args dicom.tls=true <target>
--- @usage nmap --script dicom-enum --script-args dicom-enum.probe=full <target>
--- @usage nmap --script dicom-enum --script-args dicom-enum.ports=11114,11115 <target>
+-- @usage nmap --script dicom-enum --script-args dicom-enum.ports=11114 <target>
 --
--- @args dicom.called_aet     Called AET. Default: ANY-SCP
--- @args dicom.calling_aet    Calling AET. Default: ECHOSCU
--- @args dicom.timeout_ms     Socket timeout in ms. Default: 3000
--- @args dicom.tls            Transport override: "true" forces DICOM-over-TLS,
---                            "false" forces plaintext. Default: unset (adapt
---                            to Nmap's own -sV SSL/TLS service detection).
--- @args dicom.no_release     If set, the script closes with A-ABORT instead
---                            of A-RELEASE-RQ, so the SCP sees an aborted
---                            association. Default: unset (release is sent).
--- @args dicom.max_pcs        Most presentation contexts per A-ASSOCIATE-RQ.
---                            Default: 64
--- @args dicom.max_rq_bytes   Largest A-ASSOCIATE-RQ PDU in bytes. Default:
---                            16384
--- @args dicom.retries        Retries after a temporary-congestion /
---                            local-limit-exceeded reject. Default: 2
--- @args dicom.backoff_ms     First retry delay in ms, doubled per retry.
---                            Default: 2000
--- @args dicom-enum.probe     Probe depth: "basic", "standard" (default), or
---                            "full". See the description for the trade-off.
--- @args dicom-enum.ports     Optional comma-separated list of ports to
---                            probe (e.g. "104,11112,2761,2762,4242").
+-- @args dicom-enum.probe Probe depth: "basic", "standard" or "full" (see the
+--                        description). Default: standard
+-- @args dicom-enum.ports Optional comma-separated list of extra ports to run
+--                        on, e.g. "104,11112,2762,4242", for SCPs on
+--                        non-standard ports that -sV does not identify as
+--                        DICOM.
 --
 -- @output
--- PORT     STATE SERVICE
--- 4242/tcp open  dicom
+-- PORT      STATE SERVICE
+-- 11112/tcp open  dicom
 -- | dicom-enum:
--- |   association: accepted (max_pdu=16384, vendor=Orthanc 1.11.0)
+-- |   association: accepted (max_pdu=16382, vendor=pynetdicom)
 -- |   probe: standard (36 presentation contexts proposed, 1 association)
 -- |   services:
 -- |     verification: yes - C-ECHO
--- |     storage: yes - C-STORE (15 SOP classes)
+-- |     storage: yes - C-STORE (25 SOP classes)
 -- |     query: yes - C-FIND (Patient Root, Study Root)
 -- |     retrieve: yes - C-GET, C-MOVE (Patient Root, Study Root)
--- |     modality_worklist: no
+-- |     modality_worklist: yes - C-FIND
 -- |     storage_commitment: no
 -- |     mpps: no
 -- |     ups: not probed
 -- |     print: no
 -- |   service_classes:
+-- |     Modality-Worklist
 -- |     QR-Patient-Root
 -- |     QR-Study-Root
 -- |     Storage
@@ -168,50 +126,51 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- |   modalities:
 -- |     CT
 -- |     MRI
--- |     Mammography
 -- |     PET
 -- |     PET-CT
 -- |     Ultrasound
--- |     X-Ray (DX)
--- |   inferred_device_class: Archive front-end
+-- |   inferred_device_class: PACS/VNA
 -- |   results:
 -- |     accepted:
--- |       count: 15
+-- |       count: 33
 -- |       items:
 -- |         Verification - Implicit VR Little Endian
--- |         CT Image Storage - Explicit VR Little Endian
--- |         MR Image Storage - JPEG 2000 Image Compression (Lossless Only)
+-- |         CT Image Storage - Implicit VR Little Endian
+-- |         MR Image Storage - Implicit VR Little Endian
 -- |   security:
 -- |     transport: plaintext (no TLS)
 -- |     findings:
 -- |       Any called-AET accepted - no AE-title allowlist enforced
--- |       Query/Retrieve C-MOVE accepted - bulk retrieval to an arbitrary AE
--- |       15 Storage SOP classes accepted - unauthenticated C-STORE surface
--- |_      Plaintext transport - associations and PHI exposed on the wire
+-- |       Query/Retrieve C-FIND accepted - patient/study metadata enumeration possible
+-- |       Query/Retrieve C-MOVE accepted - bulk image retrieval to an arbitrary destination AE possible
+-- |       Query/Retrieve C-GET accepted - direct image retrieval possible
+-- |       25 Storage SOP classes accepted - unauthenticated C-STORE (data/malware injection) surface
+-- |_      Plaintext transport - associations and PHI exposed on the wire (consider DICOM-over-TLS, PS3.15 Annex B)
 --
 -- @output
--- PORT     STATE SERVICE
--- 4242/tcp open  dicom
+-- PORT      STATE SERVICE
+-- 11112/tcp open  dicom
 -- | dicom-enum:
 -- |   dicom: DICOM Service Provider discovered!
 -- |   config: Association rejected: rejected-permanent / DICOM-UL-service-user / called-AE-title-not-recognized
 -- |_  hint: Called-AET not recognized - try dicom.called_aet=<AET>
 --
 -- @xmloutput
--- <elem key="association">accepted (max_pdu=16384, vendor=Orthanc 1.11.0)</elem>
+-- <elem key="association">accepted (max_pdu=16382, vendor=pynetdicom)</elem>
 -- <elem key="probe">standard (36 presentation contexts proposed, 1 association)</elem>
 -- <table key="services">
 --   <elem key="verification">yes - C-ECHO</elem>
---   <elem key="storage">yes - C-STORE (15 SOP classes)</elem>
+--   <elem key="storage">yes - C-STORE (25 SOP classes)</elem>
 --   <elem key="query">yes - C-FIND (Patient Root, Study Root)</elem>
 --   <elem key="retrieve">yes - C-GET, C-MOVE (Patient Root, Study Root)</elem>
---   <elem key="modality_worklist">no</elem>
+--   <elem key="modality_worklist">yes - C-FIND</elem>
 --   <elem key="storage_commitment">no</elem>
 --   <elem key="mpps">no</elem>
 --   <elem key="ups">not probed</elem>
 --   <elem key="print">no</elem>
 -- </table>
 -- <table key="service_classes">
+--   <elem>Modality-Worklist</elem>
 --   <elem>QR-Patient-Root</elem>
 --   <elem>QR-Study-Root</elem>
 --   <elem>Storage</elem>
@@ -227,13 +186,11 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- <table key="modalities">
 --   <elem>CT</elem>
 --   <elem>MRI</elem>
---   <elem>PET</elem>
---   <elem>PET-CT</elem>
 -- </table>
--- <elem key="inferred_device_class">Archive front-end</elem>
+-- <elem key="inferred_device_class">PACS/VNA</elem>
 -- <table key="results">
 --   <table key="accepted">
---     <elem key="count">15</elem>
+--     <elem key="count">33</elem>
 --     <table key="items">
 --       <elem>Verification - Implicit VR Little Endian</elem>
 --     </table>
@@ -247,72 +204,70 @@ Modeled on ssh2-enum-algos: discovery + safe categories, NOT default.
 -- </table>
 ---
 
-author     = "Tyler M <tmart234()gmail.com>, Paulino Calderon <paulino()calderonpale.com>"
-license    = "Same as Nmap--See https://nmap.org/book/man-legal.html"
+author = {
+  "Tyler M <tmart234()gmail.com>",
+  "Paulino Calderon <paulino()calderonpale.com>",
+  "Nichelle Gilbert <nich.gilbert()gmail.com>",
+}
+license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
 categories = {"discovery", "safe"}
 
-local shortport = require "shortport"
-local dicom     = require "dicom"
-local stdnse    = require "stdnse"
-local nmap      = require "nmap"
-local table     = require "table"
-local string    = require "string"
+local COMMON_DICOM_PORTS = {104, 2761, 2762, 4242, 11112}
 
--- ---------- Transfer syntaxes ----------
--- Abstract syntax UIDs are taken from PS3.4 (Storage / Worklist / Q-R) and
--- PS3.6 (registry of UIDs).
+-- Parse a comma/space separated port list into a lookup set.
+local function parse_ports_arg(s)
+  if not s then return nil end
+  local set = {}
+  for n in string.gmatch(s, "%d+") do
+    set[tonumber(n)] = true
+  end
+  return next(set) and set or nil
+end
 
-local TS_I       = "1.2.840.10008.1.2"        -- Implicit VR LE  (mandatory)
-local TS_E       = "1.2.840.10008.1.2.1"      -- Explicit VR LE
-local TS_EBE     = "1.2.840.10008.1.2.2"      -- Explicit VR Big Endian
-local TS_DEFLATE = "1.2.840.10008.1.2.1.99"   -- Deflated Explicit VR LE
-local TS_JPEG_BL = "1.2.840.10008.1.2.4.50"   -- JPEG Baseline (Process 1)
-local TS_JPEG_LL = "1.2.840.10008.1.2.4.70"   -- JPEG Lossless
-local TS_JLS_LL  = "1.2.840.10008.1.2.4.80"   -- JPEG-LS Lossless
-local TS_J2K_LL  = "1.2.840.10008.1.2.4.90"   -- JPEG 2000 (Lossless Only)
-local TS_J2K     = "1.2.840.10008.1.2.4.91"   -- JPEG 2000 (Lossy)
-local TS_RLE     = "1.2.840.10008.1.2.5"      -- RLE Lossless
-local TS_HTJ2K_L = "1.2.840.10008.1.2.4.201"  -- HTJ2K Lossless (Sup235)
-local TS_HTJ2K_R = "1.2.840.10008.1.2.4.202"  -- HTJ2K Lossless RPCL
-local TS_HTJ2K   = "1.2.840.10008.1.2.4.203"  -- HTJ2K (Lossy)
+local custom_ports = parse_ports_arg(stdnse.get_script_args(SCRIPT_NAME .. ".ports"))
 
--- Storage transfer-syntax sets, chosen per probe depth. Implicit VR LE is
--- always first so that even an SCP that negotiates nothing else still
--- accepts the context (PS3.5 section 10.1 makes Implicit VR LE mandatory).
---
---   basic    - Implicit + Explicit VR only; smallest A-ASSOCIATE-RQ, best
---              for fragile/embedded legacy devices that choke on large PDUs.
---   standard - the transfer syntaxes a SCP realistically negotiates in the
---              field; moderate PDU size (default).
---   full     - the complete matrix, for exhaustive codec fingerprinting of
---              modern devices.
-local TS_STORAGE_BASIC    = { TS_I, TS_E }
-local TS_STORAGE_STANDARD = {
-  TS_I, TS_E, TS_DEFLATE, TS_JPEG_BL, TS_JPEG_LL, TS_J2K_LL, TS_J2K, TS_RLE,
-}
-local TS_STORAGE_FULL = {
-  TS_I, TS_E, TS_EBE, TS_DEFLATE,
-  TS_JPEG_BL, TS_JPEG_LL, TS_JLS_LL,
-  TS_J2K_LL, TS_J2K, TS_RLE,
-  TS_HTJ2K_L, TS_HTJ2K_R, TS_HTJ2K,
+portrule = function(host, port)
+  if not (port.protocol == "tcp" and port.state == "open") then return false end
+  if custom_ports and custom_ports[port.number] then return true end
+  return shortport.port_or_service(COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, "tcp")(host, port)
+end
+
+-- ---------- Presentation context catalogue ----------
+
+local TS = dicom.TRANSFER_SYNTAX
+
+-- Storage transfer syntax sets, chosen per probe depth. Implicit VR LE comes
+-- first so that even an SCP that negotiates nothing else accepts the
+-- context.
+local TS_STORAGE = {
+  basic = { TS.IMPLICIT_LE, TS.EXPLICIT_LE },
+  standard = {
+    TS.IMPLICIT_LE, TS.EXPLICIT_LE, TS.DEFLATED_LE, TS.JPEG_BASELINE,
+    TS.JPEG_LOSSLESS, TS.JPEG2000_LOSSLESS, TS.JPEG2000, TS.RLE,
+  },
+  full = {
+    TS.IMPLICIT_LE, TS.EXPLICIT_LE, TS.EXPLICIT_BE, TS.DEFLATED_LE,
+    TS.JPEG_BASELINE, TS.JPEG_LOSSLESS, TS.JPEG_LS,
+    TS.JPEG2000_LOSSLESS, TS.JPEG2000, TS.RLE,
+    TS.HTJ2K_LOSSLESS, TS.HTJ2K_LOSSLESS_RPCL, TS.HTJ2K,
+  },
 }
 
--- Non-storage classes (Verification, Q/R, MWL, MPPS, StgCmt, UPS, Print) do
--- not benefit from compressed transfer syntaxes; keep the proposal minimal.
-local CMD_TS = { TS_I, TS_E }
+-- Non-storage classes (Verification, Q/R, MWL, MPPS, Storage Commitment,
+-- UPS, Print) gain nothing from compressed transfer syntaxes.
+local TS_CMD = { TS.IMPLICIT_LE, TS.EXPLICIT_LE }
 
--- ---------- Master presentation-context catalogue ----------
--- kind  = "storage" (gets the depth-selected storage TS set) or "cmd"
---         (always CMD_TS).
--- depth = "core" (proposed at every depth) or "ext" (proposed only in
---         "full"). The "core" set is the broadly-supported capability
---         surface; "ext" is the long tail that matters for exhaustive
---         fingerprinting of modern systems.
-local PC_MASTER = {
+-- kind  = "storage" (gets the depth's storage transfer syntaxes) or "cmd"
+--         (always TS_CMD).
+-- depth = "core" (proposed at every depth) or "ext" (only by "full"): the
+--         broadly supported surface versus the long tail that matters for
+--         exhaustive fingerprinting of modern systems.
+-- UIDs are from PS3.4 and the PS3.6 UID registry.
+local CATALOGUE = {
   -- Verification
   {name = "Verification",                                uid = "1.2.840.10008.1.1",                   kind = "cmd",     depth = "core"},
 
-  -- Storage SOP classes (core)
+  -- Storage (core)
   {name = "CT Image Storage",                            uid = "1.2.840.10008.5.1.4.1.1.2",           kind = "storage", depth = "core"},
   {name = "Enhanced CT Image Storage",                   uid = "1.2.840.10008.5.1.4.1.1.2.1",         kind = "storage", depth = "core"},
   {name = "MR Image Storage",                            uid = "1.2.840.10008.5.1.4.1.1.4",           kind = "storage", depth = "core"},
@@ -339,7 +294,7 @@ local PC_MASTER = {
   {name = "Comprehensive SR Storage",                    uid = "1.2.840.10008.5.1.4.1.1.88.33",       kind = "storage", depth = "core"},
   {name = "Grayscale Softcopy Presentation State Storage", uid = "1.2.840.10008.5.1.4.1.1.11.1",      kind = "storage", depth = "core"},
 
-  -- Storage SOP classes (extended / long tail - full probe only)
+  -- Storage (long tail, full probe only)
   {name = "Multi-frame Single Bit SC Image Storage",     uid = "1.2.840.10008.5.1.4.1.1.7.1",         kind = "storage", depth = "ext"},
   {name = "Multi-frame Grayscale Byte SC Image Storage", uid = "1.2.840.10008.5.1.4.1.1.7.2",         kind = "storage", depth = "ext"},
   {name = "Multi-frame Grayscale Word SC Image Storage", uid = "1.2.840.10008.5.1.4.1.1.7.3",         kind = "storage", depth = "ext"},
@@ -369,7 +324,7 @@ local PC_MASTER = {
   {name = "Encapsulated STL Storage",                    uid = "1.2.840.10008.5.1.4.1.1.104.3",       kind = "storage", depth = "ext"},
   {name = "Surface Scan Mesh Storage",                   uid = "1.2.840.10008.5.1.4.1.1.68.1",        kind = "storage", depth = "ext"},
 
-  -- Worklist + Query/Retrieve (core)
+  -- Worklist and Query/Retrieve
   {name = "Modality Worklist Information Model - FIND",  uid = "1.2.840.10008.5.1.4.31",              kind = "cmd",     depth = "core"},
   {name = "Patient Root Query/Retrieve - FIND",          uid = "1.2.840.10008.5.1.4.1.2.1.1",         kind = "cmd",     depth = "core"},
   {name = "Patient Root Query/Retrieve - MOVE",          uid = "1.2.840.10008.5.1.4.1.2.1.2",         kind = "cmd",     depth = "core"},
@@ -378,143 +333,197 @@ local PC_MASTER = {
   {name = "Study Root Query/Retrieve - MOVE",            uid = "1.2.840.10008.5.1.4.1.2.2.2",         kind = "cmd",     depth = "core"},
   {name = "Study Root Query/Retrieve - GET",             uid = "1.2.840.10008.5.1.4.1.2.2.3",         kind = "cmd",     depth = "core"},
 
-  -- Workflow (core)
+  -- Workflow
   {name = "Storage Commitment Push Model",               uid = "1.2.840.10008.1.20.1",                kind = "cmd",     depth = "core"},
   {name = "Modality Performed Procedure Step",           uid = "1.2.840.10008.3.1.2.3.3",             kind = "cmd",     depth = "core"},
-
-  -- Workflow (extended / full probe only)
   {name = "Unified Procedure Step - Push",               uid = "1.2.840.10008.5.1.4.34.6.1",          kind = "cmd",     depth = "ext"},
   {name = "Unified Procedure Step - Watch",              uid = "1.2.840.10008.5.1.4.34.6.2",          kind = "cmd",     depth = "ext"},
 
-  -- Print (core)
+  -- Print
   {name = "Basic Grayscale Print Management Meta",       uid = "1.2.840.10008.5.1.1.9",               kind = "cmd",     depth = "core"},
 }
 
--- Build the list of presentation contexts (and the parallel metadata list)
--- for the requested probe depth.
-local function storage_ts_for_depth(depth)
-  if depth == "basic" then return TS_STORAGE_BASIC end
-  if depth == "full"  then return TS_STORAGE_FULL  end
-  return TS_STORAGE_STANDARD
-end
-
+-- Build the presentation contexts for a probe depth, plus the parallel list
+-- of catalogue entries they came from.
 local function build_pcs(depth)
-  local want_ext   = (depth == "full")
-  local storage_ts = storage_ts_for_depth(depth)
-  local pcs, meta = {}, {}
-  for _, e in ipairs(PC_MASTER) do
-    if e.depth == "core" or want_ext then
-      local ts = (e.kind == "storage") and storage_ts or CMD_TS
-      pcs[#pcs + 1]  = { abstract_syntax = e.uid, transfer_syntaxes = ts }
-      meta[#meta + 1] = e
+  local pcs, entries = {}, {}
+  for _, e in ipairs(CATALOGUE) do
+    if e.depth == "core" or depth == "full" then
+      local ts = (e.kind == "storage") and TS_STORAGE[depth] or TS_CMD
+      pcs[#pcs + 1] = { abstract_syntax = e.uid, transfer_syntaxes = ts }
+      entries[#entries + 1] = e
     end
   end
-  return pcs, meta
+  return pcs, entries
 end
 
--- ---------- portrule ----------
+-- ---------- SOP class classification ----------
 
-local COMMON_DICOM_PORTS = {104, 11112, 2761, 2762, 4242}
+-- PS3.4 Service Classes in services-table order. Query/Retrieve (Annex C) is
+-- split into its query (C-FIND) and retrieve (C-MOVE, C-GET) halves;
+-- Modality Worklist is the Basic Worklist Management Service (Annex K), a
+-- separate Service Class whose C-FIND runs against a different information
+-- model.
+local SERVICE_KEYS = {
+  "verification",        -- Annex A
+  "storage",             -- Annex B
+  "query",               -- Annex C, C-FIND
+  "retrieve",            -- Annex C, C-MOVE / C-GET
+  "modality_worklist",   -- Annex K
+  "storage_commitment",  -- Annex J
+  "mpps",                -- Annex F
+  "ups",                 -- Annex CC
+  "print",               -- Annex H
+}
 
-local function parse_ports_arg(s)
-  if not s then return nil end
-  local set = {}
-  for n in string.gmatch(s, "%d+") do
-    local v = tonumber(n)
-    if v then set[v] = true end
+-- Service Class names for service_classes; Query/Retrieve is named by
+-- information model instead (QR_MODELS).
+local SERVICE_CLASS_NAMES = {
+  verification       = "Verification",
+  storage            = "Storage",
+  modality_worklist  = "Modality-Worklist",
+  storage_commitment = "Storage-Commitment",
+  mpps               = "MPPS",
+  ups                = "UPS",
+  print              = "Print",
+}
+
+-- DIMSE operations each SOP Class carries (PS3.4; DIMSE services per PS3.7).
+-- Composite services use DIMSE-C, the normalized workflow and print services
+-- use DIMSE-N. A Meta SOP Class lists the union of its member SOP Classes.
+local PRINT_META_OPS = {"N-ACTION", "N-CREATE", "N-DELETE", "N-EVENT-REPORT", "N-GET", "N-SET"}
+local DIMSE_BY_UID = {
+  ["1.2.840.10008.1.1"]          = {service = "verification",       ops = {"C-ECHO"}},
+  ["1.2.840.10008.5.1.4.31"]     = {service = "modality_worklist",  ops = {"C-FIND"}},
+  ["1.2.840.10008.1.20.1"]       = {service = "storage_commitment", ops = {"N-ACTION", "N-EVENT-REPORT"}},
+  ["1.2.840.10008.3.1.2.3.3"]    = {service = "mpps",               ops = {"N-CREATE", "N-SET"}},
+  -- Each UPS SOP Class carries a different slice of the service (Annex CC).
+  ["1.2.840.10008.5.1.4.34.6.1"] = {service = "ups", label = "Push",  ops = {"N-ACTION", "N-CREATE", "N-GET"}},
+  ["1.2.840.10008.5.1.4.34.6.2"] = {service = "ups", label = "Watch", ops = {"C-FIND", "N-ACTION", "N-GET"}},
+  ["1.2.840.10008.5.1.4.34.6.3"] = {service = "ups", label = "Pull",  ops = {"C-FIND", "N-ACTION", "N-GET", "N-SET"}},
+  ["1.2.840.10008.5.1.4.34.6.4"] = {service = "ups", label = "Event", ops = {"N-EVENT-REPORT"}},
+  ["1.2.840.10008.5.1.1.9"]      = {service = "print", label = "Basic Grayscale", ops = PRINT_META_OPS},
+  ["1.2.840.10008.5.1.1.18"]     = {service = "print", label = "Basic Color",     ops = PRINT_META_OPS},
+}
+
+local STORAGE_UID_PREFIX = "1.2.840.10008.5.1.4.1.1."
+-- Q/R SOP Class UIDs are <information model>.<op>: .1 FIND, .2 MOVE, .3 GET.
+local QR_UID_PREFIX = "1.2.840.10008.5.1.4.1.2."
+local QR_OPS = { ["1"] = "C-FIND", ["2"] = "C-MOVE", ["3"] = "C-GET" }
+local QR_MODELS = {
+  ["1.2.840.10008.5.1.4.1.2.1"] = {label = "Patient Root",       class = "QR-Patient-Root"},
+  ["1.2.840.10008.5.1.4.1.2.2"] = {label = "Study Root",         class = "QR-Study-Root"},
+  ["1.2.840.10008.5.1.4.1.2.3"] = {label = "Patient/Study Only", class = "QR-Patient-Study"},
+}
+
+-- Classify a SOP Class UID. Returns its SERVICE_KEYS entry, the DIMSE
+-- operations it carries, an optional label naming the Q/R information model
+-- or UPS / Print SOP Class, and its Service Class name; nil if unknown.
+local function classify(uid)
+  local d = DIMSE_BY_UID[uid]
+  if d then
+    return d.service, d.ops, d.label, SERVICE_CLASS_NAMES[d.service]
   end
-  return (next(set) and set) or nil
-end
-
-local custom_ports_set = parse_ports_arg(stdnse.get_script_args("dicom-enum.ports"))
-
-portrule = function(host, port)
-  if not (port.protocol == "tcp" and port.state == "open") then return false end
-  if custom_ports_set and custom_ports_set[port.number] then return true end
-  return shortport.port_or_service(COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, "tcp")(host, port)
-end
-
--- ---------- helpers ----------
-
-local function ts_label(uid)
-  return dicom.TRANSFER_SYNTAX_NAMES[uid] or uid or "(unknown TS)"
-end
-
--- Per-PC results other than "accepted" are a fingerprint of what the SCP
--- *doesn't* serve, useful for triage but noisy in normal output. They are
--- emitted at debug level only; the normal-output table reports "accepted".
-local DEBUG_BUCKET_ORDER = {1, 3, 4, 2}
-
-local VALID_PROBES = { basic = true, standard = true, full = true }
-
-local function is_tls_port(port)
-  if port.version and port.version.service_tunnel == "ssl" then return true end
-  if port.version and type(port.version.name) == "string"
-     and port.version.name:match("tls") then return true end
-  return false
-end
-
-local function mark_dicom_service(host, port)
-  local is_tls = is_tls_port(port)
-  port.version.name = is_tls and "dicom-tls" or "dicom"
-  nmap.set_port_version(host, port)
-end
-
--- Format a certificate validity date, which Nmap may hand back as a string
--- or as a broken-out date table.
-local function fmt_cert_date(d)
-  if type(d) == "table" then
-    if d.year then
-      return string.format("%04d-%02d-%02d %02d:%02d:%02d",
-        d.year or 0, d.month or 0, d.day or 0,
-        d.hour or 0, d.min or 0, d.sec or 0)
-    end
-    return "?"
+  if uid:sub(1, #STORAGE_UID_PREFIX) == STORAGE_UID_PREFIX then
+    return "storage", {"C-STORE"}, nil, SERVICE_CLASS_NAMES.storage
   end
-  return tostring(d)
-end
-
--- Summarise a TLS certificate as an ordered output table.
-local function cert_table(cert)
-  local t = stdnse.output_table()
-  t.subject = cert.subject and cert.subject.commonName or "?"
-  t.issuer  = cert.issuer  and cert.issuer.commonName  or "?"
-  if cert.validity and cert.validity.notAfter then
-    t.not_after = fmt_cert_date(cert.validity.notAfter)
-  end
-  if cert.pubkey then
-    local kline = tostring(cert.pubkey.type or "?")
-    if cert.pubkey.bits then kline = kline .. " " .. tostring(cert.pubkey.bits) .. "-bit" end
-    t.public_key = kline
-  end
-  if cert.sig_algorithm then
-    t.signature = tostring(cert.sig_algorithm)
-  end
-  return t
-end
-
--- Weak-crypto / trust warnings derived from a TLS certificate.
-local function cert_findings(cert, out)
-  if cert.pubkey and cert.pubkey.type == "rsa" and cert.pubkey.bits
-     and cert.pubkey.bits < 2048 then
-    out[#out + 1] = "TLS certificate uses a weak RSA key (< 2048-bit)"
-  end
-  if cert.sig_algorithm then
-    local low = tostring(cert.sig_algorithm):lower()
-    if low:find("sha1") or low:find("md5") then
-      out[#out + 1] = "TLS certificate uses a weak signature algorithm (SHA-1/MD5)"
+  if uid:sub(1, #QR_UID_PREFIX) == QR_UID_PREFIX then
+    local model, tail = uid:match("^(.*)%.(%d)$")
+    local qr, op = QR_MODELS[model], QR_OPS[tail]
+    if qr and op then
+      return (op == "C-FIND") and "query" or "retrieve", {op}, qr.label, qr.class
     end
   end
-  local subj = cert.subject and cert.subject.commonName
-  local iss  = cert.issuer  and cert.issuer.commonName
-  if subj and iss and subj == iss then
-    out[#out + 1] = "TLS certificate is self-signed (no CA trust chain)"
-  end
+  return nil
 end
 
--- One line per PS3.4 Service Class: "yes - <DIMSE ops> (<models>)", "no",
--- or "not probed" when this probe depth proposed no context for it. Ops that
--- cover the same models share a group, e.g.
+-- Storage SOP Class UID -> imaging modality (PS3.4 Annex B, PS3.6).
+local MODALITY_BY_UID = {
+  ["1.2.840.10008.5.1.4.1.1.2"]        = "CT",
+  ["1.2.840.10008.5.1.4.1.1.2.1"]      = "CT",
+  ["1.2.840.10008.5.1.4.1.1.2.2"]      = "CT",
+  ["1.2.840.10008.5.1.4.1.1.4"]        = "MRI",
+  ["1.2.840.10008.5.1.4.1.1.4.1"]      = "MRI",
+  ["1.2.840.10008.5.1.4.1.1.4.2"]      = "MRI",
+  ["1.2.840.10008.5.1.4.1.1.4.3"]      = "MRI",
+  ["1.2.840.10008.5.1.4.1.1.4.4"]      = "MRI",
+  ["1.2.840.10008.5.1.4.1.1.3.1"]      = "Ultrasound",
+  ["1.2.840.10008.5.1.4.1.1.6.1"]      = "Ultrasound",
+  ["1.2.840.10008.5.1.4.1.1.6.2"]      = "Ultrasound",
+  ["1.2.840.10008.5.1.4.1.1.1.2"]      = "Mammography",
+  ["1.2.840.10008.5.1.4.1.1.1.2.1"]    = "Mammography",
+  ["1.2.840.10008.5.1.4.1.1.13.1.3"]   = "Mammography",
+  ["1.2.840.10008.5.1.4.1.1.1.3"]      = "X-Ray (Intra-oral)",
+  ["1.2.840.10008.5.1.4.1.1.1.3.1"]    = "X-Ray (Intra-oral)",
+  ["1.2.840.10008.5.1.4.1.1.1.1"]      = "X-Ray (DX)",
+  ["1.2.840.10008.5.1.4.1.1.1.1.1"]    = "X-Ray (DX)",
+  ["1.2.840.10008.5.1.4.1.1.1"]        = "X-Ray (CR)",
+  ["1.2.840.10008.5.1.4.1.1.12.1"]     = "X-Ray Angiography",
+  ["1.2.840.10008.5.1.4.1.1.12.1.1"]   = "X-Ray Angiography",
+  ["1.2.840.10008.5.1.4.1.1.12.2"]     = "Fluoroscopy",
+  ["1.2.840.10008.5.1.4.1.1.12.2.1"]   = "Fluoroscopy",
+  ["1.2.840.10008.5.1.4.1.1.20"]       = "Nuclear Medicine",
+  -- PET-CT scanners emit both PET and CT Storage SOP classes.
+  ["1.2.840.10008.5.1.4.1.1.128"]      = "PET",
+  ["1.2.840.10008.5.1.4.1.1.128.1"]    = "PET",
+  ["1.2.840.10008.5.1.4.1.1.130"]      = "PET",
+  ["1.2.840.10008.5.1.4.1.1.77.1.1"]   = "Endoscopy",
+  ["1.2.840.10008.5.1.4.1.1.77.1.1.1"] = "Endoscopy",
+  ["1.2.840.10008.5.1.4.1.1.77.1.4"]   = "VL Photographic",
+  ["1.2.840.10008.5.1.4.1.1.77.1.4.1"] = "VL Photographic",
+  ["1.2.840.10008.5.1.4.1.1.481.1"]    = "RT Image",
+  ["1.2.840.10008.5.1.4.1.1.77.1.5.1"] = "Ophthalmic Photography",
+  ["1.2.840.10008.5.1.4.1.1.77.1.5.2"] = "Ophthalmic Photography",
+  ["1.2.840.10008.5.1.4.1.1.77.1.5.4"] = "Ophthalmic Tomography (OCT)",
+  ["1.2.840.10008.5.1.4.1.1.9.1.1"]    = "ECG (Waveform)",
+  ["1.2.840.10008.5.1.4.1.1.9.1.2"]    = "ECG (Waveform)",
+  ["1.2.840.10008.5.1.4.1.1.9.1.3"]    = "ECG (Waveform)",
+  ["1.2.840.10008.5.1.4.1.1.77.1.2"]   = "Microscopy",
+  ["1.2.840.10008.5.1.4.1.1.77.1.2.1"] = "Microscopy",
+  ["1.2.840.10008.5.1.4.1.1.77.1.6"]   = "Whole Slide Imaging",
+  -- Non-image objects, no implied physical modality
+  ["1.2.840.10008.5.1.4.1.1.7"]        = "Secondary Capture",
+  ["1.2.840.10008.5.1.4.1.1.104.1"]    = "Encapsulated Document",
+}
+
+local function sorted_keys(set)
+  local list = {}
+  for k in pairs(set) do list[#list + 1] = k end
+  table.sort(list)
+  return list
+end
+
+-- Summarize negotiation per SERVICE_KEYS entry. A key is absent when no
+-- context for that service was answered (not probed); otherwise it maps to
+-- {accepted = bool, sop_classes = n, ops = {[op] = sorted labels}}, where
+-- labels name the Q/R information models or UPS / Print SOP Classes that
+-- carry the op. Contexts left unanswered by a failed follow-up association
+-- count as not probed rather than rejected.
+local function summarize_services(pc_results)
+  local out = {}
+  for _, r in ipairs(pc_results) do
+    local svc, ops, label = classify(r.abstract_syntax)
+    if svc and r.result ~= nil then
+      local s = out[svc] or { accepted = false, sop_classes = 0, ops = {} }
+      out[svc] = s
+      if r.result == 0 then
+        s.accepted = true
+        s.sop_classes = s.sop_classes + 1
+        for _, op in ipairs(ops) do
+          s.ops[op] = s.ops[op] or {}
+          if label then s.ops[op][label] = true end
+        end
+      end
+    end
+  end
+  for _, s in pairs(out) do
+    for op, labels in pairs(s.ops) do s.ops[op] = sorted_keys(labels) end
+  end
+  return out
+end
+
+-- One line per Service Class: "yes - <DIMSE ops> (<labels>)", "no", or
+-- "not probed". Ops that cover the same labels share a group, e.g.
 -- "yes - C-GET, C-MOVE (Patient Root, Study Root)".
 local function service_line(key, s)
   if not s then return "not probed" end
@@ -523,11 +532,8 @@ local function service_line(key, s)
     return string.format("yes - C-STORE (%d SOP class%s)",
       s.sop_classes, s.sop_classes == 1 and "" or "es")
   end
-  local ops = {}
-  for op in pairs(s.ops) do ops[#ops + 1] = op end
-  table.sort(ops)
   local groups, order = {}, {}
-  for _, op in ipairs(ops) do
+  for _, op in ipairs(sorted_keys(s.ops)) do
     local labels = table.concat(s.ops[op], ", ")
     if not groups[labels] then
       groups[labels] = {}
@@ -544,69 +550,102 @@ local function service_line(key, s)
   return "yes - " .. table.concat(parts, "; ")
 end
 
--- Contexts left unanswered by a failed follow-up association count as not
--- probed rather than rejected.
-local function services_table(pc_results)
-  local proposed, accepted = {}, {}
-  for _, r in ipairs(pc_results) do
-    if r.result ~= nil then proposed[#proposed + 1] = r.abstract_syntax end
-    if r.result == 0 then accepted[#accepted + 1] = r.abstract_syntax end
+-- Best-effort device class from the accepted Service Class names. The
+-- taxonomy (PACS/VNA, Modality, RIS gateway, Archive, Print) is practitioner
+-- consensus, not a normative DICOM concept; cf. Mildenberger 2002 (PMID
+-- 11960356). Returns nil when the pattern is ambiguous.
+local function device_class(classes)
+  local qr = classes["QR-Patient-Root"] or classes["QR-Study-Root"]
+    or classes["QR-Patient-Study"]
+  local storage = classes["Storage"]
+  if storage and qr and (classes["Modality-Worklist"] or classes["MPPS"]
+      or classes["Storage-Commitment"]) then
+    return "PACS/VNA"
   end
-  local summary = dicom.infer_services(proposed, accepted)
+  if storage and qr then return "Archive front-end" end
+  if classes["Modality-Worklist"] and not storage then
+    return "RIS gateway / worklist broker"
+  end
+  if classes["Print"] then return "Print server" end
+  if classes["Verification"] and not storage and not qr then
+    return "Modality (or unconfigured SCP)"
+  end
+  return nil
+end
+
+-- ---------- Security assessment ----------
+
+local function cert_date(d)
+  if type(d) == "table" then return datetime.format_timestamp(d) end
+  return tostring(d)
+end
+
+-- Summarize a TLS certificate as an ordered output table.
+local function cert_table(cert)
   local t = stdnse.output_table()
-  for _, key in ipairs(dicom.SERVICE_KEYS) do
-    t[key] = service_line(key, summary[key])
+  t.subject = cert.subject and cert.subject.commonName or "?"
+  t.issuer  = cert.issuer  and cert.issuer.commonName  or "?"
+  if cert.validity and cert.validity.notAfter then
+    t.not_after = cert_date(cert.validity.notAfter)
+  end
+  if cert.pubkey then
+    local kline = tostring(cert.pubkey.type or "?")
+    if cert.pubkey.bits then kline = kline .. " " .. tostring(cert.pubkey.bits) .. "-bit" end
+    t.public_key = kline
+  end
+  if cert.sig_algorithm then
+    t.signature = tostring(cert.sig_algorithm)
   end
   return t
 end
 
--- Count how many accepted abstract syntaxes are Storage SOP classes, and
--- which Query/Retrieve DIMSE operations (FIND/MOVE/GET) were accepted.
-local QR_PREFIX = "1.2.840.10008.5.1.4.1.2."
-local STORAGE_PREFIX = "1.2.840.10008.5.1.4.1.1."
+-- Weak-crypto and trust warnings derived from a TLS certificate.
+local function cert_findings(cert, out)
+  if cert.pubkey and cert.pubkey.type == "rsa" and cert.pubkey.bits
+     and cert.pubkey.bits < 2048 then
+    out[#out + 1] = "TLS certificate uses a weak RSA key (< 2048-bit)"
+  end
+  if cert.sig_algorithm then
+    local low = tostring(cert.sig_algorithm):lower()
+    if low:find("sha1", 1, true) or low:find("md5", 1, true) then
+      out[#out + 1] = "TLS certificate uses a weak signature algorithm (SHA-1/MD5)"
+    end
+  end
+  local subj = cert.subject and cert.subject.commonName
+  local iss  = cert.issuer  and cert.issuer.commonName
+  if subj and iss and subj == iss then
+    out[#out + 1] = "TLS certificate is self-signed (no CA trust chain)"
+  end
+end
 
-local function security_findings(accepted_uids, called_aet, info)
+-- Findings drawn from the association alone; no DIMSE messages are sent.
+local function security_findings(services, called_aet, info)
   local findings = {}
 
-  -- Unauthenticated association: we proposed a default/empty called-AET and
-  -- the SCP still accepted, so it enforces no AE-title allowlist.
+  -- The default called AET was accepted, so no AE-title allowlist applies.
   if not called_aet or called_aet == "" or called_aet == "ANY-SCP" then
     findings[#findings + 1] = "Any called-AET accepted - no AE-title allowlist enforced"
   end
 
-  -- Query/Retrieve exfiltration surface.
-  local has_find, has_move, has_get = false, false, false
-  local storage_count = 0
-  for _, uid in ipairs(accepted_uids) do
-    if uid:sub(1, #QR_PREFIX) == QR_PREFIX then
-      local tail = uid:match("%.([123])$")
-      if     tail == "1" then has_find = true
-      elseif tail == "2" then has_move = true
-      elseif tail == "3" then has_get  = true
-      end
-    elseif uid:sub(1, #STORAGE_PREFIX) == STORAGE_PREFIX then
-      storage_count = storage_count + 1
-    end
+  local query, retrieve, storage = services.query, services.retrieve, services.storage
+  if query and query.accepted then
+    findings[#findings + 1] = "Query/Retrieve C-FIND accepted - patient/study metadata enumeration possible"
   end
-  if has_find then
-    findings[#findings + 1] = "Query/Retrieve C-FIND accepted - patient/study metadata enumeration possible (dicom-brute, then a C-FIND client)"
-  end
-  if has_move then
+  if retrieve and retrieve.ops["C-MOVE"] then
     findings[#findings + 1] = "Query/Retrieve C-MOVE accepted - bulk image retrieval to an arbitrary destination AE possible"
   end
-  if has_get then
+  if retrieve and retrieve.ops["C-GET"] then
     findings[#findings + 1] = "Query/Retrieve C-GET accepted - direct image retrieval possible"
   end
-  if storage_count > 0 then
+  if storage and storage.accepted then
     findings[#findings + 1] = string.format(
       "%d Storage SOP class%s accepted - unauthenticated C-STORE (data/malware injection) surface",
-      storage_count, storage_count == 1 and "" or "es")
+      storage.sop_classes, storage.sop_classes == 1 and "" or "es")
   end
 
-  -- Transport.
-  if info and info.tls then
+  if info.tls then
     findings[#findings + 1] =
-      "TLS server did not request a client certificate - no mutual TLS / IHE ATNA node authentication"
+      "TLS association completed without a client certificate - no mutual TLS / IHE ATNA node authentication"
     if info.cert then cert_findings(info.cert, findings) end
   else
     findings[#findings + 1] =
@@ -618,86 +657,82 @@ end
 
 -- ---------- action ----------
 
+local PROBE_DEPTHS = { basic = true, standard = true, full = true }
+
+-- Rejected contexts are a fingerprint of what the SCP doesn't serve: useful
+-- for triage, noise in normal output, so they are listed at debug level.
+local DEBUG_RESULT_ORDER = {1, 3, 4, 2}
+
+local REJECT_HINTS = {
+  [1] = {
+    [3] = "Calling-AET not recognized - try dicom.calling_aet=<AET>",
+    [7] = "Called-AET not recognized - try dicom.called_aet=<AET>",
+  },
+  [2] = {
+    [2] = "Protocol version mismatch",
+  },
+  [3] = {
+    [1] = "SCP busy (association pool full) after retries - rescan later",
+    [2] = "SCP busy (association pool full) after retries - rescan later",
+  },
+}
+
+local function mark_dicom_service(host, port)
+  port.version.name = dicom.tls_enabled(port) and "dicom-tls" or "dicom"
+  nmap.set_port_version(host, port)
+end
+
 action = function(host, port)
-  local out = stdnse.output_table()
-
-  local called_aet  = stdnse.get_script_args("dicom.called_aet")
-  local calling_aet = stdnse.get_script_args("dicom.calling_aet")
-
-  local probe = (stdnse.get_script_args("dicom-enum.probe") or "standard"):lower()
-  if not VALID_PROBES[probe] then
-    stdnse.debug1("DICOM: unknown probe depth %q, falling back to 'standard'", probe)
+  local probe = (stdnse.get_script_args(SCRIPT_NAME .. ".probe") or "standard"):lower()
+  if not PROBE_DEPTHS[probe] then
+    stdnse.debug1("Unknown probe depth %q, using 'standard'", probe)
     probe = "standard"
   end
+  local pcs, entries = build_pcs(probe)
+  stdnse.debug1("probe=%s, proposing %d presentation contexts", probe, #pcs)
 
-  local pcs, pcmeta = build_pcs(probe)
-  stdnse.debug1("DICOM: probe=%s, proposing %d presentation contexts", probe, #pcs)
-
-  local ok, err, pc_results, info =
-    dicom.associate_extended(host, port, calling_aet, called_aet, pcs)
+  local ok, err, pc_results, info = dicom.associate_extended(host, port, nil, nil, pcs)
+  local out = stdnse.output_table()
 
   if not ok then
-    if type(err) == "table" and err.err == "ASSOCIATE REJECT received" then
-      out.dicom  = "DICOM Service Provider discovered!"
-      out.config = string.format("Association rejected: %s / %s / %s",
-        err.result_text or "?", err.source_text or "?", err.reason_text or "?")
-      if err.source == 1 and err.reason == 7 then
-        out.hint = "Called-AET not recognized - try dicom.called_aet=<AET>"
-      elseif err.source == 1 and err.reason == 3 then
-        out.hint = "Calling-AET not recognized - try dicom.calling_aet=<AET>"
-      elseif err.source == 2 and err.reason == 2 then
-        out.hint = "Protocol version mismatch"
-      elseif err.source == 3 and (err.reason == 1 or err.reason == 2) then
-        out.hint = "SCP busy (association pool full) after retries - rescan later"
-      end
-      mark_dicom_service(host, port)
-      return out
+    if type(err) ~= "table" then
+      stdnse.debug1("Association failed: %s", err)
+      return nil
     end
-    local e = tostring(err or "")
-    out.dicom = "DICOM Service Provider discovered!"
-    out.error = e
-    return nil
+    out.dicom  = "DICOM Service Provider discovered!"
+    out.config = string.format("Association rejected: %s / %s / %s",
+      err.result_text or "?", err.source_text or "?", err.reason_text or "?")
+    out.hint = REJECT_HINTS[err.source] and REJECT_HINTS[err.source][err.reason]
+    mark_dicom_service(host, port)
+    return out
   end
 
-  -- Resolve vendor / version once and reuse for both port.version metadata
-  -- and the human-readable association header.
-  local final_version, vendor, _clean, device_vendor
-  if info and (info.impl_version or info.impl_uid) then
-    final_version, vendor, _clean, device_vendor =
-      dicom.resolve_vendor_info(info.impl_version, info.impl_uid)
-  end
-
+  -- Implementation identification, for port.version and the association
+  -- line.
+  local version, vendor, _, device_vendor =
+    dicom.resolve_vendor_info(info.impl_version, info.impl_uid)
+  local has_version = version and version ~= info.impl_version
   if vendor then
     port.version.product = vendor
-    if final_version and final_version ~= info.impl_version then
-      port.version.version = final_version
-    end
+    if has_version then port.version.version = version end
   end
   if device_vendor then
     port.version.extrainfo = "Device: " .. device_vendor
   end
   mark_dicom_service(host, port)
 
-  -- Build the association header line: "accepted (max_pdu=N, vendor=...)"
   local detail = {}
-  if info and info.max_pdu then
+  if info.max_pdu then
     detail[#detail + 1] = string.format("max_pdu=%d", info.max_pdu)
   end
   if vendor then
-    local v = vendor
-    if final_version and final_version ~= info.impl_version then
-      v = v .. " " .. final_version
-    end
-    detail[#detail + 1] = "vendor=" .. v
+    detail[#detail + 1] = "vendor=" .. vendor .. (has_version and " " .. version or "")
   end
   if device_vendor then
     detail[#detail + 1] = "device=" .. device_vendor
   end
-  if #detail > 0 then
-    out.association = string.format("accepted (%s)", table.concat(detail, ", "))
-  else
-    out.association = "accepted"
-  end
+  out.association = #detail > 0
+    and string.format("accepted (%s)", table.concat(detail, ", ")) or "accepted"
 
   -- Probe depth and how it went out, so a "not probed" service, or a
   -- difference between two scans of one host, can be traced to the depth.
@@ -709,103 +744,73 @@ action = function(host, port)
     end
     out.probe = string.format("%s (%d of %d presentation contexts answered, %d of %d associations)",
       probe, answered, #pcs, n, info.associations_planned)
+    out.warning = "results are partial: " .. table.concat(info.errors, "; ")
   else
     out.probe = string.format("%s (%d presentation contexts proposed, %d association%s)",
       probe, #pcs, n, n == 1 and "" or "s")
   end
-  if info.errors then
-    out.warning = string.format("results are partial: %s", table.concat(info.errors, "; "))
-  end
 
-  -- Bucket per-PC results and collect accepted service classes / UIDs.
-  local buckets = { [0]={}, [1]={}, [2]={}, [3]={}, [4]={}, unknown={} }
-  local accepted_services = {}
-  local accepted_uids = {}
+  local accepted, rejected, classes, commands, modalities = {}, {}, {}, {}, {}
   for i, r in ipairs(pc_results) do
-    local pc = pcmeta[i]
-    local code = r.result
-    if code == 0 then
-      table.insert(buckets[0], string.format("%s - %s", pc.name, ts_label(r.accepted_ts)))
-      accepted_uids[#accepted_uids + 1] = r.abstract_syntax
-      local svc = dicom.service_class_for_uid(r.abstract_syntax)
-      if svc then accepted_services[svc] = true end
-    elseif code == 1 or code == 2 or code == 3 or code == 4 then
-      table.insert(buckets[code], pc.name)
-    else
-      table.insert(buckets.unknown, pc.name)
+    local name = entries[i].name
+    if r.result == 0 then
+      accepted[#accepted + 1] = string.format("%s - %s", name,
+        dicom.TRANSFER_SYNTAX_NAMES[r.accepted_ts] or r.accepted_ts or "(unknown TS)")
+      local _, ops, _, class = classify(r.abstract_syntax)
+      if class then classes[class] = true end
+      for _, op in ipairs(ops or {}) do commands[op] = true end
+      local modality = MODALITY_BY_UID[r.abstract_syntax]
+      if modality then modalities[modality] = true end
+    elseif r.result ~= nil then
+      local code = dicom.PC_RESULT_NAMES[r.result] and r.result or "unknown"
+      rejected[code] = rejected[code] or {}
+      table.insert(rejected[code], name)
     end
   end
-
-  -- Per-Service-Class negotiation summary (PS3.4), in SERVICE_KEYS order.
-  out.services = services_table(pc_results)
-
-  -- Service-class summary (sorted for stable output).
-  local svc_list = {}
-  for s in pairs(accepted_services) do svc_list[#svc_list + 1] = s end
-  table.sort(svc_list)
-  if #svc_list > 0 then
-    out.service_classes = svc_list
+  if modalities["PET"] and modalities["CT"] then
+    modalities["PET-CT"] = true
   end
 
-  -- Flat DIMSE view of the accepted SOP classes: C-* from the composite
-  -- services, N-* from MPPS, Storage Commitment, UPS and Print.
-  local cmds = dicom.infer_service_commands(accepted_uids)
-  if #cmds > 0 then
-    out.service_commands = cmds
+  local services = summarize_services(pc_results)
+  out.services = stdnse.output_table()
+  for _, key in ipairs(SERVICE_KEYS) do
+    out.services[key] = service_line(key, services[key])
+  end
+  if next(classes) then out.service_classes = sorted_keys(classes) end
+  if next(commands) then out.service_commands = sorted_keys(commands) end
+  if next(modalities) then out.modalities = sorted_keys(modalities) end
+  out.inferred_device_class = device_class(classes)
+
+  out.results = stdnse.output_table()
+  if #accepted > 0 then
+    local t = stdnse.output_table()
+    t.count = #accepted
+    t.items = accepted
+    out.results[dicom.PC_RESULT_NAMES[0]] = t
   end
 
-  -- Imaging modalities implied by accepted Storage SOP classes (CT, MRI,
-  -- Ultrasound, Mammography, X-Ray, PET, Fluoroscopy, Endoscopy, ...).
-  local modalities = dicom.infer_modalities(accepted_uids)
-  if #modalities > 0 then
-    out.modalities = modalities
-  end
-
-  -- Device-class fingerprint (practitioner taxonomy, not normative DICOM).
-  local device_class = dicom.infer_device_class(accepted_services)
-  if device_class then
-    out.inferred_device_class = device_class
-  end
-
-  -- Structured results in normal output: only the accepted bucket. The
-  -- non-accepted buckets are a fingerprint of what the SCP *doesn't* serve;
-  -- emit them at debug level so normal output stays focused on capabilities.
-  local results = stdnse.output_table()
-  if #buckets[0] > 0 then
-    local sub = stdnse.output_table()
-    sub.count = #buckets[0]
-    sub.items = buckets[0]
-    results[dicom.PC_RESULT_NAMES[0]] = sub
-  end
-  out.results = results
-
-  -- Security assessment, derived entirely from the single association above
-  -- (no DIMSE commands or patient data sent).
   local security = stdnse.output_table()
-  if info and info.tls then
+  if info.tls then
     security.transport = "DICOM over TLS"
-    if info.cert then
-      security.certificate = cert_table(info.cert)
-    end
+    if info.cert then security.certificate = cert_table(info.cert) end
   else
     security.transport = "plaintext (no TLS)"
   end
-  local findings = security_findings(accepted_uids, called_aet, info)
-  if #findings > 0 then
-    security.findings = findings
-  end
+  local findings = security_findings(services,
+    stdnse.get_script_args("dicom.called_aet"), info)
+  if #findings > 0 then security.findings = findings end
   out.security = security
 
-  for _, code in ipairs(DEBUG_BUCKET_ORDER) do
-    local items = buckets[code]
-    if items and #items > 0 then
-      stdnse.debug1("DICOM: %s (%d): %s",
-        dicom.PC_RESULT_NAMES[code], #items, table.concat(items, ", "))
+  for _, code in ipairs(DEBUG_RESULT_ORDER) do
+    local names = rejected[code]
+    if names then
+      stdnse.debug1("%s (%d): %s", dicom.PC_RESULT_NAMES[code], #names,
+        table.concat(names, ", "))
     end
   end
-  if #buckets.unknown > 0 then
-    stdnse.debug1("DICOM: unknown-result (%d): %s",
-      #buckets.unknown, table.concat(buckets.unknown, ", "))
+  if rejected.unknown then
+    stdnse.debug1("unknown-result (%d): %s", #rejected.unknown,
+      table.concat(rejected.unknown, ", "))
   end
 
   return out

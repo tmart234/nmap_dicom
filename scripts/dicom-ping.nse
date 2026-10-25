@@ -81,7 +81,11 @@ way of detecting DICOM servers.
 -- </script>
 ---
 
-author = "Paulino Calderon <calderon()calderonpale.com>, Tyler M <tmart234()gmail.com>"
+author = {
+  "Paulino Calderon <calderon()calderonpale.com>",
+  "Tyler M <tmart234()gmail.com>",
+  "Nichelle Gilbert <nich.gilbert()gmail.com>",
+}
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
 categories = {"discovery", "default", "version", "safe", "auth"}
 
@@ -101,6 +105,18 @@ local function parse_ports_arg(ports_str)
   end
   return (next(set) and set) or nil
 end
+
+-- Parent of a UID ("1.2.3.4" -> "1.2.3"), for looking up an unknown
+-- Implementation Class UID's organization in an OID registry.
+local function uid_root(uid)
+  return uid:match("^([%d%.]+)%.[^%.]+$") or uid
+end
+
+-- One Verification context, Implicit + Explicit VR Little Endian.
+local VERIFICATION_PC = {
+  abstract_syntax   = dicom.SOP_CLASS.VERIFICATION,
+  transfer_syntaxes = { dicom.TRANSFER_SYNTAX.IMPLICIT_LE, dicom.TRANSFER_SYNTAX.EXPLICIT_LE },
+}
 
 -- Default/common DICOM ports:
 local COMMON_DICOM_PORTS = {104, 11112, 2761, 2762, 4242}
@@ -134,22 +150,19 @@ action = function(host, port)
   local called_aet = stdnse.get_script_args("dicom.called_aet")
   local extended   = stdnse.get_script_args("dicom-ping.extended") ~= nil
 
-  local is_tls = (port.version and port.version.service_tunnel == "ssl") or
-                 (port.version and type(port.version.name) == "string" and port.version.name:match("tls"))
+  local is_tls = dicom.tls_enabled(port)
 
-  -- Returns: ok, err, version, vendor, uid, impl_version_name, device_vendor
-  -- (on a reject, the third value is the decoded A-ASSOCIATE-RJ instead)
-  local ok, err, version, vendor, uid, impl_version_name, device_vendor = dicom.associate(host, port, nil, called_aet)
+  local ok, err, _, info = dicom.associate_extended(host, port, nil, called_aet, {VERIFICATION_PC})
 
   if not ok then
-    stdnse.debug1("Association failed: %s", tostring(err or "Unknown error"))
+    stdnse.debug1("Association failed: %s", type(err) == "table" and err.err or tostring(err))
     local e = tostring(err or "")
 
-    if e == "ASSOCIATE REJECT received" then
+    if type(err) == "table" then
       port.version.name = is_tls and "dicom-tls" or "dicom"
       nmap.set_port_version(host, port)
 
-      local reject = type(version) == "table" and version or {}
+      local reject = err
       out.dicom  = "DICOM Service Provider discovered!"
       if reject.source == 3 then
         -- Provider-side reject (congestion / association limit), not an AET check.
@@ -172,8 +185,8 @@ action = function(host, port)
       return out
     end
 
-    -- Heuristic: plaintext on IANA TLS port
-    if not is_tls and tonumber(port.number) == 2762 and e:lower():match("short pdu header") then
+    -- Heuristic: plaintext association failed on the IANA DICOM-TLS port
+    if tonumber(port.number) == 2762 then
       out.dicom    = "Possible DICOM/TLS endpoint (plaintext A-ASSOCIATE not accepted)"
       out.tls_hint = "Port 2762 is open, but DICOM associate could not be completed. Rerun with -sV or --script+ssl to confirm."
       out.error    = e
@@ -184,6 +197,8 @@ action = function(host, port)
   end
 
   -- Success: association accepted
+  local uid, impl_version_name = info.impl_uid, info.impl_version
+  local version, vendor, _, device_vendor = dicom.resolve_vendor_info(impl_version_name, uid)
   out.dicom = "DICOM Service Provider discovered!"
   if not called_aet or called_aet == "ANY-SCP" then
     out.config = "Any AET is accepted (Insecure)"
@@ -222,9 +237,9 @@ action = function(host, port)
   if uid then
     if not identified then
       out.impl_class_uid = uid
-      local uid_root = dicom.extract_uid_root(uid)
-      if uid_root and uid_root ~= uid then
-        out.impl_uid_root = uid_root
+      local root = uid_root(uid)
+      if root ~= uid then
+        out.impl_uid_root = root
       end
     elseif is_verbose or device_vendor then
       out.impl_class_uid = uid

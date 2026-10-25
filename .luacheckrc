@@ -1,5 +1,5 @@
 -- nmap_dicom: luacheck config for upstream PR readiness.
--- Run `luacheck nselib/dicom.lua scripts/dicom-enum.nse scripts/dicom-ping.nse`
+-- Run `luacheck nselib/dicom.lua scripts/*.nse`
 -- from the repo root (NSE files have a .nse extension and aren't picked up by
 -- the default `nselib/ scripts/` recursion).
 std = "lua54"
@@ -12,6 +12,7 @@ max_line_length = 250
 read_globals = {
   "nmap", "stdnse", "string", "table", "math", "shortport", "ipOps", "tab",
   "io", "os", "bin", "tableaux", "json", "openssl", "datetime",
+  "SCRIPT_NAME", "SCRIPT_PATH", "SCRIPT_TYPE",
 }
 
 -- NSE script-globals (set at top of every .nse file).
@@ -29,23 +30,10 @@ ignore = {
   "542",       -- empty if branch (used as documented no-op)
 }
 
--- nselib modules use the stdnse.module(_ENV-based) idiom which luacheck
--- doesn't natively understand.
+-- nselib modules use the `_ENV = stdnse.module(...)` idiom: every top-level
+-- global assignment after it is an exported module member.
 files["nselib/dicom.lua"] = {
-  globals = {
-    "_ENV",
-    -- exported by `_ENV = stdnse.module(...)`:
-    "PDU_NAMES", "PDU_CODES",
-    "PC_RESULT_NAMES", "TRANSFER_SYNTAX_UIDS", "TRANSFER_SYNTAX_NAMES",
-    "ASSOC_RJ_RESULT", "ASSOC_RJ_SOURCE", "ASSOC_RJ_REASON",
-    "SERVICE_CLASS_BY_UID", "SOP_MODALITY_BY_UID",
-    "service_class_for_uid", "infer_device_class",
-    "modality_for_uid", "infer_modalities", "infer_service_commands",
-    "SERVICE_KEYS", "infer_services",
-    "start_connection", "send", "receive", "pdu_header_encode",
-    "parse_associate_accept", "parse_implementation_version",
-    "identify_vendor_from_uid", "identify_toolkit", "extract_clean_version",
-    "resolve_vendor_info", "associate_extended", "associate", "abort",
-    "send_pdata", "extract_uid_root",
-  },
+  globals = { "_ENV" },
+  allow_defined_top = true,
+  ignore = { "131" },  -- exported members are "unused" within the module
 }

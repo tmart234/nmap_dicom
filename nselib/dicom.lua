@@ -1,176 +1,234 @@
 ---
--- DICOM library
+-- DICOM protocol library for Nmap NSE scripts.
 --
--- This library implements (partially) the DICOM protocol. This protocol is used to
--- capture, store and distribute medical images.
+-- Implements the DICOM Upper Layer protocol (PS3.8) and core DIMSE
+-- services (PS3.7).  Provides connection management, A-ASSOCIATE
+-- negotiation, P-DATA-TF PDU construction/parsing, and helpers for
+-- C-ECHO, C-STORE, C-FIND, C-GET, and C-MOVE.
 --
--- From Wikipedia:
--- The core application of the DICOM standard is to capture, store and distribute
--- medical images. The standard also provides services related to imaging such as
--- managing imaging procedure worklists, printing images on film or digital media
--- like DVDs, reporting procedure status like completion of an imaging acquisition,
--- confirming successful archiving of images, encrypting datasets, removing patient
--- identifying information from datasets, organizing layouts of images for review,
--- saving image manipulations and annotations, calibrating image displays, encoding
--- ECGs, encoding CAD results, encoding structured measurement data, and storing
--- acquisition protocols.
+-- Supports both Implicit VR Little Endian and Explicit VR Little Endian
+-- transfer syntaxes for dataset encoding and parsing.
+--
+-- Designed to be shared across multiple DICOM NSE scripts
+-- (dicom-ping, dicom-store-fuzzer, dicom-cfind-ls, etc.) so that
+-- protocol logic lives in one place.
+--
+-- INSTALLATION:
+-- Copy this file to your Nmap nselib/ directory to replace the
+-- built-in minimal dicom.lua:
+--   cp dicom.lua /usr/share/nmap/nselib/dicom.lua
+-- (or /usr/local/share/nmap/nselib/dicom.lua on macOS)
+-- This library is fully backward-compatible with the original: the legacy
+-- API (start_connection, send, receive, pdu_header_encode, associate,
+-- send_pdata) keeps its exact signatures and behaviour, so the official
+-- dicom-ping and dicom-brute scripts run unchanged.
+--
+-- CHANGES vs. the upstream nmap nselib/dicom.lua:
+--  * Legacy API preserved verbatim (drop-in compatible).
+--  * Added DIMSE service support: C-ECHO, C-STORE, C-FIND, C-GET, C-MOVE.
+--  * Added A-ASSOCIATE-RQ builder with multiple presentation contexts,
+--    configurable max PDU, and SCP/SCU Role Selection (PS3.7 D.3.3.4) so
+--    C-GET can receive C-STORE sub-operations.
+--  * Added A-ASSOCIATE-AC parser (accepted contexts, transfer syntaxes,
+--    max PDU, implementation identification, accepted roles) for
+--    fingerprinting and negotiation.
+--  * Added P-DATA-TF fragmentation/reassembly that surfaces the PDV
+--    presentation-context ID (needed to answer C-STORE sub-ops correctly).
+--  * Added Implicit/Explicit VR LE element encoders/decoders and Part-10
+--    (.dcm) dataset extraction.
 --
 -- OPTIONS:
--- *<code>called_aet</code> - If set it changes the called Application Entity Title
---                            used in the requests. Default: ANY-SCP
--- *<code>calling_aet</code> - If set it changes the calling Application Entity Title
---                            used in the requests. Default: ECHOSCU
+-- *<code>called_aet</code> - Called Application Entity Title (default:
+-- ANY-SCP)
+-- *<code>calling_aet</code> - Calling Application Entity Title (default:
+-- ECHOSCU)
 --
--- Associations are kept gentle on production SCPs, whose association pool
--- is shared with clinical traffic: associations to a host are serialized
--- across all DICOM scripts, a transient A-ASSOCIATE-RJ (temporary-congestion
--- / local-limit-exceeded) is retried with exponential backoff, large
--- proposals are split across sequential associations, and every error path
--- after the A-ASSOCIATE-RQ sends A-ABORT so the SCP frees the slot at once.
+-- associate_extended() proposes a list of presentation contexts, each with
+-- its own transfer syntaxes, and reports the SCP's answer for every one of
+-- them (PS3.8 section 9.3.3.2); resolve_vendor_info() turns the
+-- implementation identification in the A-ASSOCIATE-AC into a toolkit,
+-- version and device manufacturer. associate_extended() is gentle on
+-- production SCPs, whose association pool is shared with clinical traffic:
+-- its associations to a host are serialized across all scripts, a transient
+-- A-ASSOCIATE-RJ (temporary-congestion / local-limit-exceeded) is retried
+-- with exponential backoff, large proposals are split across sequential
+-- associations, and every error path after the A-ASSOCIATE-RQ sends A-ABORT
+-- so the SCP frees the slot at once.
 --
 -- @args dicom.called_aet Called Application Entity Title. Default: ANY-SCP
 -- @args dicom.calling_aet Calling Application Entity Title. Default: ECHOSCU
--- @args dicom.timeout_ms Socket timeout in milliseconds. Default: 3000
+-- @args dicom.tls Transport: "true" forces DICOM-over-TLS, "false" forces
+--                 plain TCP. When unset, associate_extended() follows Nmap's
+--                 own service detection (-sV) and the other functions use
+--                 plain TCP. Default: unset
+-- @args dicom.timeout_ms Socket timeout of associate_extended() in
+--                        milliseconds. Default: 3000
 -- @args dicom.retries Retries after a transient A-ASSOCIATE-RJ
---                     (temporary-congestion / local-limit-exceeded). Default: 2
+--                     (temporary-congestion / local-limit-exceeded).
+--                     Default: 2
 -- @args dicom.backoff_ms Delay before the first retry in milliseconds,
 --                        doubled for each retry after it. Default: 2000
 -- @args dicom.max_pcs Most presentation contexts proposed in one
---                     A-ASSOCIATE-RQ; larger proposals are split across
---                     sequential associations. Default: 64 (range 2-128)
--- @args dicom.max_rq_bytes Largest A-ASSOCIATE-RQ PDU sent, in bytes; larger
---                          proposals are split across sequential
---                          associations. Default: 16384
--- @args dicom.no_release If set, an accepted association is closed with
---                        A-ABORT instead of A-RELEASE-RQ. Default: unset
+--                     A-ASSOCIATE-RQ by associate_extended(); larger
+--                     proposals are split across sequential associations.
+--                     Default: 64 (range 2-128)
+-- @args dicom.max_rq_bytes Largest A-ASSOCIATE-RQ PDU sent by
+--                          associate_extended(), in bytes; larger proposals
+--                          are split across sequential associations.
+--                          Default: 16384
+-- @args dicom.no_release If set, associate_extended() closes an accepted
+--                        association with A-ABORT instead of A-RELEASE-RQ.
+--                        Default: unset
 --
--- @author Paulino Calderon <paulino@calderonpale.com> and Tyler M <tmart234@gmail.com>
+-- @author Paulino Calderon <paulino@calderonpale.com>
+-- @author Tyler M <tmart234@gmail.com>
+-- @author Nichelle Gilbert <nich.gilbert@gmail.com>
 -- @copyright Same as Nmap--See https://nmap.org/book/man-legal.html
 ---
 
-local nmap = require "nmap"
+local nmap   = require "nmap"
 local stdnse = require "stdnse"
 local string = require "string"
-local table = require "table"
+local table  = require "table"
+local math   = require "math"
+local io     = require "io"
+local os     = require "os"
 
 _ENV = stdnse.module("dicom", stdnse.seeall)
 
-local MIN_HEADER_LEN = 6
-PDU_NAMES = {}  -- exported reverse map: pdu_type -> name (built below)
+-----------------------------------------------------------------------
+-- 1. CONSTANTS
+-----------------------------------------------------------------------
 
--- ITU-T X.667 self-issued OID. Generated once for Nmap's NSE DICOM stack.
--- Stable across runs (so PACS audit-log correlation works) but not under the
--- OFFIS / IANA-PEN tree, so it does not impersonate DCMTK or any registered
--- vendor. Replace with 1.3.6.1.4.1.<PEN>.1 if Insecure.Com registers a PEN.
-local IMPLEMENTATION_CLASS_UID = "2.25.205477355541376756296906656564391676347"
--- Implementation Version Name (PS3.7 D.3.3.2). Stable across Nmap releases
--- so SCP fingerprinting / audit-log filtering rules don't need updating
--- whenever Nmap ships. Embed the Nmap version in port.version at the
--- script layer where it belongs, not in the wire-level identifier.
-local IMPLEMENTATION_VERSION_NAME = "NMAP_NSE"
+--- Minimum size in bytes of a valid A-ASSOCIATE-RQ PDU.
+MIN_SIZE_ASSOC_REQ = 68
+--- Maximum PDU size accepted when reading from the network.
+MAX_SIZE_PDU       = 128000
+--- Length in bytes of a DICOM Upper Layer PDU header.
+MIN_HEADER_LEN     = 6
 
-local APPLICATION_CONTEXT_NAME = "1.2.840.10008.3.1.1.1"
-local MAX_PDU_LEN = 16384
--- A-ASSOCIATE-RQ fixed fields between the PDU header and the first variable
--- item: protocol version, reserved, called/calling AE titles, reserved
--- (PS3.8 §9.3.2).
-local RQ_FIXED_LEN = 68
-
--- Presentation context IDs are odd integers 1-255 (PS3.8 §9.3.2.2), so one
--- A-ASSOCIATE-RQ can carry at most 128. Some real SCPs (older DCMTK builds,
--- GE, embedded modality stacks) refuse far smaller RQ PDUs, so proposals are
--- split well below that ceiling by default.
-local MAX_PCS_PER_RQ       = 128
-local DEFAULT_MAX_PCS      = 64
-local DEFAULT_MAX_RQ_BYTES = 16384
-
-local DEFAULT_RETRIES    = 2
-local DEFAULT_BACKOFF_MS = 2000
--- Pause before each follow-up association of a split proposal. SCPs can free
--- a pool slot a moment after sending A-RELEASE-RP (pynetdicom with a
--- one-slot pool rejected 4 of 10 immediate re-associations), so starting the
--- next one at once can draw a local-limit-exceeded reject.
-local BATCH_GAP_MS = 250
-
--- A-ABORT source and reason/diag values (PS3.8 §9.3.8). The reason is only
--- significant when the source is the UL service-provider.
-local ABORT_SOURCE_USER           = 0
-local ABORT_SOURCE_PROVIDER       = 2
-local ABORT_REASON_NOT_SPECIFIED  = 0
-local ABORT_REASON_UNEXPECTED_PDU = 2
-
--- A-ASSOCIATE-AC PDU layout (PS3.8 §9.3.3 Table 9-17).
--- 6-byte PDU header + 68-byte fixed preamble = 74; first variable item starts
--- at 1-indexed Lua offset 75.
-local AC_VARIABLE_ITEM_OFFSET = 75
--- Item / sub-item types (PS3.8 §9.3.3.2 Table 9-18, §9.3.3.2.1 Table 9-19,
--- §9.3.3.3, PS3.7 D.3.3).
-local ITEM_PC_AC               = 0x21
-local ITEM_TRANSFER_SYNTAX     = 0x40
-local ITEM_USER_INFORMATION    = 0x50
-local SUBITEM_MAX_PDU          = 0x51
-local SUBITEM_IMPL_CLASS_UID   = 0x52
-local SUBITEM_IMPL_VERSION     = 0x55
-
--- ===== Local Helper Functions =====
-
-local function ul_item(item_type, value_bytes)
-  return string.pack(">B B I2", item_type, 0x00, #value_bytes) .. value_bytes
-end
-
-local function item_application_context(uid) return ul_item(0x10, uid) end
-local function item_abstract_syntax(uid)    return ul_item(0x30, uid) end
-local function item_transfer_syntax(uid)    return ul_item(0x40, uid) end
-
-local function item_presentation_context(pc_id, abstract_uid, transfer_uids)
-  local header = string.pack(">B B B B", pc_id, 0x00, 0x00, 0x00)
-  local ts_blob = ""
-  -- Accept either a single UID string or a list of UIDs.
-  if type(transfer_uids) == "string" then
-    ts_blob = item_transfer_syntax(transfer_uids)
-  else
-    for _, uid in ipairs(transfer_uids) do
-      ts_blob = ts_blob .. item_transfer_syntax(uid)
-    end
-  end
-  local payload = header .. item_abstract_syntax(abstract_uid) .. ts_blob
-  return ul_item(0x20, payload)
-end
-
-local function item_max_pdu(max_len)
-  return string.pack(">B B I2 I4", 0x51, 0x00, 0x0004, max_len)
-end
-local function item_impl_uid(uid)     return ul_item(0x52, uid) end
-local function item_impl_version(ver) return ul_item(0x55, ver) end
-
-local function item_user_information(impl_uid, impl_ver, max_pdu_len)
-  local payload = item_max_pdu(max_pdu_len) .. item_impl_uid(impl_uid) .. item_impl_version(impl_ver)
-  return ul_item(0x50, payload)
-end
-
-local function pad16(s)
-  s = (s or ""):sub(1,16)
-  if #s < 16 then s = s .. string.rep(" ", 16 - #s) end
-  return s
-end
-
--- ==================================
-
-local PDU_CODES = {
+---
+-- DICOM Upper Layer PDU type codes (PS3.8 Table 9-1).
+-- @class table
+-- @name PDU_CODES
+PDU_CODES = {
   ASSOCIATE_REQUEST  = 0x01,
   ASSOCIATE_ACCEPT   = 0x02,
   ASSOCIATE_REJECT   = 0x03,
   DATA               = 0x04,
   RELEASE_REQUEST    = 0x05,
   RELEASE_RESPONSE   = 0x06,
-  ABORT              = 0x07
+  ABORT              = 0x07,
 }
 
+---
+-- Reverse map of PDU_CODES: numeric type code to its name.
+-- @class table
+-- @name PDU_NAMES
+PDU_NAMES = {}
 for i, v in pairs(PDU_CODES) do
   PDU_NAMES[v] = i
 end
 
--- Per-PC result codes returned in A-ASSOCIATE-AC (PS3.8 §9.3.3.2)
+---
+-- DIMSE Command Field values (PS3.7 Table E.1-1).
+-- @class table
+-- @name COMMAND_FIELD
+COMMAND_FIELD = {
+  C_STORE_RQ  = 0x0001,
+  C_STORE_RSP = 0x8001,
+  C_GET_RQ    = 0x0010,
+  C_GET_RSP   = 0x8010,
+  C_FIND_RQ   = 0x0020,
+  C_FIND_RSP  = 0x8020,
+  C_MOVE_RQ   = 0x0021,
+  C_MOVE_RSP  = 0x8021,
+  C_ECHO_RQ   = 0x0030,
+  C_ECHO_RSP  = 0x8030,
+}
+
+---
+-- DIMSE Status codes (PS3.7 Table C.4-1 ff.).
+-- @class table
+-- @name STATUS
+STATUS = {
+  SUCCESS              = 0x0000,
+  PENDING              = 0xFF00,
+  PENDING_WARN         = 0xFF01,
+  CANCEL               = 0xFE00,
+  WARN_COERCE          = 0xB000,
+  FAIL_REFUSED_MV      = 0xA700,
+  FAIL_REFUSED_SOP     = 0xA900,
+  FAIL_ERROR           = 0xC000,
+}
+
+---
+-- Well-known SOP Class UIDs (storage and Query/Retrieve information models).
+-- @class table
+-- @name SOP_CLASS
+SOP_CLASS = {
+  VERIFICATION          = "1.2.840.10008.1.1",
+  CT_IMAGE_STORAGE      = "1.2.840.10008.5.1.4.1.1.2",
+  ENHANCED_CT_STORAGE   = "1.2.840.10008.5.1.4.1.1.2.1",
+  MR_IMAGE_STORAGE      = "1.2.840.10008.5.1.4.1.1.4",
+  SECONDARY_CAPTURE     = "1.2.840.10008.5.1.4.1.1.7",
+  PET_IMAGE_STORAGE     = "1.2.840.10008.5.1.4.1.1.128",
+  RT_DOSE_STORAGE       = "1.2.840.10008.5.1.4.1.1.481.2",
+  RT_PLAN_STORAGE       = "1.2.840.10008.5.1.4.1.1.481.5",
+  -- Query/Retrieve Information Models
+  STUDY_ROOT_QR_FIND    = "1.2.840.10008.5.1.4.1.2.2.1",
+  STUDY_ROOT_QR_MOVE    = "1.2.840.10008.5.1.4.1.2.2.2",
+  STUDY_ROOT_QR_GET     = "1.2.840.10008.5.1.4.1.2.2.3",
+  PATIENT_ROOT_QR_FIND  = "1.2.840.10008.5.1.4.1.2.1.1",
+  PATIENT_ROOT_QR_MOVE  = "1.2.840.10008.5.1.4.1.2.1.2",
+  PATIENT_ROOT_QR_GET   = "1.2.840.10008.5.1.4.1.2.1.3",
+}
+
+---
+-- Transfer Syntax UIDs (PS3.5).
+-- @class table
+-- @name TRANSFER_SYNTAX
+TRANSFER_SYNTAX = {
+  IMPLICIT_LE  = "1.2.840.10008.1.2",
+  EXPLICIT_LE  = "1.2.840.10008.1.2.1",
+  EXPLICIT_BE  = "1.2.840.10008.1.2.2",
+  DEFLATED_LE  = "1.2.840.10008.1.2.1.99",
+  JPEG_BASELINE = "1.2.840.10008.1.2.4.50",
+  JPEG_LOSSLESS = "1.2.840.10008.1.2.4.70",
+  JPEG_LS       = "1.2.840.10008.1.2.4.80",
+  JPEG2000_LOSSLESS = "1.2.840.10008.1.2.4.90",
+  JPEG2000      = "1.2.840.10008.1.2.4.91",
+  RLE           = "1.2.840.10008.1.2.5",
+  HTJ2K_LOSSLESS      = "1.2.840.10008.1.2.4.201",
+  HTJ2K_LOSSLESS_RPCL = "1.2.840.10008.1.2.4.202",
+  HTJ2K               = "1.2.840.10008.1.2.4.203",
+}
+
+---
+-- Names of the TRANSFER_SYNTAX UIDs, keyed by UID (PS3.6 Annex A).
+-- @class table
+-- @name TRANSFER_SYNTAX_NAMES
+TRANSFER_SYNTAX_NAMES = {
+  ["1.2.840.10008.1.2"]       = "Implicit VR Little Endian",
+  ["1.2.840.10008.1.2.1"]     = "Explicit VR Little Endian",
+  ["1.2.840.10008.1.2.2"]     = "Explicit VR Big Endian",
+  ["1.2.840.10008.1.2.1.99"]  = "Deflated Explicit VR Little Endian",
+  ["1.2.840.10008.1.2.4.50"]  = "JPEG Baseline (Process 1)",
+  ["1.2.840.10008.1.2.4.70"]  = "JPEG Lossless, Non-Hierarchical, First-Order Prediction",
+  ["1.2.840.10008.1.2.4.80"]  = "JPEG-LS Lossless",
+  ["1.2.840.10008.1.2.4.90"]  = "JPEG 2000 Image Compression (Lossless Only)",
+  ["1.2.840.10008.1.2.4.91"]  = "JPEG 2000 Image Compression",
+  ["1.2.840.10008.1.2.5"]     = "RLE Lossless",
+  ["1.2.840.10008.1.2.4.201"] = "HTJ2K Lossless",
+  ["1.2.840.10008.1.2.4.202"] = "HTJ2K Lossless RPCL",
+  ["1.2.840.10008.1.2.4.203"] = "HTJ2K",
+}
+
+---
+-- Presentation context result codes in an A-ASSOCIATE-AC, keyed by code
+-- (PS3.8 Table 9-18).
+-- @class table
+-- @name PC_RESULT_NAMES
 PC_RESULT_NAMES = {
   [0] = "accepted",
   [1] = "user-rejection",
@@ -179,16 +237,30 @@ PC_RESULT_NAMES = {
   [4] = "transfer-syntaxes-not-supported",
 }
 
--- A-ASSOCIATE-RJ field decoding (PS3.8 §9.3.4 Table 9-21)
+---
+-- A-ASSOCIATE-RJ Result field values (PS3.8 Table 9-21).
+-- @class table
+-- @name ASSOC_RJ_RESULT
 ASSOC_RJ_RESULT = {
   [1] = "rejected-permanent",
   [2] = "rejected-transient",
 }
+
+---
+-- A-ASSOCIATE-RJ Source field values (PS3.8 Table 9-21).
+-- @class table
+-- @name ASSOC_RJ_SOURCE
 ASSOC_RJ_SOURCE = {
   [1] = "DICOM-UL-service-user",
   [2] = "DICOM-UL-service-provider-ACSE",
   [3] = "DICOM-UL-service-provider-Presentation",
 }
+
+---
+-- A-ASSOCIATE-RJ Reason/Diag field values, keyed by Source and then by
+-- Reason (PS3.8 Table 9-21).
+-- @class table
+-- @name ASSOC_RJ_REASON
 ASSOC_RJ_REASON = {
   [1] = {
     [1] = "no-reason-given",
@@ -207,962 +279,1671 @@ ASSOC_RJ_REASON = {
   },
 }
 
--- Common DICOM Transfer Syntax UIDs
-TRANSFER_SYNTAX_UIDS = {
-  IMPLICIT_VR_LE       = "1.2.840.10008.1.2",
-  EXPLICIT_VR_LE       = "1.2.840.10008.1.2.1",
-  EXPLICIT_VR_BE       = "1.2.840.10008.1.2.2",
-  DEFLATE_EXPLICIT_LE  = "1.2.840.10008.1.2.1.99",
-  JPEG_BASELINE        = "1.2.840.10008.1.2.4.50",
-  JPEG_LOSSLESS        = "1.2.840.10008.1.2.4.70",
-  JPEG_LS_LOSSLESS     = "1.2.840.10008.1.2.4.80",
-  JPEG_2000_LOSSLESS   = "1.2.840.10008.1.2.4.90",
-  JPEG_2000_LOSSY      = "1.2.840.10008.1.2.4.91",
-  RLE_LOSSLESS         = "1.2.840.10008.1.2.5",
-  HTJ2K_LOSSLESS       = "1.2.840.10008.1.2.4.201",
-  HTJ2K_LOSSLESS_RPCL  = "1.2.840.10008.1.2.4.202",
-  HTJ2K                = "1.2.840.10008.1.2.4.203",
-}
+--- DICOM Application Context Name UID (PS3.7).
+APP_CTX_UID = "1.2.840.10008.3.1.1.1"
 
--- Friendly names for the TS UIDs we may propose
-TRANSFER_SYNTAX_NAMES = {
-  ["1.2.840.10008.1.2"]       = "Implicit VR Little Endian",
-  ["1.2.840.10008.1.2.1"]     = "Explicit VR Little Endian",
-  ["1.2.840.10008.1.2.2"]     = "Explicit VR Big Endian",
-  ["1.2.840.10008.1.2.1.99"]  = "Deflated Explicit VR Little Endian",
-  ["1.2.840.10008.1.2.4.50"]  = "JPEG Baseline (Process 1)",
-  ["1.2.840.10008.1.2.4.70"]  = "JPEG Lossless, Non-Hierarchical, First-Order Prediction",
-  ["1.2.840.10008.1.2.4.80"]  = "JPEG-LS Lossless",
-  ["1.2.840.10008.1.2.4.90"]  = "JPEG 2000 Image Compression (Lossless Only)",
-  ["1.2.840.10008.1.2.4.91"]  = "JPEG 2000 Image Compression",
-  ["1.2.840.10008.1.2.5"]     = "RLE Lossless",
-  ["1.2.840.10008.1.2.4.201"] = "HTJ2K Lossless",
-  ["1.2.840.10008.1.2.4.202"] = "HTJ2K Lossless RPCL",
-  ["1.2.840.10008.1.2.4.203"] = "HTJ2K",
-}
+--- Implementation Class UID advertised in A-ASSOCIATE-RQ (DCMTK-compatible).
+IMPL_CLASS_UID   = "1.2.276.0.7230010.3.0.3.6.7"
+--- Implementation Version Name advertised in A-ASSOCIATE-RQ.
+IMPL_VERSION     = "OFFIS_DCMTK_367"
+--- Default maximum PDU length proposed during association.
+MAX_PDU_DEFAULT  = 16384
 
--- DICOM SOP-Class UID -> functional service-class mapping.
--- Sources: PS3.4 Annex A (Verification), Annex B (Storage), Annex C (Q/R),
--- Annex F (MPPS), Annex H (Print), Annex J (Storage Commitment),
--- Annex K (Modality Worklist), Annex CC (UPS), Annex DD (GP Worklist).
--- Order matters: most-specific entry must appear before any prefix that
--- would also match.
-SERVICE_CLASS_BY_UID = {
-  {uid = "1.2.840.10008.1.1",                   service = "Verification"},
-  {uid = "1.2.840.10008.1.20.1",                service = "Storage-Commitment"},
-  {uid = "1.2.840.10008.3.1.2.3.3",             service = "MPPS"},
-  {uid = "1.2.840.10008.5.1.4.31",              service = "Modality-Worklist"},
-  {uid = "1.2.840.10008.5.1.4.32.",             service = "GP-Worklist", prefix = true},
-  {uid = "1.2.840.10008.5.1.4.34.",             service = "UPS",         prefix = true},
-  {uid = "1.2.840.10008.5.1.4.1.2.1.",          service = "QR-Patient-Root",  prefix = true},
-  {uid = "1.2.840.10008.5.1.4.1.2.2.",          service = "QR-Study-Root",    prefix = true},
-  {uid = "1.2.840.10008.5.1.4.1.2.3.",          service = "QR-Patient-Study", prefix = true},
-  {uid = "1.2.840.10008.5.1.4.1.1.",            service = "Storage", prefix = true},
-  {uid = "1.2.840.10008.5.1.1.",                service = "Print",   prefix = true},
+---
+-- Query/Retrieve levels (0008,0052 QueryRetrieveLevel values).
+-- @class table
+-- @name QR_LEVEL
+QR_LEVEL = {
+  PATIENT = "PATIENT",
+  STUDY   = "STUDY",
+  SERIES  = "SERIES",
+  IMAGE   = "IMAGE",
 }
 
 ---
--- Map an Abstract Syntax UID to its DICOM functional service class.
--- @return service-class string, or nil if no match.
-function service_class_for_uid(uid)
-  if not uid then return nil end
-  for _, entry in ipairs(SERVICE_CLASS_BY_UID) do
-    if entry.prefix then
-      if uid:sub(1, #entry.uid) == entry.uid then return entry.service end
-    elseif uid == entry.uid then
-      return entry.service
+-- VRs that use the long (12-byte) explicit encoding in Explicit VR LE
+-- (PS3.5 Table 7.1-1). Membership test: LONG_VRS[vr] is true for these.
+-- @class table
+-- @name LONG_VRS
+LONG_VRS = {
+  OB = true, OD = true, OF = true, OL = true, OV = true, OW = true,
+  SQ = true, UC = true, UN = true, UR = true, UT = true,
+  SV = true, UV = true,
+}
+
+--- All valid DICOM Value Representations (PS3.5 Table 6.2-1). Used to detect a
+-- corrupt File Meta element whose VR bytes are not a real VR, so the Explicit
+-- VR walk can stop instead of misaligning on a bogus length.
+-- @class table
+-- @name KNOWN_VRS
+KNOWN_VRS = {
+  AE = true, AS = true, AT = true, CS = true, DA = true, DS = true,
+  DT = true, FL = true, FD = true, IS = true, LO = true, LT = true,
+  OB = true, OD = true, OF = true, OL = true, OV = true, OW = true,
+  PN = true, SH = true, SL = true, SQ = true, SS = true, ST = true,
+  SV = true, TM = true, UC = true, UI = true, UL = true, UN = true,
+  UR = true, US = true, UT = true, UV = true,
+}
+
+--- CommandDataSetType (0000,0800) sentinel: a dataset follows the command.
+DATASET_PRESENT     = 0x0001
+--- CommandDataSetType (0000,0800) sentinel: no dataset follows the command.
+DATASET_NOT_PRESENT = 0x0101
+
+-----------------------------------------------------------------------
+-- 2. LOW-LEVEL UTILITIES
+-----------------------------------------------------------------------
+
+--- Pack a big-endian unsigned integer into n bytes.
+function pack_be(val, n)
+  if n == 1 then return string.pack(">B",  val) end
+  if n == 2 then return string.pack(">I2", val) end
+  if n == 4 then return string.pack(">I4", val) end
+  return string.pack(">I" .. n, val)
+end
+
+--- Pack a little-endian unsigned integer into n bytes.
+function pack_le(val, n)
+  if n == 1 then return string.pack("<B",  val) end
+  if n == 2 then return string.pack("<I2", val) end
+  if n == 4 then return string.pack("<I4", val) end
+  return string.pack("<I" .. n, val)
+end
+
+--- Pad/truncate a string to exactly n bytes (space-padded on right).
+function pad_str(s, n)
+  s = s or ""
+  if #s >= n then return s:sub(1, n) end
+  return s .. string.rep(" ", n - #s)
+end
+
+--- Build a TLV item: type(1) + reserved(1) + length(2, big-endian) + data.
+function mk_item(item_type, data)
+  return string.pack(">B B I2", item_type, 0x00, #data) .. data
+end
+
+--- Generate a plausible fake UID.
+function generate_fake_uid()
+  return string.format("1.2.3.4.5.99999.%d.%d",
+    os.time(), math.random(100000, 999999))
+end
+
+--- Read a file from disk.  Returns bytes string or nil, err.
+function read_file(path)
+  local f, err = io.open(path, "rb")
+  if not f then return nil, "Cannot open file: " .. tostring(err) end
+  local data = f:read("*a")
+  f:close()
+  if not data then return nil, "Cannot read file: " .. path end
+  return data, nil
+end
+
+--- Write binary data to a file.  Returns true or nil, err.
+function write_file(path, data)
+  local f, err = io.open(path, "wb")
+  if not f then
+    return nil, "Cannot open file for writing: " .. tostring(err)
+  end
+  f:write(data)
+  f:close()
+  return true
+end
+
+-----------------------------------------------------------------------
+-- 3. PDU HEADER
+-----------------------------------------------------------------------
+
+--- Encode a DICOM PDU header (6 bytes).
+-- @param pdu_type PDU type byte
+-- @param length   Length of the PDU body
+-- @return status (bool), header_or_err (string)
+function pdu_header_encode(pdu_type, length)
+  if type(pdu_type) ~= "number" then
+    return false, "PDU Type must be an unsigned integer. Range:0-7"
+  end
+  if type(length) ~= "number" then
+    return false, "Length must be an unsigned integer."
+  end
+  local header = string.pack(">B B I4", pdu_type, 0, length)
+  if #header < MIN_HEADER_LEN then
+    return false, "Header must be at least 6 bytes. Something went wrong."
+  end
+  return true, header
+end
+
+-----------------------------------------------------------------------
+-- 4. ASSOCIATION PDU BUILDERS
+-----------------------------------------------------------------------
+
+--- Build an SCP/SCU Role Selection sub-item (PS3.7 §D.3.3.4, item type 0x54).
+-- Used to request role reversal so the SCU can receive C-STORE sub-operations
+-- (required for C-GET).
+-- @param uid  Abstract Syntax (SOP Class) UID the role applies to
+-- @param scu  SCU role byte (0 or 1)
+-- @param scp  SCP role byte (0 or 1)
+-- @return Encoded role selection sub-item bytes
+function mk_role_item(uid, scu, scp)
+  -- body: UID-length(2) + UID + SCU-role(1) + SCP-role(1)
+  local body = string.pack(">I2", #uid) .. uid
+             .. string.pack(">B B", scu and 1 or 0, scp and 1 or 0)
+  return mk_item(0x54, body)
+end
+
+--- Build User Information sub-item for A-ASSOCIATE-RQ.
+-- @param max_pdu Max PDU length to advertise
+-- @param roles   (optional) list of {uid=<SOP Class UID>, scu=bool, scp=bool}
+--                role-selection requests to append (for C-GET, request
+-- scp=true
+--                on the storage SOP classes you are willing to receive).
+function mk_user_info(max_pdu, roles)
+  max_pdu = max_pdu or MAX_PDU_DEFAULT
+  local max_pdu_item = string.pack(">B B I2 I4", 0x51, 0x00, 0x04, max_pdu)
+  local inner = max_pdu_item
+  -- Role selection items must precede the implementation identification items
+  -- in typical peer implementations; place them here for maximum
+  -- compatibility.
+  if roles then
+    for _, r in ipairs(roles) do
+      inner = inner .. mk_role_item(r.uid, r.scu ~= false, r.scp == true)
     end
   end
-  return nil
+  inner = inner
+        .. mk_item(0x52, IMPL_CLASS_UID)
+        .. mk_item(0x55, IMPL_VERSION)
+  return mk_item(0x50, inner)
 end
 
----
--- Best-effort device-class fingerprint from the set of accepted service
--- classes. The taxonomy (PACS/VNA/Modality/RIS-gateway/Archive/Print) is a
--- practitioner consensus, not a normative DICOM concept; cf. Mildenberger
--- 2002 (PMID 11960356) and the structural division between PACS and VNA in
--- the radiology informatics literature.
--- @param accepted_services set-shaped table where keys are service strings.
--- @return device-class string, or nil if the pattern is ambiguous.
-function infer_device_class(accepted_services)
-  if not accepted_services then return nil end
-  local function has(s) return accepted_services[s] and true or false end
-  local has_qr = has("QR-Patient-Root") or has("QR-Study-Root") or has("QR-Patient-Study")
-  if has("Storage") and has_qr and (has("Modality-Worklist") or has("MPPS") or has("Storage-Commitment")) then
-    return "PACS/VNA"
+--- Build a Presentation Context sub-item for A-ASSOCIATE-RQ.
+-- @param pctx_id       Odd integer 1–255
+-- @param sop_class     Abstract Syntax UID string
+-- @param transfer_uids List of Transfer Syntax UIDs
+--                      (default: Explicit VR LE + Implicit VR LE)
+function mk_pres_ctx(pctx_id, sop_class, transfer_uids)
+  transfer_uids = transfer_uids or {
+    TRANSFER_SYNTAX.EXPLICIT_LE,
+    TRANSFER_SYNTAX.IMPLICIT_LE,
+  }
+  local inner = string.pack(">B B B B", pctx_id, 0x00, 0x00, 0x00)
+              .. mk_item(0x30, sop_class)
+  for _, ts in ipairs(transfer_uids) do
+    inner = inner .. mk_item(0x40, ts)
   end
-  if has("Storage") and has_qr then
-    return "Archive front-end"
-  end
-  if has("Modality-Worklist") and not has("Storage") then
-    return "RIS gateway / worklist broker"
-  end
-  if has("Print") then
-    return "Print server"
-  end
-  if has("Verification") and not has("Storage") and not has_qr then
-    return "Modality (or unconfigured SCP)"
-  end
-  return nil
+  return mk_item(0x20, inner)
 end
 
--- DICOM Storage SOP-Class UID -> imaging modality. Sourced from PS3.4 Annex B
--- and the PS3.6 UID registry. Order matters: most-specific UIDs (with the
--- longer suffixes) come before any prefix that would also match.
-SOP_MODALITY_BY_UID = {
-  -- CT
-  {uid = "1.2.840.10008.5.1.4.1.1.2.1",         modality = "CT"},
-  {uid = "1.2.840.10008.5.1.4.1.1.2.2",         modality = "CT"},
-  {uid = "1.2.840.10008.5.1.4.1.1.2",           modality = "CT"},
-  -- MR
-  {uid = "1.2.840.10008.5.1.4.1.1.4.1",         modality = "MRI"},
-  {uid = "1.2.840.10008.5.1.4.1.1.4.2",         modality = "MRI"},
-  {uid = "1.2.840.10008.5.1.4.1.1.4.3",         modality = "MRI"},
-  {uid = "1.2.840.10008.5.1.4.1.1.4.4",         modality = "MRI"},
-  {uid = "1.2.840.10008.5.1.4.1.1.4",           modality = "MRI"},
-  -- Ultrasound
-  {uid = "1.2.840.10008.5.1.4.1.1.3.1",         modality = "Ultrasound"},
-  {uid = "1.2.840.10008.5.1.4.1.1.6.1",         modality = "Ultrasound"},
-  {uid = "1.2.840.10008.5.1.4.1.1.6.2",         modality = "Ultrasound"},
-  -- Mammography (must come before generic DX/CR Storage prefixes)
-  {uid = "1.2.840.10008.5.1.4.1.1.1.2.1",       modality = "Mammography"},
-  {uid = "1.2.840.10008.5.1.4.1.1.1.2",         modality = "Mammography"},
-  {uid = "1.2.840.10008.5.1.4.1.1.13.1.3",      modality = "Mammography"},
-  -- Intra-oral / dentistry (more specific than generic X-Ray)
-  {uid = "1.2.840.10008.5.1.4.1.1.1.3.1",       modality = "X-Ray (Intra-oral)"},
-  {uid = "1.2.840.10008.5.1.4.1.1.1.3",         modality = "X-Ray (Intra-oral)"},
-  -- Digital X-Ray (DR)
-  {uid = "1.2.840.10008.5.1.4.1.1.1.1.1",       modality = "X-Ray (DX)"},
-  {uid = "1.2.840.10008.5.1.4.1.1.1.1",         modality = "X-Ray (DX)"},
-  -- Computed Radiography
-  {uid = "1.2.840.10008.5.1.4.1.1.1",           modality = "X-Ray (CR)"},
-  -- X-Ray Angiography
-  {uid = "1.2.840.10008.5.1.4.1.1.12.1.1",      modality = "X-Ray Angiography"},
-  {uid = "1.2.840.10008.5.1.4.1.1.12.1",        modality = "X-Ray Angiography"},
-  -- X-Ray Radiofluoroscopy
-  {uid = "1.2.840.10008.5.1.4.1.1.12.2.1",      modality = "Fluoroscopy"},
-  {uid = "1.2.840.10008.5.1.4.1.1.12.2",        modality = "Fluoroscopy"},
-  -- Nuclear Medicine
-  {uid = "1.2.840.10008.5.1.4.1.1.20",          modality = "Nuclear Medicine"},
-  -- PET (PET-CT scanners emit both PET and CT Storage SOP classes)
-  {uid = "1.2.840.10008.5.1.4.1.1.130",         modality = "PET"},
-  {uid = "1.2.840.10008.5.1.4.1.1.128.1",       modality = "PET"},
-  {uid = "1.2.840.10008.5.1.4.1.1.128",         modality = "PET"},
-  -- Endoscopy / Visible Light
-  {uid = "1.2.840.10008.5.1.4.1.1.77.1.1.1",    modality = "Endoscopy"},
-  {uid = "1.2.840.10008.5.1.4.1.1.77.1.1",      modality = "Endoscopy"},
-  {uid = "1.2.840.10008.5.1.4.1.1.77.1.4.1",    modality = "VL Photographic"},
-  {uid = "1.2.840.10008.5.1.4.1.1.77.1.4",      modality = "VL Photographic"},
-  -- Radiotherapy
-  {uid = "1.2.840.10008.5.1.4.1.1.481.1",       modality = "RT Image"},
-  -- Ophthalmology
-  {uid = "1.2.840.10008.5.1.4.1.1.77.1.5.1",    modality = "Ophthalmic Photography"},
-  {uid = "1.2.840.10008.5.1.4.1.1.77.1.5.2",    modality = "Ophthalmic Photography"},
-  {uid = "1.2.840.10008.5.1.4.1.1.77.1.5.4",    modality = "Ophthalmic Tomography (OCT)"},
-  -- Cardiology / physiological waveforms
-  {uid = "1.2.840.10008.5.1.4.1.1.9.1.1",       modality = "ECG (Waveform)"},
-  {uid = "1.2.840.10008.5.1.4.1.1.9.1.2",       modality = "ECG (Waveform)"},
-  {uid = "1.2.840.10008.5.1.4.1.1.9.1.3",       modality = "ECG (Waveform)"},
-  -- Digital pathology / microscopy
-  {uid = "1.2.840.10008.5.1.4.1.1.77.1.2",      modality = "Microscopy"},
-  {uid = "1.2.840.10008.5.1.4.1.1.77.1.2.1",    modality = "Microscopy"},
-  {uid = "1.2.840.10008.5.1.4.1.1.77.1.6",      modality = "Whole Slide Imaging"},
-  -- Document / non-image objects (no implied physical modality)
-  {uid = "1.2.840.10008.5.1.4.1.1.7",           modality = "Secondary Capture"},
-  {uid = "1.2.840.10008.5.1.4.1.1.104.1",       modality = "Encapsulated Document"},
-}
+--- Build a complete A-ASSOCIATE-RQ PDU.
+-- @param called_ae   Called AE Title (max 16 chars)
+-- @param calling_ae  Calling AE Title (max 16 chars)
+-- @param sop_classes List of Abstract Syntax UIDs to propose. An entry may
+--                    instead be a table {abstract_syntax = uid,
+--                    transfer_syntaxes = {uid, ...}} to give that
+--                    presentation context its own transfer syntaxes.
+-- @param max_pdu     Max PDU length to propose
+-- @param transfer_uids  Optional list of TS UIDs for all presentation contexts
+-- @param roles          Optional list of {uid=, scu=, scp=} role-selection
+--                       requests (see mk_user_info). Use for C-GET to request
+--                       scp=true on the storage SOP classes you will receive.
+-- @return Full PDU bytes ready to send
+function build_assoc_rq(called_ae, calling_ae, sop_classes, max_pdu,
+    transfer_uids, roles)
+  called_ae  = pad_str(called_ae  or "ANY-SCP",   16)
+  calling_ae = pad_str(calling_ae or "ECHOSCU",    16)
 
----
--- Map a Storage SOP-Class UID to its imaging modality. Returns nil for
--- non-Storage UIDs (Verification, Q/R, MWL, Print, ...).
-function modality_for_uid(uid)
-  if not uid then return nil end
-  for _, entry in ipairs(SOP_MODALITY_BY_UID) do
-    if uid == entry.uid then return entry.modality end
-  end
-  return nil
-end
+  local reserved_32 = string.rep("\x00", 32)
+  local body = string.pack(">I2 I2", 0x0001, 0x0000)
+             .. called_ae .. calling_ae .. reserved_32
+  body = body .. mk_item(0x10, APP_CTX_UID)
 
----
--- Build the sorted set of modalities implied by a list of accepted abstract
--- syntax UIDs. PET-CT is collapsed when both PET and CT are present.
-function infer_modalities(accepted_uids)
-  if not accepted_uids then return {} end
-  local set = {}
-  for _, uid in ipairs(accepted_uids) do
-    local m = modality_for_uid(uid)
-    if m then set[m] = true end
-  end
-  if set["PET"] and set["CT"] then
-    set["PET-CT"] = true
-  end
-  local list = {}
-  for m in pairs(set) do list[#list + 1] = m end
-  table.sort(list)
-  return list
-end
-
--- PS3.4 Service Classes reported by infer_services(), in output order. Query/
--- Retrieve (Annex C) is split into its query (C-FIND) and retrieve (C-MOVE,
--- C-GET) halves; Modality Worklist is the Basic Worklist Management Service
--- (Annex K), a separate Service Class whose C-FIND runs against a different
--- information model.
-SERVICE_KEYS = {
-  "verification",        -- Annex A
-  "storage",             -- Annex B
-  "query",               -- Annex C, C-FIND
-  "retrieve",            -- Annex C, C-MOVE / C-GET
-  "modality_worklist",   -- Annex K
-  "storage_commitment",  -- Annex J
-  "mpps",                -- Annex F
-  "ups",                 -- Annex CC
-  "print",               -- Annex H
-}
-
--- DIMSE operations each SOP Class carries (PS3.4; DIMSE services per PS3.7).
--- Composite services use DIMSE-C, the normalized workflow and print services
--- use DIMSE-N. A Meta SOP Class lists the union of its member SOP Classes.
-local PRINT_META_OPS = {"N-ACTION", "N-CREATE", "N-DELETE", "N-EVENT-REPORT", "N-GET", "N-SET"}
-local DIMSE_BY_UID = {
-  ["1.2.840.10008.1.1"]          = {service = "verification",       ops = {"C-ECHO"}},
-  ["1.2.840.10008.5.1.4.31"]     = {service = "modality_worklist",  ops = {"C-FIND"}},
-  ["1.2.840.10008.1.20.1"]       = {service = "storage_commitment", ops = {"N-ACTION", "N-EVENT-REPORT"}},
-  ["1.2.840.10008.3.1.2.3.3"]    = {service = "mpps",               ops = {"N-CREATE", "N-SET"}},
-  -- Each UPS SOP Class carries a different slice of the service (Annex CC).
-  ["1.2.840.10008.5.1.4.34.6.1"] = {service = "ups", label = "Push",  ops = {"N-ACTION", "N-CREATE", "N-GET"}},
-  ["1.2.840.10008.5.1.4.34.6.2"] = {service = "ups", label = "Watch", ops = {"C-FIND", "N-ACTION", "N-GET"}},
-  ["1.2.840.10008.5.1.4.34.6.3"] = {service = "ups", label = "Pull",  ops = {"C-FIND", "N-ACTION", "N-GET", "N-SET"}},
-  ["1.2.840.10008.5.1.4.34.6.4"] = {service = "ups", label = "Event", ops = {"N-EVENT-REPORT"}},
-  ["1.2.840.10008.5.1.1.9"]      = {service = "print", label = "Basic Grayscale", ops = PRINT_META_OPS},
-  ["1.2.840.10008.5.1.1.18"]     = {service = "print", label = "Basic Color",     ops = PRINT_META_OPS},
-}
-
-local STORAGE_UID_PREFIX = "1.2.840.10008.5.1.4.1.1."
--- Q/R SOP Class UIDs are <information model>.<op>: .1 FIND, .2 MOVE, .3 GET.
-local QR_UID_PREFIX = "1.2.840.10008.5.1.4.1.2."
-local QR_OPS = { ["1"] = "C-FIND", ["2"] = "C-MOVE", ["3"] = "C-GET" }
-local QR_MODEL_NAMES = {
-  ["1.2.840.10008.5.1.4.1.2.1"] = "Patient Root",
-  ["1.2.840.10008.5.1.4.1.2.2"] = "Study Root",
-  ["1.2.840.10008.5.1.4.1.2.3"] = "Patient/Study Only",
-}
-
--- Map a SOP Class UID to its SERVICE_KEYS entry, DIMSE ops, and an optional
--- label naming the Q/R information model or UPS / Print SOP Class.
-local function dimse_for_uid(uid)
-  local d = DIMSE_BY_UID[uid]
-  if d then return d.service, d.ops, d.label end
-  if uid:sub(1, #STORAGE_UID_PREFIX) == STORAGE_UID_PREFIX then
-    return "storage", {"C-STORE"}, nil
-  end
-  if uid:sub(1, #QR_UID_PREFIX) == QR_UID_PREFIX then
-    local model, tail = uid:match("^(.*)%.([123])$")
-    local op = tail and QR_OPS[tail]
-    if op then
-      return (op == "C-FIND") and "query" or "retrieve", {op}, QR_MODEL_NAMES[model] or model
+  for i, sop in ipairs(sop_classes) do
+    local pctx_id = (2 * i - 1)
+    if pctx_id > 255 then pctx_id = 255 end
+    if type(sop) == "table" then
+      body = body .. mk_pres_ctx(pctx_id, sop.abstract_syntax,
+          sop.transfer_syntaxes)
+    else
+      body = body .. mk_pres_ctx(pctx_id, sop, transfer_uids)
     end
   end
-  return nil
+  body = body .. mk_user_info(max_pdu, roles)
+
+  return string.pack(">B B I4", PDU_CODES.ASSOCIATE_REQUEST, 0x00, #body)
+      .. body
 end
 
-local function sorted_keys(set)
-  local list = {}
-  for k in pairs(set) do list[#list + 1] = k end
-  table.sort(list)
-  return list
-end
+--- Parse A-ASSOCIATE-AC to extract accepted presentation contexts.
+-- @param data  Raw A-ASSOCIATE-AC PDU bytes
+-- @return Table { pctxs = {pctx_id -> {accepted, result, transfer_syntax}},
+-- max_pdu = n }, where result is the presentation context result code (see
+-- PC_RESULT_NAMES)
+function parse_assoc_ac(data)
+  local result = {
+    pctxs = {},
+    max_pdu = MAX_PDU_DEFAULT,
+    roles = {}, -- Accepted SCP/SCU role selections {uid -> {scu,scp}}
+    -- Fingerprinting fields (populated from A-ASSOCIATE-AC)
+    called_ae       = "",   -- Called AE Title (from fixed header)
+    calling_ae      = "",   -- Calling AE Title (from fixed header)
+    impl_class_uid  = "",   -- Implementation Class UID (User Info 0x52)
+    impl_version    = "",   -- Implementation Version Name (User Info 0x55)
+    protocol_ver    = 0,    -- Protocol Version (should be 1)
+  }
+  if #data < 10 then return result end
 
----
--- Infer DIMSE service commands from accepted abstract syntax UIDs: C-ECHO,
--- C-STORE, C-FIND, C-MOVE and C-GET for the composite services, and the
--- N-* operations (N-CREATE, N-SET, N-ACTION, N-EVENT-REPORT, N-GET,
--- N-DELETE) for MPPS, Storage Commitment, UPS and Print Management.
--- @return sorted list of DIMSE operation names.
-function infer_service_commands(accepted_uids)
-  local cmds = {}
-  for _, uid in ipairs(accepted_uids or {}) do
-    local _, ops = dimse_for_uid(uid)
-    for _, op in ipairs(ops or {}) do cmds[op] = true end
+  -- Fixed header after PDU header(6): protocol version(2) + reserved(2) +
+  -- called(16) + calling(16) + reserved(32) = 68
+  if #data >= 74 then
+    result.protocol_ver = string.unpack(">I2", data, 7)
+    -- Called AE Title: bytes 11-26 (16 bytes, space-padded)
+    result.called_ae  = data:sub(11, 26):gsub("%s+$", "")
+    -- Calling AE Title: bytes 27-42 (16 bytes, space-padded)
+    result.calling_ae = data:sub(27, 42):gsub("%s+$", "")
   end
-  return sorted_keys(cmds)
-end
 
----
--- Summarize negotiation per PS3.4 Service Class (see SERVICE_KEYS).
--- @param proposed_uids abstract syntaxes the SCP answered, accepted or not
--- @param accepted_uids abstract syntaxes it accepted
--- @return table keyed by SERVICE_KEYS entry. A key is absent when no context
---         for that service was proposed; otherwise it maps to
---         {accepted = bool, sop_classes = n, ops = {[op] = sorted labels}},
---         where labels name the Q/R information models or UPS / Print SOP
---         Classes that carry the op (empty for single-SOP-Class services).
-function infer_services(proposed_uids, accepted_uids)
-  local out = {}
-  local function entry(svc)
-    out[svc] = out[svc] or { accepted = false, sop_classes = 0, ops = {} }
-    return out[svc]
-  end
-  for _, uid in ipairs(proposed_uids or {}) do
-    local svc = dimse_for_uid(uid)
-    if svc then entry(svc) end
-  end
-  local seen = {}
-  for _, uid in ipairs(accepted_uids or {}) do
-    local svc, ops, label = dimse_for_uid(uid)
-    if svc and not seen[uid] then
-      seen[uid] = true
-      local s = entry(svc)
-      s.accepted = true
-      s.sop_classes = s.sop_classes + 1
-      for _, op in ipairs(ops) do
-        s.ops[op] = s.ops[op] or {}
-        if label then s.ops[op][label] = true end
+  local pos = 75
+  if pos >= #data then return result end
+
+  while pos <= #data - 4 do
+    local item_type = string.byte(data, pos)
+    local item_len  = string.unpack(">I2", data, pos + 2)
+    local item_data = data:sub(pos + 4, pos + 3 + item_len)
+    pos = pos + 4 + item_len
+
+    if item_type == 0x21 and #item_data >= 4 then
+      -- Presentation Context (AC)
+      local pctx_id     = string.byte(item_data, 1)
+      local result_code = string.byte(item_data, 3)
+      local ts_uid = ""
+      if #item_data >= 8 then
+        local ts_type = string.byte(item_data, 5)
+        if ts_type == 0x40 then
+          local ts_len = string.unpack(">I2", item_data, 7)
+          ts_uid = item_data:sub(9, 8 + ts_len):gsub("%z", "")
+        end
+      end
+      result.pctxs[pctx_id] = {
+        accepted        = (result_code == 0x00),
+        result          = result_code,
+        transfer_syntax = ts_uid,
+      }
+    elseif item_type == 0x50 then
+      -- User Information sub-items (PS3.7 Annex D.3.3)
+      local upos = 1
+      while upos <= #item_data - 4 do
+        local u_type = string.byte(item_data, upos)
+        local u_len  = string.unpack(">I2", item_data, upos + 2)
+        local u_val  = item_data:sub(upos + 4, upos + 3 + u_len)
+        if u_type == 0x51 and u_len == 4 then
+          -- Maximum Length sub-item
+          result.max_pdu = string.unpack(">I4", item_data, upos + 4)
+        elseif u_type == 0x52 then
+          -- Implementation Class UID
+          result.impl_class_uid = u_val:gsub("%z", ""):gsub("%s+$", "")
+        elseif u_type == 0x55 then
+          -- Implementation Version Name
+          result.impl_version = u_val:gsub("%z", ""):gsub("%s+$", "")
+        elseif u_type == 0x54 then
+          -- SCP/SCU Role Selection (accepted): UID-len(2)+UID+SCU(1)+SCP(1)
+          if u_len >= 4 then
+            local uid_len = string.unpack(">I2", u_val, 1)
+            if uid_len + 2 <= #u_val then
+              local uid    = u_val:sub(3, 2 + uid_len)
+              local scu_b  = string.byte(u_val, 3 + uid_len) or 0
+              local scp_b  = string.byte(u_val, 4 + uid_len) or 0
+              result.roles[uid] = { scu = (scu_b == 1), scp = (scp_b == 1) }
+            end
+          end
+        end
+        upos = upos + 4 + u_len
       end
     end
   end
-  for _, s in pairs(out) do
-    for op, labels in pairs(s.ops) do s.ops[op] = sorted_keys(labels) end
+  return result
+end
+
+-----------------------------------------------------------------------
+-- 5. P-DATA-TF PDU BUILDER / PARSER
+-----------------------------------------------------------------------
+
+--- Chunk data into one or more P-DATA-TF PDUs (single-stream).
+-- Use build_pdata_pdus when you need separate command/dataset PDU lists.
+-- Use send_dimse() for the preferred combined approach.
+-- @param pctx_id    Presentation context ID
+-- @param data       Raw bytes to send
+-- @param is_command true for command set, false for dataset
+-- @param max_pdu    Max PDU length
+-- @return List of PDU byte strings
+function build_pdata_pdus(pctx_id, data, is_command, max_pdu)
+  max_pdu = max_pdu or MAX_PDU_DEFAULT
+  -- Overhead: 6 (PDU header) + 4 (PDV length) + 1 (PC-ID) + 1 (MCH) = 12
+  local frag_size = max_pdu - 12
+  if frag_size < 1 then frag_size = 512 end
+
+  local pdus = {}
+  local total = #data
+  local offset = 1
+
+  while offset <= total do
+    local chunk_end = math.min(offset + frag_size - 1, total)
+    local chunk   = data:sub(offset, chunk_end)
+    local is_last = (chunk_end >= total)
+
+    -- PS3.8 §9.3.5.1: bit 0 = 1 → command, bit 0 = 0 → dataset; bit 1 = last
+    local mch
+    if is_command then
+      mch = is_last and 0x03 or 0x01
+    else
+      mch = is_last and 0x02 or 0x00
+    end
+
+    local pdv_len = 2 + #chunk   -- PC-ID + MCH + data
+    local pdv = string.pack(">I4 B B", pdv_len, pctx_id, mch) .. chunk
+    local pdu = string.pack(">B B I4", PDU_CODES.DATA, 0x00, #pdv) .. pdv
+    pdus[#pdus + 1] = pdu
+    offset = chunk_end + 1
   end
-  return out
+  return pdus
 end
 
--- UID tables: "toolkit" = DICOM library on the wire (CVE target),
--- "manufacturer" = device OEM (asset inventory).
--- Most-specific patterns first within each table.
+--- Extract command bytes and dataset bytes from a single P-DATA-TF PDU.
+-- @param data  Raw P-DATA-TF PDU bytes
+-- @return cmd_bytes, dataset_bytes, cmd_complete, ds_complete, pctx_id
+--   cmd_complete: true if the last command PDV had the "last fragment" bit set
+--   ds_complete:  true if the last dataset PDV had the "last fragment" bit set
+--   pctx_id:      presentation context ID of the PDV(s) (command PDV
+-- preferred),
+--                 needed to reply on the correct context (e.g. C-STORE-RSP
+-- during
+--                 C-GET sub-operations). nil if no PDV was seen.
+function parse_pdata(data)
+  local cmd_bytes     = ""
+  local dataset_bytes = ""
+  local cmd_complete  = false
+  local ds_complete   = false
+  local pctx_id       = nil
+  if not data or #data < 6 then
+    return cmd_bytes, dataset_bytes, cmd_complete, ds_complete, pctx_id
+  end
 
-local TOOLKIT_UID_PATTERNS = {
-  {"^1%.3%.6%.1%.4%.1%.25403%.",              "ClearCanvas"},
-  {"^1%.3%.6%.1%.4%.1%.30071%.8",             "fo-dicom"},
-  {"^1%.2%.826%.0%.1%.3680043%.9%.3811%.",    "pynetdicom"},
-  {"^1%.2%.826%.0%.1%.3680043%.8%.641%.",     "Orthanc"},
-  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.",    "OsiriX/Horos"},
-  {"^1%.2%.276%.0%.7230010%.3%.",             "DCMTK"},
-  {"^1%.2%.40%.0%.13%.1%.3",                  "dcm4che"},
-  {"^1%.2%.826%.0%.1%.3680043%.2%.135%.1066%.101", "ConQuest"},
-}
+  local pos = 1
+  while pos <= #data - 5 do
+    local pdu_type = string.byte(data, pos)
+    if pdu_type ~= PDU_CODES.DATA then break end
+    local pdu_len  = string.unpack(">I4", data, pos + 2)
+    local pdu_end  = pos + 5 + pdu_len
+    local pdu_data = data:sub(pos + 6, pdu_end)
+    pos = pdu_end + 1
 
-local MANUFACTURER_UID_PATTERNS = {
-  {"^1%.2%.840%.113619%.",                    "GE Healthcare"},
-  {"^1%.3%.12%.2%.1107%.",                    "Siemens"},
-  {"^1%.2%.840%.114257%.",                    "Agfa"},
-  {"^1%.2%.840%.113704%.",                    "Philips"},
-  {"^1%.3%.46%.670589%.",                     "Philips"},
-  {"^1%.2%.840%.113564%.",                    "Carestream"},
-  {"^1%.2%.392%.200036%.",                    "Fujifilm"},
-  {"^1%.2%.840%.113669%..*",                  "Merge Healthcare"},
-}
+    -- Walk PDV items inside this PDU
+    local ppos = 1
+    while ppos + 5 <= #pdu_data do
+      local pdv_len = string.unpack(">I4", pdu_data, ppos)
+      if pdv_len < 2 then break end
+      local pdv_pcid = string.byte(pdu_data, ppos + 4)
+      local pdv_mch  = string.byte(pdu_data, ppos + 5)
+      local pdv_frag = pdu_data:sub(ppos + 6, ppos + 3 + pdv_len)
+      ppos = ppos + 4 + pdv_len
 
--- Known toolkit signatures in Implementation Version Name (0x55).
--- Case-insensitive plain-text match against the cleaned value.
--- More-specific substrings must come before any prefix that would also match.
-local TOOLKIT_PATTERNS = {
-  {"offis",          "DCMTK"},
-  {"dcmtk",          "DCMTK"},
-  {"mergecom",       "Merge Healthcare SDK"},
-  {"dcm4che",        "dcm4che"},
-  {"pynetdicom",     "pynetdicom"},
-  {"leadtools",      "LeadTools"},
-  {"clearcanvas",    "ClearCanvas"},
-  {"orthanc",        "Orthanc"},
-  {"osirix",         "OsiriX"},
-  {"horos",          "Horos"},
-  {"conquest",       "ConQuest"},
-  {"dgate",          "ConQuest"},
-  {"fo-dicom",       "fo-dicom"},
-  {"dicomobjects",   "DICOMObjects"},  -- DicomObjects.NET default
-  {"dcmobj",         "DICOMObjects"},  -- DicomObjects.COM default ("DCMOBJw.x.y.z")
-  {"logipacs",       "LogiPACS"},
-  {"neologica",      "LogiPACS"},
-}
-
---- Check whether two canonical vendor/toolkit names refer to the same entity.
--- Handles cases like toolkit="OsiriX" vs org="OsiriX/Horos" where a substring
--- match is sufficient to declare equivalence.
-local function names_match(a, b)
-  if not a or not b then return false end
-  if a == b then return true end
-  if a:find(b, 1, true) or b:find(a, 1, true) then return true end
-  return false
+      -- PS3.8 §9.3.5.1:
+      --   Bit 0 = 1 -> command, Bit 0 = 0 -> dataset
+      --   Bit 1 = 1 -> last fragment
+      if pdv_mch and (pdv_mch & 0x01) == 0x01 then
+        cmd_bytes = cmd_bytes .. pdv_frag
+        cmd_complete = (pdv_mch & 0x02) == 0x02
+        pctx_id = pdv_pcid            -- command PDV context wins
+      else
+        dataset_bytes = dataset_bytes .. pdv_frag
+        ds_complete = (pdv_mch & 0x02) == 0x02
+        if pctx_id == nil then pctx_id = pdv_pcid end
+      end
+    end
+  end
+  return cmd_bytes, dataset_bytes, cmd_complete, ds_complete, pctx_id
 end
 
----
--- start_connection(host, port) starts socket to DICOM service
----
+-----------------------------------------------------------------------
+-- 6. DATA ELEMENT ENCODING
+-----------------------------------------------------------------------
+
+--- Encode a single DICOM element in Implicit VR Little Endian (PS3.5 §7.1.2).
+-- @param group  Group number (e.g. 0x0000, 0x0008, 0x0010)
+-- @param elem   Element number
+-- @param vr     VR string ("US", "UL", "UI", "CS", "LO", etc.)
+-- @param val    Value (number for US/UL, string otherwise)
+-- @return Encoded element bytes
+function implicit_elem(group, elem, vr, val)
+  local tag_bytes = pack_le(group, 2) .. pack_le(elem, 2)
+  local val_bytes
+  if vr == "US" then
+    val_bytes = pack_le(val, 2)
+  elseif vr == "UL" then
+    val_bytes = pack_le(val, 4)
+  elseif vr == "UI" then
+    val_bytes = tostring(val)
+    if #val_bytes % 2 ~= 0 then val_bytes = val_bytes .. "\x00" end
+  else
+    -- CS, LO, SH, DA, TM, PN, IS, etc.
+    val_bytes = tostring(val)
+    if #val_bytes % 2 ~= 0 then val_bytes = val_bytes .. " " end
+  end
+  return tag_bytes .. pack_le(#val_bytes, 4) .. val_bytes
+end
+
+--- Encode a single DICOM element in Explicit VR Little Endian (PS3.5 §7.1.1).
+-- Uses long format for OB/OD/OF/OL/OV/OW/SQ/UC/UN/UR/UT/SV/UV,
+-- short format for all other VRs.
+-- @param group  Group number
+-- @param elem   Element number
+-- @param vr     VR string (2 characters)
+-- @param val    Value (number for US/UL/SS/SL, string otherwise)
+-- @return Encoded element bytes
+function explicit_elem(group, elem, vr, val)
+  local tag_bytes = pack_le(group, 2) .. pack_le(elem, 2)
+  local val_bytes
+  if vr == "US" then
+    val_bytes = pack_le(val, 2)
+  elseif vr == "UL" then
+    val_bytes = pack_le(val, 4)
+  elseif vr == "SS" then
+    val_bytes = string.pack("<i2", val)
+  elseif vr == "SL" then
+    val_bytes = string.pack("<i4", val)
+  elseif vr == "UI" then
+    val_bytes = tostring(val)
+    if #val_bytes % 2 ~= 0 then val_bytes = val_bytes .. "\x00" end
+  else
+    val_bytes = tostring(val)
+    if #val_bytes % 2 ~= 0 then val_bytes = val_bytes .. " " end
+  end
+
+  if LONG_VRS[vr] then
+    -- Long format: tag(4) + VR(2) + reserved(2) + length(4) + value
+    return tag_bytes .. vr .. pack_le(0, 2) .. pack_le(#val_bytes, 4)
+        .. val_bytes
+  else
+    -- Short format: tag(4) + VR(2) + length(2) + value
+    return tag_bytes .. vr .. pack_le(#val_bytes, 2) .. val_bytes
+  end
+end
+
+--- Encode a single element using the specified transfer syntax.
+-- @param group           Group number
+-- @param elem            Element number
+-- @param vr              VR string
+-- @param val             Value
+-- @param transfer_syntax Transfer syntax UID (default: Explicit VR LE)
+-- @return Encoded element bytes
+function encode_element(group, elem, vr, val, transfer_syntax)
+  if transfer_syntax == TRANSFER_SYNTAX.IMPLICIT_LE then
+    return implicit_elem(group, elem, vr, val)
+  else
+    return explicit_elem(group, elem, vr, val)
+  end
+end
+
+--- Encode a dataset (list of tag definitions) using the specified TS.
+-- Each tag is {group=N, elem=N, vr="XX", value=...}.
+-- Tags are sorted by (group, elem) automatically.
+-- @param tags            List of tag tables
+-- @param transfer_syntax Transfer syntax UID (default: Explicit VR LE)
+-- @return Encoded dataset bytes
+function encode_dataset(tags, transfer_syntax)
+  transfer_syntax = transfer_syntax or TRANSFER_SYNTAX.EXPLICIT_LE
+
+  -- Sort by (group, elem) — DICOM requires ascending order
+  table.sort(tags, function(a, b)
+    if a.group == b.group then return a.elem < b.elem end
+    return a.group < b.group
+  end)
+
+  local ds = ""
+  for _, t in ipairs(tags) do
+    ds = ds .. encode_element(t.group, t.elem, t.vr, t.value, transfer_syntax)
+  end
+  return ds
+end
+
+-----------------------------------------------------------------------
+-- 7. DATA ELEMENT PARSING
+-----------------------------------------------------------------------
+
+--- Parse Implicit VR LE command set bytes into a keyed table.
+-- For group 0x0000, auto-decodes US/UL values; for others, returns raw.
+-- @param cmd_bytes  Raw command set bytes
+-- @return Table { "GGGG,EEEE" -> {group, elem, raw, value} }
+function parse_command_set(cmd_bytes)
+  local elements = {}
+  local pos = 1
+  while pos <= #cmd_bytes - 7 do
+    local group = string.unpack("<I2", cmd_bytes, pos)
+    local elem  = string.unpack("<I2", cmd_bytes, pos + 2)
+    local vlen  = string.unpack("<I4", cmd_bytes, pos + 4)
+    if pos + 7 + vlen > #cmd_bytes + 1 then break end
+    local raw   = cmd_bytes:sub(pos + 8, pos + 7 + vlen)
+    pos = pos + 8 + vlen
+
+    local key = string.format("%04X,%04X", group, elem)
+    local value = raw
+    if group == 0x0000 then
+      if vlen == 2 then
+        value = string.unpack("<I2", raw)
+      elseif vlen == 4 then
+        value = string.unpack("<I4", raw)
+      end
+    end
+    elements[key] = { group = group, elem = elem, raw = raw, value = value }
+  end
+  return elements
+end
+
+--- Parse Implicit VR LE dataset bytes into tag -> string table.
+-- @param ds_bytes  Raw dataset bytes
+-- @return Table { "GGGG,EEEE" -> cleaned_string }
+function parse_dataset_implicit(ds_bytes)
+  local elements = {}
+  local pos = 1
+  while pos <= #ds_bytes - 7 do
+    local group = string.unpack("<I2", ds_bytes, pos)
+    local elem  = string.unpack("<I2", ds_bytes, pos + 2)
+    local vlen  = string.unpack("<I4", ds_bytes, pos + 4)
+
+    -- Undefined-length sequences (0xFFFFFFFF): skip to delimitation
+    if vlen == 0xFFFFFFFF then
+      pos = pos + 8
+      local depth = 1
+      while pos <= #ds_bytes - 7 and depth > 0 do
+        local g2 = string.unpack("<I2", ds_bytes, pos)
+        local e2 = string.unpack("<I2", ds_bytes, pos + 2)
+        local l2 = string.unpack("<I4", ds_bytes, pos + 4)
+        if g2 == 0xFFFE and e2 == 0xE0DD then
+          depth = depth - 1
+          pos = pos + 8
+        elseif g2 == 0xFFFE and e2 == 0xE000 then
+          if l2 == 0xFFFFFFFF then depth = depth + 1
+          pos = pos + 8
+          else pos = pos + 8 + l2 end
+        elseif g2 == 0xFFFE and e2 == 0xE00D then
+          pos = pos + 8
+        else
+          if l2 == 0xFFFFFFFF then depth = depth + 1
+          pos = pos + 8
+          else pos = pos + 8 + l2 end
+        end
+      end
+    else
+      if pos + 7 + vlen > #ds_bytes + 1 then break end
+      local raw = ds_bytes:sub(pos + 8, pos + 7 + vlen)
+      pos = pos + 8 + vlen
+      local key = string.format("%04X,%04X", group, elem)
+      elements[key] = raw:gsub("%z", ""):gsub("%s+$", "")
+    end
+  end
+  return elements
+end
+
+--- Parse Explicit VR LE dataset bytes into tag -> string table.
+-- Handles both short-format and long-format VRs per PS3.5 §7.1.1.
+-- @param ds_bytes  Raw dataset bytes
+-- @return Table { "GGGG,EEEE" -> cleaned_string }
+function parse_dataset_explicit(ds_bytes)
+  local elements = {}
+  local pos = 1
+  while pos + 3 <= #ds_bytes do
+    local group = string.unpack("<I2", ds_bytes, pos)
+    local elem  = string.unpack("<I2", ds_bytes, pos + 2)
+
+    -- Sequence/item delimiters (group FFFE)
+    if group == 0xFFFE then
+      if elem == 0xE0DD then pos = pos + 8
+      break          -- Seq delimitation
+      elseif elem == 0xE00D then pos = pos + 8             -- Item delimitation
+      elseif elem == 0xE000 then                           -- Item
+        local l = string.unpack("<I4", ds_bytes, pos + 4)
+        if l == 0xFFFFFFFF then pos = pos + 8 else pos = pos + 8 + l end
+      else pos = pos + 8 end
+      goto continue
+    end
+
+    -- Need VR bytes
+    if pos + 5 > #ds_bytes then break end
+    local vr = ds_bytes:sub(pos + 4, pos + 5)
+
+    local vlen, data_start
+    if LONG_VRS[vr] then
+      -- Long: tag(4) + VR(2) + reserved(2) + length(4) = 12
+      if pos + 11 > #ds_bytes then break end
+      vlen = string.unpack("<I4", ds_bytes, pos + 8)
+      data_start = pos + 12
+    else
+      -- Short: tag(4) + VR(2) + length(2) = 8
+      if pos + 7 > #ds_bytes then break end
+      vlen = string.unpack("<I2", ds_bytes, pos + 6)
+      data_start = pos + 8
+    end
+
+    -- Undefined-length sequences: skip to delimitation
+    if vlen == 0xFFFFFFFF then
+      pos = data_start
+      local depth = 1
+      while pos <= #ds_bytes - 7 and depth > 0 do
+        local g2 = string.unpack("<I2", ds_bytes, pos)
+        local e2 = string.unpack("<I2", ds_bytes, pos + 2)
+        local l2 = string.unpack("<I4", ds_bytes, pos + 4)
+        if g2 == 0xFFFE and e2 == 0xE0DD then
+          depth = depth - 1
+          pos = pos + 8
+        elseif g2 == 0xFFFE and e2 == 0xE000 then
+          if l2 == 0xFFFFFFFF then depth = depth + 1
+          pos = pos + 8
+          else pos = pos + 8 + l2 end
+        elseif g2 == 0xFFFE and e2 == 0xE00D then
+          pos = pos + 8
+        else
+          if l2 == 0xFFFFFFFF then depth = depth + 1
+          pos = pos + 8
+          else pos = pos + 8 + l2 end
+        end
+      end
+    else
+      if data_start + vlen - 1 > #ds_bytes then break end
+      local raw = ds_bytes:sub(data_start, data_start + vlen - 1)
+      pos = data_start + vlen
+      local key = string.format("%04X,%04X", group, elem)
+      elements[key] = raw:gsub("%z", ""):gsub("%s+$", "")
+    end
+
+    ::continue::
+  end
+  return elements
+end
+
+--- Parse a dataset using the appropriate decoder for the transfer syntax.
+-- If the TS indicates Implicit VR LE, uses the implicit parser; otherwise
+-- uses the Explicit VR parser.  Includes a heuristic fallback: if explicit
+-- parsing is expected but the first element's VR bytes aren't valid ASCII
+-- uppercase, falls back to implicit.
+-- @param ds_bytes        Raw dataset bytes
+-- @param transfer_syntax Transfer syntax UID
+-- @return Table { "GGGG,EEEE" -> cleaned_string }
+function parse_dataset(ds_bytes, transfer_syntax)
+  if not ds_bytes or #ds_bytes == 0 then return {} end
+  if transfer_syntax == TRANSFER_SYNTAX.IMPLICIT_LE then
+    return parse_dataset_implicit(ds_bytes)
+  end
+  -- Heuristic: check if bytes 5-6 look like a valid 2-char VR
+  if #ds_bytes >= 6 then
+    local b5 = string.byte(ds_bytes, 5)
+    local b6 = string.byte(ds_bytes, 6)
+    if (b5 >= 0x41 and b5 <= 0x5A) and (b6 >= 0x41 and b6 <= 0x5A) then
+      return parse_dataset_explicit(ds_bytes)
+    else
+      stdnse.debug1("DICOM: Expected Explicit VR but VR bytes 0x%02X%02X" ..
+                    " invalid; falling back to Implicit", b5, b6)
+      return parse_dataset_implicit(ds_bytes)
+    end
+  end
+  return parse_dataset_explicit(ds_bytes)
+end
+
+-----------------------------------------------------------------------
+-- 8. DIMSE COMMAND SET BUILDERS
+-----------------------------------------------------------------------
+-- Command sets are ALWAYS encoded in Implicit VR LE (PS3.7 §6.3.1).
+
+--- Build a C-ECHO-RQ command set.
+-- @param msg_id  Message ID
+-- @return Command set bytes (Implicit VR LE)
+function build_cecho_rq(msg_id)
+  msg_id = msg_id or 1
+  local cmd = ""
+  cmd = cmd .. implicit_elem(0x0000, 0x0002, "UI", SOP_CLASS.VERIFICATION)
+  cmd = cmd .. implicit_elem(0x0000, 0x0100, "US", COMMAND_FIELD.C_ECHO_RQ)
+  cmd = cmd .. implicit_elem(0x0000, 0x0110, "US", msg_id)
+  cmd = cmd .. implicit_elem(0x0000, 0x0800, "US", DATASET_NOT_PRESENT)
+  return implicit_elem(0x0000, 0x0000, "UL", #cmd) .. cmd
+end
+
+--- Build a C-STORE-RQ command set.
+-- @param msg_id           Message ID
+-- @param sop_class_uid    Affected SOP Class UID
+-- @param sop_instance_uid Affected SOP Instance UID
+-- @param priority         Priority (default: LOW = 0x0002)
+-- @return Command set bytes (Implicit VR LE)
+function build_cstore_rq(msg_id, sop_class_uid, sop_instance_uid, priority)
+  priority = priority or 0x0002
+  local cmd = ""
+  cmd = cmd .. implicit_elem(0x0000, 0x0002, "UI", sop_class_uid)
+  cmd = cmd .. implicit_elem(0x0000, 0x0100, "US", COMMAND_FIELD.C_STORE_RQ)
+  cmd = cmd .. implicit_elem(0x0000, 0x0110, "US", msg_id)
+  cmd = cmd .. implicit_elem(0x0000, 0x0700, "US", priority)
+  cmd = cmd .. implicit_elem(0x0000, 0x0800, "US", DATASET_PRESENT)
+  cmd = cmd .. implicit_elem(0x0000, 0x1000, "UI", sop_instance_uid)
+  return implicit_elem(0x0000, 0x0000, "UL", #cmd) .. cmd
+end
+
+--- Build a C-FIND-RQ command set.
+-- @param msg_id         Message ID
+-- @param sop_class_uid  Abstract Syntax UID for the Q/R information model
+-- @param priority       Priority (default: LOW = 0x0002)
+-- @return Command set bytes (Implicit VR LE)
+function build_cfind_rq(msg_id, sop_class_uid, priority)
+  priority = priority or 0x0002
+  local cmd = ""
+  cmd = cmd .. implicit_elem(0x0000, 0x0002, "UI", sop_class_uid)
+  cmd = cmd .. implicit_elem(0x0000, 0x0100, "US", COMMAND_FIELD.C_FIND_RQ)
+  cmd = cmd .. implicit_elem(0x0000, 0x0110, "US", msg_id)
+  cmd = cmd .. implicit_elem(0x0000, 0x0700, "US", priority)
+  cmd = cmd .. implicit_elem(0x0000, 0x0800, "US", DATASET_PRESENT)
+  return implicit_elem(0x0000, 0x0000, "UL", #cmd) .. cmd
+end
+
+--- Build a C-GET-RQ command set.
+-- @param msg_id         Message ID
+-- @param sop_class_uid  Abstract Syntax UID for the Q/R information model
+-- @param priority       Priority (default: LOW = 0x0002)
+-- @return Command set bytes (Implicit VR LE)
+function build_cget_rq(msg_id, sop_class_uid, priority)
+  priority = priority or 0x0002
+  local cmd = ""
+  cmd = cmd .. implicit_elem(0x0000, 0x0002, "UI", sop_class_uid)
+  cmd = cmd .. implicit_elem(0x0000, 0x0100, "US", COMMAND_FIELD.C_GET_RQ)
+  cmd = cmd .. implicit_elem(0x0000, 0x0110, "US", msg_id)
+  cmd = cmd .. implicit_elem(0x0000, 0x0700, "US", priority)
+  cmd = cmd .. implicit_elem(0x0000, 0x0800, "US", DATASET_PRESENT)
+  return implicit_elem(0x0000, 0x0000, "UL", #cmd) .. cmd
+end
+
+--- Build a C-MOVE-RQ command set.
+-- @param msg_id          Message ID
+-- @param sop_class_uid   Abstract Syntax UID for the Q/R information model
+-- @param move_dest       Move Destination AE Title (max 16 chars,
+-- space-padded)
+-- @param priority        Priority (default: LOW = 0x0002)
+-- @return Command set bytes (Implicit VR LE)
+function build_cmove_rq(msg_id, sop_class_uid, move_dest, priority)
+  priority = priority or 0x0002
+  -- MoveDestination (0000,0600) is AE type: max 16 chars, space-padded, even
+  -- length
+  local dest = move_dest or "MOVESCP"
+  if #dest > 16 then dest = dest:sub(1, 16) end
+  -- Pad to even length with spaces (AE VR convention)
+  if #dest % 2 ~= 0 then dest = dest .. " " end
+  local cmd = ""
+  cmd = cmd .. implicit_elem(0x0000, 0x0002, "UI", sop_class_uid)
+  cmd = cmd .. implicit_elem(0x0000, 0x0100, "US", COMMAND_FIELD.C_MOVE_RQ)
+  cmd = cmd .. implicit_elem(0x0000, 0x0110, "US", msg_id)
+  cmd = cmd .. implicit_elem(0x0000, 0x0600, "AE", dest)
+  cmd = cmd .. implicit_elem(0x0000, 0x0700, "US", priority)
+  cmd = cmd .. implicit_elem(0x0000, 0x0800, "US", DATASET_PRESENT)
+  return implicit_elem(0x0000, 0x0000, "UL", #cmd) .. cmd
+end
+
+--- Build a C-STORE-RSP command set.
+-- @param msg_id_rsp     Message ID Being Responded To
+-- @param sop_class_uid  Affected SOP Class UID
+-- @param sop_inst_uid   Affected SOP Instance UID
+-- @param status_code    Status code (default: SUCCESS = 0x0000)
+-- @return Command set bytes (Implicit VR LE)
+function build_cstore_rsp(msg_id_rsp, sop_class_uid, sop_inst_uid, status_code)
+  status_code = status_code or STATUS.SUCCESS
+  local cmd = ""
+  cmd = cmd .. implicit_elem(0x0000, 0x0002, "UI", sop_class_uid)
+  cmd = cmd .. implicit_elem(0x0000, 0x0100, "US", COMMAND_FIELD.C_STORE_RSP)
+  cmd = cmd .. implicit_elem(0x0000, 0x0120, "US", msg_id_rsp)
+  cmd = cmd .. implicit_elem(0x0000, 0x0800, "US", DATASET_NOT_PRESENT)
+  cmd = cmd .. implicit_elem(0x0000, 0x0900, "US", status_code)
+  cmd = cmd .. implicit_elem(0x0000, 0x1000, "UI", sop_inst_uid)
+  return implicit_elem(0x0000, 0x0000, "UL", #cmd) .. cmd
+end
+
+--- Build a C-FIND query dataset for a given Q/R level.
+-- @param level      QR_LEVEL value ("STUDY", "SERIES", "IMAGE")
+-- @param query_tags List of {group, elem, vr, value} tag tables
+-- @param transfer_syntax  Transfer syntax for encoding (default: Explicit VR
+-- LE)
+-- @return Dataset bytes
+function build_cfind_dataset(level, query_tags, transfer_syntax)
+  -- Prepend QueryRetrieveLevel
+  local all_tags = {{group=0x0008, elem=0x0052, vr="CS", value=level}}
+  for _, t in ipairs(query_tags) do
+    if not (t.group == 0x0008 and t.elem == 0x0052) then
+      all_tags[#all_tags + 1] = t
+    end
+  end
+  return encode_dataset(all_tags, transfer_syntax)
+end
+
+--- Build a C-GET query dataset.
+-- @param level      QR_LEVEL value
+-- @param query_tags List of {group, elem, vr, value} tag tables
+-- @param transfer_syntax  Transfer syntax for encoding
+-- @return Dataset bytes
+function build_cget_dataset(level, query_tags, transfer_syntax)
+  return build_cfind_dataset(level, query_tags, transfer_syntax)
+end
+
+-----------------------------------------------------------------------
+-- 9. DIMSE RESPONSE PARSERS
+-----------------------------------------------------------------------
+
+--- Parse a C-STORE-RSP from P-DATA-TF PDU bytes.
+-- @param data  Raw PDU bytes
+-- @return status_code (int), error_comment (string)
+function parse_cstore_rsp(data)
+  local cmd_bytes = parse_pdata(data)
+  local elems = parse_command_set(cmd_bytes)
+  local status = 0xFFFF
+  local error_comment = ""
+  if elems["0000,0900"] then status = elems["0000,0900"].value end
+  if elems["0000,0902"] then
+    error_comment = tostring(elems["0000,0902"].value):gsub("%z",
+        ""):gsub("%s+$", "")
+  end
+  return status, error_comment
+end
+
+--- Parse a C-FIND-RSP from P-DATA-TF PDU bytes.
+-- @param data             Raw PDU bytes
+-- @param transfer_syntax  Transfer syntax for dataset decoding (default:
+-- Explicit VR LE)
+-- @return status (int), dataset_elements (table or nil), cmd_elements (table)
+function parse_cfind_rsp(data, transfer_syntax)
+  transfer_syntax = transfer_syntax or TRANSFER_SYNTAX.EXPLICIT_LE
+  local cmd_bytes, dataset_bytes = parse_pdata(data)
+  local cmd_elems = parse_command_set(cmd_bytes)
+
+  local status = 0xFFFF
+  if cmd_elems["0000,0900"] then
+    status = cmd_elems["0000,0900"].value
+  end
+
+  -- CommandDataSetType: 0x0101 = no dataset
+  local has_dataset = true
+  if cmd_elems["0000,0800"] then
+    has_dataset = (cmd_elems["0000,0800"].value ~= DATASET_NOT_PRESENT)
+  end
+
+  local ds_elems = nil
+  if has_dataset and #dataset_bytes > 0 then
+    ds_elems = parse_dataset(dataset_bytes, transfer_syntax)
+  end
+
+  return status, ds_elems, cmd_elems
+end
+
+-----------------------------------------------------------------------
+-- 10. NETWORK LAYER
+-----------------------------------------------------------------------
+
+--- Create a new Nmap socket with timeout.
+function new_sock(timeout_s)
+  local s = nmap.new_socket()
+  s:set_timeout((timeout_s or 10) * 1000)
+  return s
+end
+
+--- Whether DICOM-over-TLS is requested via the global "dicom.tls" script-arg.
+-- When the script-arg is unset and a port is given, Nmap's own service
+-- detection decides instead: an SSL tunnel or a dicom-tls service name from
+-- -sV means TLS.
+-- @param port (optional) Port table
+-- @return true if dicom.tls=true was supplied on the command line, or if it
+--         is unset and the port was detected as TLS
+function tls_enabled(port)
+  local arg = stdnse.get_script_args("dicom.tls")
+  if arg ~= nil or type(port) ~= "table" or not port.version then
+    return arg == "true"
+  end
+  local v = port.version
+  return v.service_tunnel == "ssl"
+      or (type(v.name) == "string" and v.name:match("tls") ~= nil)
+end
+
+--- Connect a socket.  Returns ok, err.
+-- @param sock Nmap socket
+-- @param host Host object
+-- @param port Port object (or number)
+-- @param tls  true = TLS, false = plain TCP, nil = honor the dicom.tls arg
+function tcp_connect(sock, host, port, tls)
+  if tls == nil then tls = tls_enabled() end
+  return sock:connect(host, port, tls and "ssl" or "tcp")
+end
+
+--- Fetch the peer's TLS certificate from a connected TLS socket, if any.
+-- @param sock Connected Nmap socket (TLS)
+-- @return certificate table (see nmap sslcert), or nil
+function get_cert(sock)
+  local ok, cert = pcall(function() return sock:get_ssl_certificate() end)
+  if ok then return cert end
+  return nil
+end
+
+--- Send all bytes on a socket.  Returns ok, err.
+function tcp_send(sock, data)
+  if not data or #data == 0 then return true end
+  return sock:send(data)
+end
+
+--- Receive bytes until one complete PDU is assembled.
+-- Accepts an optional carry buffer containing leftover bytes from a
+-- previous call (when multiple PDUs arrive in a single TCP segment).
+-- Returns the extracted PDU **and** any remaining bytes so the caller
+-- can feed them back into the next call.
+--
+-- @param sock      Nmap socket
+-- @param timeout_s Timeout in seconds (used for error classification)
+-- @param carry     (optional) leftover bytes from a previous recv_pdu call
+-- @return ok (bool), data_or_err (string), remaining (string – leftover bytes,
+-- empty on error)
+function recv_pdu(sock, timeout_s, carry)
+  local buf = carry or ""
+  -- If carry already contains a full PDU, extract it without reading the
+  -- socket
+  if #buf >= 6 then
+    local pdu_len = string.unpack(">I4", buf, 3)
+    if #buf >= 6 + pdu_len then
+      local pdu_data  = buf:sub(1, 6 + pdu_len)
+      local remaining = buf:sub(6 + pdu_len + 1)
+      return true, pdu_data, remaining
+    end
+  end
+  local ok, chunk
+  for _ = 1, 30 do
+    ok, chunk = sock:receive()
+    if not ok then
+      if chunk and chunk:find("TIMEOUT") then
+        return false, "TIMEOUT", ""
+      end
+      return false, "CONNECTION_RESET", ""
+    end
+    buf = buf .. chunk
+    if #buf >= 6 then
+      local pdu_len = string.unpack(">I4", buf, 3)
+      if #buf >= 6 + pdu_len then
+        local pdu_data  = buf:sub(1, 6 + pdu_len)
+        local remaining = buf:sub(6 + pdu_len + 1)
+        return true, pdu_data, remaining
+      end
+    end
+  end
+  if #buf > 0 then return true, buf, "" end
+  return false, "NO_DATA", ""
+end
+
+-----------------------------------------------------------------------
+-- 11. DIMSE MESSAGE I/O
+-----------------------------------------------------------------------
+
+--- Send a DIMSE message (command set + optional dataset) as P-DATA-TF PDU(s).
+--
+-- When both the command and dataset fit within a single PDU, they are
+-- combined into one P-DATA-TF PDU with two PDV items (matching the
+-- behaviour of DCMTK and pynetdicom).  For larger payloads, the dataset
+-- is fragmented across multiple PDUs.
+--
+-- Command sets are always Implicit VR LE.  The dataset must already be
+-- encoded in the negotiated transfer syntax before calling this function.
+--
+-- @param sock      Nmap socket
+-- @param pctx_id   Accepted presentation context ID
+-- @param cmd_bytes Command set bytes (Implicit VR LE)
+-- @param ds_bytes  Dataset bytes (already encoded in negotiated TS), or nil
+-- @param max_pdu   Max PDU size (use server's negotiated value)
+-- @return ok (bool), err (string or nil)
+function send_dimse(sock, pctx_id, cmd_bytes, ds_bytes, max_pdu)
+  max_pdu = max_pdu or MAX_PDU_DEFAULT
+  local max_frag = max_pdu - 12
+  if max_frag < 1 then max_frag = 512 end
+
+  -- Build command PDV: MCH 0x03 = command + last fragment
+  -- PS3.8 §9.3.5.1: Bit 0 = 1 → command, Bit 1 = 1 → last fragment
+  local cmd_pdv = string.pack(">I4 B B", 2 + #cmd_bytes, pctx_id, 0x03)
+      .. cmd_bytes
+
+  -- Always send command in its own P-DATA-TF PDU.
+  -- Some DICOM implementations (including certain Orthanc/DCMTK builds)
+  -- do not correctly handle multi-PDV P-DATA-TF PDUs where both the
+  -- command and dataset PDV items are combined into one PDU.  Sending
+  -- them in separate PDUs is the most compatible approach and is
+  -- explicitly allowed by PS3.8 §9.3.5.
+  local pdu1 = string.pack(">B B I4", PDU_CODES.DATA, 0x00, #cmd_pdv)
+      .. cmd_pdv
+  local ok, err = tcp_send(sock, pdu1)
+  if not ok then return false, err end
+
+  if not ds_bytes or #ds_bytes == 0 then
+    return true  -- Command-only (e.g., C-ECHO-RQ)
+  end
+
+  -- Fragment dataset across P-DATA-TF PDU(s)
+  local offset = 1
+  while offset <= #ds_bytes do
+    local chunk_end = math.min(offset + max_frag - 1, #ds_bytes)
+    local chunk   = ds_bytes:sub(offset, chunk_end)
+    local is_last = (chunk_end >= #ds_bytes)
+    local mch = is_last and 0x02
+        or 0x00 -- PS3.8: bit 0=0 → dataset, bit 1=1 → last
+    local ds_pdv  = string.pack(">I4 B B", 2 + #chunk, pctx_id, mch) .. chunk
+    local pdu = string.pack(">B B I4", PDU_CODES.DATA, 0x00, #ds_pdv) .. ds_pdv
+    ok, err = tcp_send(sock, pdu)
+    if not ok then return false, err end
+    offset = chunk_end + 1
+  end
+  return true
+end
+
+--- Receive a single DIMSE response (command + optional dataset).
+--
+-- The server may send the command and dataset in a single P-DATA-TF PDU
+-- (with two PDV items) or in separate P-DATA-TF PDUs.  This function
+-- handles both cases by checking CommandDataSetType (0000,0800) in the
+-- command set: if a dataset is expected but not yet received, it reads
+-- the next PDU to obtain it.
+--
+-- Accepts and returns a carry buffer so the caller can chain calls
+-- without losing bytes when multiple PDUs arrive in one TCP segment.
+--
+-- @param sock      Nmap socket
+-- @param timeout_s Timeout in seconds
+-- @param carry     (optional) leftover bytes from previous recv_pdu
+-- @return pdu_type (int or nil), cmd_elems (table), ds_bytes (string),
+--         raw_pdu (string), remaining (string – leftover bytes for next call),
+--         pctx_id (int or nil – presentation context the message arrived on;
+--         needed to reply on the correct context during C-GET sub-operations)
+function recv_dimse(sock, timeout_s, carry)
+  local remaining = carry or ""
+
+  -- Read first PDU (should contain at least the command set)
+  local ok, data
+  ok, data, remaining = recv_pdu(sock, timeout_s, remaining)
+  if not ok then return nil, nil, "", data, remaining, nil end
+
+  local pdu_type = string.byte(data, 1)
+  if pdu_type ~= PDU_CODES.DATA then
+    return pdu_type, nil, "", data, remaining, nil
+  end
+
+  local cmd_bytes, ds_bytes, cmd_complete, ds_complete,
+      pctx_id = parse_pdata(data)
+  local cmd_elems = {}
+  if #cmd_bytes > 0 then
+    cmd_elems = parse_command_set(cmd_bytes)
+  end
+
+  -- Check if command indicates a dataset is present
+  -- CommandDataSetType (0000,0800): 0x0101 = no dataset, anything else =
+  -- dataset present
+  local has_dataset = false
+  if cmd_elems["0000,0800"] then
+    has_dataset = (cmd_elems["0000,0800"].value ~= DATASET_NOT_PRESENT)
+  end
+
+  if has_dataset then
+    -- Read additional PDUs until we have the complete dataset.
+    -- The dataset may span many P-DATA-TF PDUs (common for images).
+    -- We stop when the last dataset PDV has MCH bit 1 set (last fragment).
+    local max_reads = 2000  -- safety limit for very large datasets
+    local reads = 0
+    while not ds_complete and reads < max_reads do
+      reads = reads + 1
+      local ok2, data2
+      ok2, data2, remaining = recv_pdu(sock, timeout_s, remaining)
+      if not ok2 then
+        stdnse.debug2("recv_dimse: dataset reassembly read error: %s",
+            tostring(data2))
+        break
+      end
+      local pdu_type2 = string.byte(data2, 1)
+      if pdu_type2 ~= PDU_CODES.DATA then
+        -- Non-DATA PDU arrived mid-dataset (e.g. A-ABORT).
+        -- Return what we have; caller gets the unexpected PDU next time via
+        -- carry.
+        -- Push data2 back into remaining so the next recv_pdu finds it.
+        remaining = data2 .. remaining
+        break
+      end
+      local extra_cmd, extra_ds, _, extra_ds_complete = parse_pdata(data2)
+      if #extra_cmd > 0 then
+        cmd_bytes = cmd_bytes .. extra_cmd
+      end
+      ds_bytes = ds_bytes .. extra_ds
+      ds_complete = extra_ds_complete
+    end
+  end
+
+  return pdu_type, cmd_elems, ds_bytes, data, remaining, pctx_id
+end
+
+-----------------------------------------------------------------------
+-- 12. CONNECTION / ASSOCIATION MANAGEMENT
+-----------------------------------------------------------------------
+
+-- ── Legacy API (backward-compatible with built-in dicom.lua) ───────
+
+--- Legacy: start_connection(host, port) — opens TCP socket.
 function start_connection(host, port)
   local dcm = {}
+  local status, err
   dcm['socket'] = nmap.new_socket()
-
-  -- Transport selection (PS3.15 §B.1 DICOM-over-TLS):
-  --   dicom.tls=true  -> force a TLS association
-  --   dicom.tls=false -> force plaintext
-  --   unset           -> adapt to Nmap's own SSL/TLS service detection
-  -- (so `-sV` on an stunnel-fronted SCP, or the dicom-tls service name, is
-  -- honoured without a script-arg).
-  local protocol = "tcp"
-  local is_ssl = false
-
-  local tls_arg = stdnse.get_script_args("dicom.tls")
-  if tls_arg == "true" then
-    is_ssl = true
-  elseif tls_arg == "false" then
-    is_ssl = false
-  else
-    if port.version and port.version.service_tunnel == "ssl" then
-      is_ssl = true
-    end
-    if port.version and type(port.version.name) == "string" and port.version.name:match("tls") then
-      is_ssl = true
-    end
-  end
-
-  if is_ssl then
-    protocol = "ssl"
-    stdnse.debug1("DICOM: Upgrading to SSL/TLS")
-  end
-
-  local ok, err = dcm['socket']:connect(host, port, protocol)
-  if ok == false then
+  local proto = tls_enabled() and "ssl" or "tcp"
+  status, err = dcm['socket']:connect(host, port, proto)
+  if status == false then
     return false, "DICOM: Failed to connect to host: " .. err
   end
-
-  local t = tonumber(stdnse.get_script_args("dicom.timeout_ms")) or 3000
-  dcm['socket']:set_timeout(t)
-
-  -- Record the negotiated transport so association helpers can report it and
-  -- fetch the peer certificate.
-  dcm['is_ssl'] = is_ssl
   return true, dcm
 end
 
----
--- send(dcm, data) Sends DICOM packet over established socket
----
+--- Legacy: send(dcm, data)
 function send(dcm, data)
-  if not dcm['socket'] then return false, "No socket found." end
-  stdnse.debug2("DICOM: Sending DICOM packet (%d bytes)", #data)
-  return dcm['socket']:send(data)
+  stdnse.debug2("DICOM: Sending DICOM packet (%d)", #data)
+  if dcm['socket'] then
+    local status, err = dcm['socket']:send(data)
+    if status == false then return false, err end
+  else
+    return false, "No socket found. Check your DICOM object"
+  end
+  return true
 end
 
----
--- receive(dcm) Reads DICOM PDUs over an established socket.
----
+--- Legacy: receive(dcm)
 function receive(dcm)
-  local sock = dcm['socket']
-  if not sock then return false, "No socket" end
-
-  local function is_timeout(err)
-    local e = tostring(err or ""):lower()
-    return e:find("timed out", 1, true) or e:find("timeout", 1, true) or e:find("time out", 1, true)
-  end
-
-  local ok1, chunk = sock:receive_bytes(6)
-  if not ok1 then
-    if is_timeout(chunk) then return false, "TIMEOUT" end
-    return false, chunk
-  end
-  if #chunk < 6 then return false, "Short PDU header" end
-
-  local header = chunk:sub(1, 6)
-  local _pdu_type, _, pdu_length = string.unpack(">B B I4", header)
-  local body = chunk:sub(7)
-  local need = pdu_length - #body
-
-  while need > 0 do
-    local ok2, more = sock:receive_bytes(need)
-    if not ok2 then
-      if is_timeout(more) then return false, "TIMEOUT" end
-      return false, more
-    end
-    -- Prevent buffer over-read if the server sends the next PDU immediately
-    body = body .. string.sub(more, 1, need)
-    need = pdu_length - #body
-  end
-
-  return true, header .. body
+  local status, data = dcm['socket']:receive()
+  if status == false then return false, data end
+  stdnse.debug1("DICOM: receive() read %d bytes", #data)
+  return true, data
 end
 
----
--- pdu_header_encode(pdu_type, length) encodes the DICOM PDU header
----
-function pdu_header_encode(pdu_type, length)
-  if type(pdu_type) ~= "number" or type(length) ~= "number" then
-    return false, "PDU Type and Length must be numbers."
+--- Legacy: associate(host, port, calling_aet, called_aet)
+function associate(host, port, calling_aet, called_aet)
+  local application_context = ""
+  local presentation_context = ""
+  local userinfo_context = ""
+
+  local status, dcm = start_connection(host, port)
+  if status == false then return false, dcm end
+
+  local application_context_name = "1.2.840.10008.3.1.1.1"
+  application_context = string.pack(">B B s2", 0x10, 0x0,
+      application_context_name)
+
+  local abstract_syntax_name = "1.2.840.10008.1.1"
+  local transfer_syntax_name = "1.2.840.10008.1.2"
+  presentation_context = string.pack(">B B I2 B B B B B B s2 B B s2",
+    0x20, 0x0, 0x2e,
+    0x1, 0x0, 0x0, 0x0,
+    0x30, 0x0, abstract_syntax_name,
+    0x40, 0x0, transfer_syntax_name)
+
+  local implementation_id = IMPL_CLASS_UID
+  local implementation_version = IMPL_VERSION
+  userinfo_context = string.pack(">B B I2 B B I2 I4 B B s2 B B s2",
+    0x50, 0x0, 0x3a,
+    0x51, 0x0, 0x04, 0x4000,
+    0x52, 0x0, implementation_id,
+    0x55, 0x0, implementation_version)
+
+  local called_ae_title = called_aet
+      or stdnse.get_script_args("dicom.called_aet") or "ANY-SCP"
+  local calling_ae_title = calling_aet
+      or stdnse.get_script_args("dicom.calling_aet") or "ECHOSCU"
+  if #called_ae_title > 16 or #calling_ae_title > 16 then
+    return false,
+        "Calling/Called Application Entity Title must be less than 16 bytes"
   end
-  local header = string.pack(">B B I4", pdu_type, 0, length)
-  return true, header
+  called_ae_title  = ("%-16s"):format(called_ae_title)
+  calling_ae_title = ("%-16s"):format(calling_ae_title)
+
+  local assoc_request = string.pack(">I2 I2 c16 c16 c32",
+    0x1, 0x0, called_ae_title, calling_ae_title, "")
+    .. application_context
+    .. presentation_context
+    .. userinfo_context
+
+  local status, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"],
+      #assoc_request)
+  if status == false then return false, header end
+
+  assoc_request = header .. assoc_request
+
+  if #assoc_request < MIN_SIZE_ASSOC_REQ then
+    return false, string.format(
+      "ASSOCIATE request PDU must be at least %d bytes and we tried to send" ..
+      " %d.",
+      MIN_SIZE_ASSOC_REQ, #assoc_request)
+  end
+  local status, err = send(dcm, assoc_request)
+  if status == false then
+    return false, string.format("Couldn't send ASSOCIATE request:%s", err)
+  end
+  status, err = receive(dcm)
+  if status == false then
+    return false, string.format("Couldn't read ASSOCIATE response:%s", err)
+  end
+
+  local resp_type, _, resp_length = string.unpack(">B B I4", err)
+  stdnse.debug1("PDU Type:%d Length:%d", resp_type, resp_length)
+  if resp_type == PDU_CODES["ASSOCIATE_ACCEPT"] then
+    stdnse.debug1("ASSOCIATE ACCEPT message found!")
+    return true, dcm
+  elseif resp_type == PDU_CODES["ASSOCIATE_REJECT"] then
+    stdnse.debug1("ASSOCIATE REJECT message found!")
+    return false, "ASSOCIATE REJECT received"
+  else
+    return false, "Received unknown response"
+  end
+end
+
+--- Legacy: send_pdata(dicom, data)
+function send_pdata(dicom, data)
+  local status, header = pdu_header_encode(PDU_CODES["DATA"], #data)
+  if status == false then return false, header end
+  local err
+  status, err = send(dicom, header .. data)
+  if status == false then return false, err end
+end
+
+-- ── New API ────────────────────────────────────────────────────────
+
+--- Perform A-ASSOCIATE-RQ and parse A-ASSOCIATE-AC.
+-- @param host           Nmap host object
+-- @param port           Nmap port object
+-- @param called_ae      Called AE Title
+-- @param calling_ae     Calling AE Title
+-- @param sop_classes    List of SOP Class UIDs to propose
+-- @param max_pdu        Max PDU length
+-- @param timeout_s      Socket timeout in seconds
+-- @param transfer_uids  Optional list of TS UIDs for presentation contexts
+-- @param roles          Optional list of {uid=,scu=,scp=} SCP/SCU role
+--                       selection requests (request scp=true on storage SOP
+--                       classes for C-GET). Accepted roles are returned in
+--                       the ac_info table (6th return value) as .roles.
+-- @param tls            If true, wrap the association in TLS (DICOM-over-TLS);
+--                       the peer certificate is returned in ac_info.cert.
+-- @return ok, sock_or_err, pctx_map, server_max_pdu, elapsed_ms, ac_info
+function do_associate(host, port, called_ae, calling_ae, sop_classes, max_pdu,
+    timeout_s, transfer_uids, roles, tls)
+  if tls == nil then tls = tls_enabled() end
+  local sock = new_sock(timeout_s)
+  local t0 = nmap.clock_ms()
+  local ok, err = tcp_connect(sock, host, port, tls)
+  if not ok then
+    sock:close()
+    return false, "CONN_REFUSED", nil, nil, nmap.clock_ms() - t0
+  end
+
+  local assoc_rq = build_assoc_rq(called_ae, calling_ae, sop_classes, max_pdu,
+      transfer_uids, roles)
+  ok, err = tcp_send(sock, assoc_rq)
+  if not ok then
+    sock:close()
+    return false, "SEND_FAILED", nil, nil, nmap.clock_ms() - t0
+  end
+
+  local resp
+  ok, resp = recv_pdu(sock, timeout_s)
+  local elapsed = nmap.clock_ms() - t0
+  if not ok then
+    sock:close()
+    return false, resp, nil, nil, elapsed
+  end
+
+  local pdu_type = string.byte(resp, 1)
+  if pdu_type == PDU_CODES.ASSOCIATE_ACCEPT then
+    local ac_info = parse_assoc_ac(resp)
+    if tls then ac_info.cert = get_cert(sock) end
+    return true, sock, ac_info.pctxs, ac_info.max_pdu, elapsed, ac_info
+  elseif pdu_type == PDU_CODES.ASSOCIATE_REJECT then
+    sock:close()
+    local result_v, source, reason = 0, 0, 0
+    if #resp >= 10 then
+      result_v = string.byte(resp, 8)
+      source   = string.byte(resp, 9)
+      reason   = string.byte(resp, 10)
+    end
+    return false,
+      string.format("REJECT(result=%d,source=%d,reason=%d)", result_v, source,
+          reason),
+      nil, nil, elapsed
+  elseif pdu_type == PDU_CODES.ABORT then
+    sock:close()
+    return false, "A-ABORT", nil, nil, elapsed
+  else
+    sock:close()
+    return false,
+      string.format("UNEXPECTED_PDU(0x%02X)", pdu_type),
+      nil, nil, elapsed
+  end
+end
+
+--- Send A-RELEASE-RQ and wait for A-RELEASE-RP (best-effort).
+function do_release(sock, timeout_s)
+  local rel_rq = string.pack(">B B I4 I4",
+    PDU_CODES.RELEASE_REQUEST, 0x00, 0x04, 0x00000000)
+  sock:set_timeout((timeout_s or 3) * 1000)
+  tcp_send(sock, rel_rq)
+  pcall(function() sock:receive() end)
+  sock:close()
+end
+
+--- Find the first accepted presentation context ID from a pctx map.
+-- @param pctxs  Table from parse_assoc_ac {pctx_id -> {accepted,
+-- transfer_syntax}}
+-- @return pctx_id (int) or nil
+function pick_accepted_pctx(pctxs)
+  local sorted = {}
+  for pid, _ in pairs(pctxs) do sorted[#sorted + 1] = pid end
+  table.sort(sorted)
+  for _, pid in ipairs(sorted) do
+    if pctxs[pid].accepted then return pid end
+  end
+  return nil
+end
+
+--- Get the negotiated transfer syntax for an accepted presentation context.
+-- @param pctxs    Table from parse_assoc_ac
+-- @param pctx_id  Presentation context ID
+-- @return Transfer syntax UID string, or nil
+function get_accepted_ts(pctxs, pctx_id)
+  if pctxs and pctx_id and pctxs[pctx_id] and pctxs[pctx_id].accepted then
+    return pctxs[pctx_id].transfer_syntax
+  end
+  return nil
+end
+
+-----------------------------------------------------------------------
+-- 13. FILE META / DATASET EXTRACTION
+-----------------------------------------------------------------------
+
+--- Extract the DICOM dataset from a raw .dcm file.
+-- Strips 128-byte preamble + "DICM" prefix and File Meta Information.
+-- @param filepath Path to .dcm file
+-- @return dataset_bytes, sop_class_uid, sop_instance_uid, transfer_syntax_uid,
+-- err
+function read_dcm_dataset(filepath)
+  local data, err = read_file(filepath)
+  if not data then
+    return nil, nil, nil, nil, err
+  end
+
+  if #data >= 132 and data:sub(129, 132) == "DICM" then
+    local pos = 133
+    local sop_class    = ""
+    local sop_instance = ""
+    local ts_uid       = TRANSFER_SYNTAX.EXPLICIT_LE
+
+    -- Parse File Meta Information (always Explicit VR LE, group 0002).
+    -- A 5th return value carries a diagnostic string when the meta cannot be
+    -- walked cleanly (e.g. a corrupt VR); callers treat empty SOP UIDs as
+    -- "meta unparseable" rather than as a deliberate empty-UID test.
+    while pos <= #data - 8 do
+      local grp  = string.unpack("<I2", data, pos)
+      if grp ~= 0x0002 then
+        -- Clean end of File Meta: the main dataset starts here.
+        return data:sub(pos), sop_class, sop_instance, ts_uid
+      end
+      local elem = string.unpack("<I2", data, pos + 2)
+      local vr   = data:sub(pos + 4, pos + 5)
+
+      -- A File Meta element whose VR is not a real DICOM VR means the
+      -- Explicit-VR framing is corrupt. Continuing would misread the length
+      -- field, misalign, and silently drop the SOP Class/Instance UIDs (and
+      -- split the dataset at the wrong offset). Stop and report instead.
+      if not KNOWN_VRS[vr] then
+        local b1, b2 = vr:byte(1, 2)
+        local detail = string.format(
+          "File Meta (%04X,%04X) has invalid VR 0x%02X%02X at offset %d"
+          .. " -- meta parsing stopped", grp, elem, b1 or 0, b2 or 0, pos)
+        stdnse.debug1("read_dcm_dataset: %s", detail)
+        return data:sub(pos), sop_class, sop_instance, ts_uid, detail
+      end
+
+      local vlen, next_pos
+      if LONG_VRS[vr] then
+        vlen     = string.unpack("<I4", data, pos + 8)
+        next_pos = pos + 12 + vlen
+      else
+        vlen     = string.unpack("<I2", data, pos + 6)
+        next_pos = pos + 8 + vlen
+      end
+
+      -- A length that does not advance, or that overruns the buffer, is also
+      -- a corrupt-framing signal; stop rather than loop or read out of bounds.
+      if next_pos <= pos or next_pos > #data + 1 then
+        local detail = string.format(
+          "File Meta (%04X,%04X) length %d overruns buffer at offset %d"
+          .. " -- meta parsing stopped", grp, elem, vlen, pos)
+        stdnse.debug1("read_dcm_dataset: %s", detail)
+        return data:sub(pos), sop_class, sop_instance, ts_uid, detail
+      end
+
+      local val = data:sub(next_pos - vlen, next_pos - 1)
+      if elem == 0x0002 then
+        sop_class = val:gsub("%z", ""):gsub("%s+$", "")
+      elseif elem == 0x0003 then
+        sop_instance = val:gsub("%z", ""):gsub("%s+$", "")
+      elseif elem == 0x0010 then
+        ts_uid = val:gsub("%z", ""):gsub("%s+$", "")
+      end
+      pos = next_pos
+    end
+    return data:sub(pos), sop_class, sop_instance, ts_uid
+  else
+    stdnse.debug2("No DICM magic in %s — sending raw file as dataset",
+        filepath)
+    return data, SOP_CLASS.CT_IMAGE_STORAGE, generate_fake_uid(),
+        TRANSFER_SYNTAX.EXPLICIT_LE
+  end
+end
+
+--- Read a .dcm file and return its bytes VERBATIM for faithful fuzzing.
+--
+-- Unlike read_dcm_dataset (which strips the Part-10 preamble + File Meta and
+-- returns only the main dataset), this returns the file exactly as stored, so
+-- structure-, meta- and dataset-level mutations all reach the target on the
+-- wire. It still parses the File Meta best-effort to recover a SOP Class,
+-- SOP Instance and transfer syntax for the C-STORE command set and the
+-- A-ASSOCIATE negotiation; those come back empty / default when the meta is
+-- corrupt (the caller substitutes safe values).
+--
+-- @param filepath       path to the .dcm file.
+-- @param after_preamble if true, drop the 128-byte preamble and the "DICM"
+--                       magic, returning File Meta + dataset; otherwise the
+--                       whole file (default).
+-- @return raw_bytes (string or nil), sop_class, sop_instance, ts_uid,
+--         meta_note (diagnostic string when the File Meta was unparseable,
+--         else nil) or, on read failure, nil + error in the 5th slot.
+function read_dcm_raw(filepath, after_preamble)
+  local data, err = read_file(filepath)
+  if not data then
+    return nil, nil, nil, nil, err
+  end
+  -- Best-effort UID/TS discovery (reuses the hardened meta walk).
+  local _, sop_class, sop_instance, ts_uid, meta_note =
+    read_dcm_dataset(filepath)
+  local payload = data
+  if after_preamble and #data >= 132 and data:sub(129, 132) == "DICM" then
+    payload = data:sub(133)
+  end
+  return payload, sop_class, sop_instance, ts_uid, meta_note
+end
+
+-----------------------------------------------------------------------
+-- 14. PRESENTATION CONTEXT NEGOTIATION
+-----------------------------------------------------------------------
+
+local DEFAULT_TIMEOUT_MS   = 3000
+-- Presentation context IDs are odd integers 1-255 (PS3.8 section 9.3.2.2),
+-- so one A-ASSOCIATE-RQ can carry at most 128. Some real SCPs (older DCMTK
+-- builds, GE, embedded modality stacks) refuse far smaller RQ PDUs, so
+-- proposals are split well below that ceiling by default.
+local MAX_PCS_PER_RQ       = 128
+local DEFAULT_MAX_PCS      = 64
+local DEFAULT_MAX_RQ_BYTES = 16384
+local DEFAULT_RETRIES      = 2
+local DEFAULT_BACKOFF_MS   = 2000
+-- Pause before each follow-up association of a split proposal. SCPs can
+-- free a pool slot a moment after sending A-RELEASE-RP (pynetdicom with a
+-- one-slot pool rejected 4 of 10 immediate re-associations), so starting
+-- the next one at once can draw a local-limit-exceeded reject.
+local BATCH_GAP_MS         = 250
+
+-- A-ABORT source and reason/diag values (PS3.8 section 9.3.8). The reason
+-- is only significant when the source is the UL service-provider.
+local ABORT_SOURCE_USER           = 0
+local ABORT_SOURCE_PROVIDER       = 2
+local ABORT_REASON_NOT_SPECIFIED  = 0
+local ABORT_REASON_UNEXPECTED_PDU = 2
+
+local function nonempty(s)
+  if s == "" then return nil end
+  return s
+end
+
+-- Open the transport for one association, honoring dicom.tls and -sV.
+local function connect(host, port)
+  local tls = tls_enabled(port)
+  local timeout = math.floor(tonumber(stdnse.get_script_args("dicom.timeout_ms"))
+      or DEFAULT_TIMEOUT_MS)
+  local sock = nmap.new_socket()
+  sock:set_timeout(timeout)
+  local ok, err = tcp_connect(sock, host, port, tls)
+  if not ok then
+    sock:close()
+    return false, "DICOM: Failed to connect to host: " .. tostring(err)
+  end
+  if tls then stdnse.debug1("DICOM: Using DICOM-over-TLS") end
+  return true, { sock = sock, tls = tls, carry = "" }
+end
+
+local function recv(conn)
+  local ok, data, remaining = recv_pdu(conn.sock, nil, conn.carry)
+  conn.carry = remaining or ""
+  return ok, data
 end
 
 -- Close the transport once; repeat calls are no-ops so error paths can tear
 -- down unconditionally.
-local function close(dcm)
-  if dcm['socket'] and not dcm['closed'] then
-    dcm['closed'] = true
-    dcm['socket']:close()
+local function close(conn)
+  if not conn.closed then
+    conn.closed = true
+    conn.sock:close()
   end
 end
 
----
--- abort(dcm, source, reason) sends an A-ABORT PDU (PS3.8 §9.3.8) and closes
--- the transport. Used on every error path once the A-ASSOCIATE-RQ is out, so
--- the SCP frees the association slot immediately instead of holding it until
--- its own ARTIM or idle timer fires. Best-effort: send errors are ignored.
--- @param source 0 = DICOM UL service-user (default), 2 = UL service-provider
--- @param reason Reason/diag, significant only when source is 2. Default: 0
----
-function abort(dcm, source, reason)
-  if not dcm or not dcm['socket'] or dcm['closed'] then return end
+-- Send A-ABORT and close. Used on every error path once the A-ASSOCIATE-RQ
+-- is out, so the SCP frees the association slot immediately instead of
+-- holding it until its own ARTIM or idle timer fires. Best-effort: send
+-- errors are ignored.
+local function abort(conn, source, reason)
+  if conn.closed then return end
   source = source or ABORT_SOURCE_USER
   reason = reason or ABORT_REASON_NOT_SPECIFIED
-  local _, header = pdu_header_encode(PDU_CODES["ABORT"], 4)
   stdnse.debug1("DICOM: Sending A-ABORT (source=%d, reason=%d)", source, reason)
-  send(dcm, header .. string.pack(">B B B B", 0, 0, source, reason))
-  close(dcm)
+  tcp_send(conn.sock, string.pack(">B B I4 B B B B",
+      PDU_CODES.ABORT, 0, 4, 0, 0, source, reason))
+  close(conn)
 end
-
--- ==================== Parse Sub-Routines ====================
-
----
--- parse_associate_accept(data) walks an A-ASSOCIATE-AC PDU and returns:
---   {
---     pc_results   = { [pc_id] = {result = N, accepted_ts = uid_or_nil} },
---     max_pdu      = number_or_nil,
---     impl_uid     = string_or_nil,        -- 0x52
---     impl_version = string_or_nil,        -- 0x55
---   }
--- Item structure follows PS3.8 §9.3.3.
-function parse_associate_accept(data)
-  local out = { pc_results = {}, max_pdu = nil, impl_uid = nil, impl_version = nil }
-  local data_len = #data
-  if data_len < AC_VARIABLE_ITEM_OFFSET - 1 then return out end
-
-  local offset = AC_VARIABLE_ITEM_OFFSET
-
-  while offset + 3 <= data_len do
-    local item_type = string.byte(data, offset)
-    local item_len  = string.unpack(">I2", data, offset + 2)
-    local val_start = offset + 4
-    local val_end   = offset + 3 + item_len
-    if val_end > data_len then break end
-
-    if item_type == ITEM_PC_AC and item_len >= 4 then
-      -- Presentation Context AC item
-      local pc_id     = string.byte(data, val_start)
-      local pc_result = string.byte(data, val_start + 2)
-      local entry     = { result = pc_result, accepted_ts = nil }
-
-      -- PS3.8 §9.3.3.2 Table 9-18: when result ≠ 0, the Transfer Syntax
-      -- sub-item value "shall not be tested when received". Skip it.
-      if pc_result == 0 then
-        local sub = val_start + 4
-        while sub + 3 <= val_end do
-          local stype = string.byte(data, sub)
-          local slen  = string.unpack(">I2", data, sub + 2)
-          local svs   = sub + 4
-          local sve   = sub + 3 + slen
-          if sve > val_end then break end
-          if stype == ITEM_TRANSFER_SYNTAX and slen > 0 then
-            local raw = data:sub(svs, sve)
-            entry.accepted_ts = (raw:gsub("%z", "")):match("^%s*(.-)%s*$")
-          end
-          sub = sub + 4 + slen
-        end
-      end
-
-      out.pc_results[pc_id] = entry
-
-    elseif item_type == ITEM_USER_INFORMATION then
-      -- User Information item
-      local sub = val_start
-      while sub + 3 <= val_end do
-        local stype = string.byte(data, sub)
-        local slen  = string.unpack(">I2", data, sub + 2)
-        local svs   = sub + 4
-        local sve   = sub + 3 + slen
-        if sve > val_end then break end
-
-        if stype == SUBITEM_MAX_PDU and slen >= 4 then
-          out.max_pdu = string.unpack(">I4", data, svs)
-        elseif stype == SUBITEM_IMPL_CLASS_UID and slen > 0 then
-          local raw = data:sub(svs, sve)
-          out.impl_uid = (raw:gsub("%z", "")):match("^%s*(.-)%s*$")
-        elseif stype == SUBITEM_IMPL_VERSION and slen > 0 then
-          local raw = data:sub(svs, sve)
-          out.impl_version = (raw:gsub("%z", "")):match("^%s*(.-)%s*$")
-        end
-
-        sub = sub + 4 + slen
-      end
-    end
-
-    offset = offset + 4 + item_len
-  end
-
-  return out
-end
-
-function parse_implementation_version(data)
-  local version, uid = nil, nil
-  local data_len = #data
-
-  if data_len < AC_VARIABLE_ITEM_OFFSET - 1 then
-    return nil, nil
-  end
-
-  local offset = AC_VARIABLE_ITEM_OFFSET
-  local userinfo_start = nil
-
-  -- Walk the TLV structure to find User Information item (0x50)
-  while offset + 3 <= data_len do
-    local item_type = string.byte(data, offset)
-    local item_len  = string.unpack(">I2", data, offset + 2)
-
-    if item_type == ITEM_USER_INFORMATION then
-      userinfo_start = offset
-      break
-    end
-    offset = offset + 4 + item_len
-  end
-
-  if not userinfo_start then
-      stdnse.debug2("User Information item (0x50) not found during TLV walk.")
-      return nil, nil
-  end
-
-  if userinfo_start + 3 > data_len then return nil, nil end
-
-  local userinfo_len = string.unpack(">I2", data, userinfo_start + 2)
-  local sub_offset = userinfo_start + 4
-  local effective_end = math.min(userinfo_start + 3 + userinfo_len, data_len)
-
-  -- Walk sub-items inside User Info
-  while sub_offset + 3 <= effective_end do
-    local sub_type = string.byte(data, sub_offset)
-    local sub_len  = string.unpack(">I2", data, sub_offset + 2)
-    local sub_value_start = sub_offset + 4
-    local sub_value_end   = sub_offset + 3 + sub_len
-
-    if sub_value_end <= effective_end and sub_len > 0 then
-      local value_raw = data:sub(sub_value_start, sub_value_end)
-      local value_cleaned = value_raw:gsub("%z", ""):match("^%s*(.-)%s*$")
-
-      if sub_type == SUBITEM_IMPL_CLASS_UID and not uid then
-          uid = value_cleaned
-      elseif sub_type == SUBITEM_IMPL_VERSION and not version then
-          version = value_cleaned
-      end
-    end
-
-    sub_offset = sub_offset + 4 + sub_len
-  end
-
-  return version, uid
-end
-
----
--- Identify the Implementation Class UID (0x52) against both UID tables.
--- Returns: name, category ("toolkit" or "manufacturer", or nil if no match)
---
-function identify_vendor_from_uid(uid)
-  if not uid then return nil, nil end
-  uid = uid:gsub("%z", ""):match("^%s*(.-)%s*$")
-
-  for _, entry in ipairs(TOOLKIT_UID_PATTERNS) do
-    if uid:match(entry[1]) then
-      stdnse.debug1("DICOM: 0x52 UID -> toolkit: %s", entry[2])
-      return entry[2], "toolkit"
-    end
-  end
-
-  for _, entry in ipairs(MANUFACTURER_UID_PATTERNS) do
-    if uid:match(entry[1]) then
-      stdnse.debug1("DICOM: 0x52 UID -> manufacturer: %s", entry[2])
-      return entry[2], "manufacturer"
-    end
-  end
-
-  stdnse.debug1("DICOM: 0x52 UID unrecognized: %s", uid)
-  return nil, nil
-end
-
----
--- Identify the toolkit from the Implementation Version Name (0x55).
--- Returns a canonical toolkit name, or nil if unrecognized.
---
-function identify_toolkit(version_str)
-  if not version_str then return nil end
-  local s = version_str:gsub("%z", ""):match("^%s*(.-)%s*$")
-  if s == "" then return nil end
-  local low = s:lower()
-  for _, entry in ipairs(TOOLKIT_PATTERNS) do
-    if low:find(entry[1], 1, true) then
-      stdnse.debug1("DICOM: 0x55 -> toolkit: %s (from: %s)", entry[2], s)
-      return entry[2]
-    end
-  end
-  stdnse.debug1("DICOM: 0x55 unrecognized: %s", s)
-  return nil
-end
-
-function extract_clean_version(version_str, vendor)
-  if not version_str then return nil end
-  local s = version_str:gsub("%z", ""):match("^%s*(.-)%s*$")
-  if s == "" then return nil end
-  local v = vendor and vendor:lower() or nil
-
-  if v == "dcmtk" or s:find("DCMTK", 1, true) or s:find("OFFIS", 1, true) then
-    local a,b,c = s:match("[Oo][Ff][Ff][Ii][Ss].-[Dd][Cc][Mm][Tt][Kk].-[ _-]?(%d)%.?(%d)%.?(%d)")
-    if a and b and c then return string.format("%s.%s.%s", a,b,c) end
-
-    a,b,c = s:match("[Dd][Cc][Mm][Tt][Kk][ _-]?(%d)%.?(%d)%.?(%d)")
-    if a and b and c then return string.format("%s.%s.%s", a,b,c) end
-
-    local sem = s:match("[Dd][Cc][Mm][Tt][Kk][%s_/-]*([%d]+%.%d+%.%d+)")
-             or s:match("[Oo][Ff][Ff][Ii][Ss].-[Dd][Cc][Mm][Tt][Kk][%s_/-]*([%d]+%.%d+%.%d+)")
-    if sem then return sem end
-  end
-
-  if v == "pynetdicom" or s:find("PYNETDICOM") or s:lower():find("pynetdicom") then
-    -- Modern pynetdicom (>= 2.x) emits PYNETDICOM_<MAJ>.<MIN>.<PATCH> with
-    -- dot separators, e.g. PYNETDICOM_3.0.4. Older forms used underscore-
-    -- joined three-digit shorthand (PYNETDICOM_300) which is unambiguous
-    -- only for single-digit components and is no longer attempted.
-    local sem = s:match("[Pp][Yy][Nn][Ee][Tt][Dd][Ii][Cc][Oo][Mm][%s_/:-]+([%d]+%.%d+%.%d+)")
-             or s:match("[Pp][Yy][Nn][Ee][Tt][Dd][Ii][Cc][Oo][Mm][%s_/:-]+([%d]+%.%d+)")
-    if sem then return sem end
-  end
-
-  if v == "dcm4che" or s:lower():find("dcm4che") then
-    local sem = s:match("dcm4che[%w-]*[%s/:-]+([%d]+%.%d+%.%d+)")
-    if sem then return sem end
-  end
-
-  if v == "orthanc" or s:lower():find("orthanc") then
-    local sem = s:match("[Oo]rthanc[%s%-/]*[vV]?([%d]+%.%d+%.%d+)")
-             or s:match("[Oo]rthanc[%s%-/]*[vV]?([%d]+%.%d+)")
-    if sem then return sem end
-  end
-
-  if v == "osirix" or v == "horos" or s:lower():find("osirix") or s:lower():find("horos") then
-    local sem = s:match("[vV]([%d]+%.%d+%.%d+)")
-    if sem then return sem end
-  end
-
-  if v == "clearcanvas" or s:find("ClearCanvas") then
-    local maj, min, build = s:match("ClearCanvas[_-](%d+)%.(%d+)%.(%d+)")
-    if maj and min and build then return string.format("%s.%s.%s", maj, min, build) end
-
-    maj, min = s:match("ClearCanvas[_-](%d+)%.(%d+)")
-    if maj and min then return string.format("%s.%s", maj, min) end
-  end
-
-  -- fo-dicom emits "fo-dicom <Major>.<Minor>.<Build>" per
-  -- FO-DICOM.Core/DicomImplementation.cs (GetImplementationVersion()).
-  if v == "fo-dicom" or s:lower():find("fo-dicom", 1, true) then
-    local sem = s:match("[Ff][Oo]%-[Dd][Ii][Cc][Oo][Mm][%s_/:-]+([%d]+%.%d+%.%d+)")
-             or s:match("[Ff][Oo]%-[Dd][Ii][Cc][Oo][Mm][%s_/:-]+([%d]+%.%d+)")
-    if sem then return sem end
-  end
-
-  -- DicomObjects.COM default Implementation Version Name is "DCMOBJw.x.y.z"
-  -- per Medical Connections KB. The .NET variant emits "DicomObjects.NET"
-  -- with no embedded version, so version stays nil there.
-  if v == "dicomobjects" or s:lower():find("dcmobj", 1, true) then
-    local sem = s:match("[Dd][Cc][Mm][Oo][Bb][Jj][%s_/:-]*(%d+%.%d+%.%d+%.%d+)")
-             or s:match("[Dd][Cc][Mm][Oo][Bb][Jj][%s_/:-]*(%d+%.%d+%.%d+)")
-             or s:match("[Dd][Cc][Mm][Oo][Bb][Jj][%s_/:-]*(%d+%.%d+)")
-    if sem then return sem end
-  end
-
-  -- Generic fallbacks
-  local sem = s:match("(%d+%.%d+%.%d+)")
-  if sem then return sem end
-  sem = s:match("(%d+%.%d+)")
-  if sem then return sem end
-
-  return s
-end
-
--- ============================================================
-
----
--- resolve_vendor_info(received_version_str, received_uid_str)
--- Maps the raw 0x55 / 0x52 strings to (final_version, parsed_vendor,
--- parsed_clean_version, device_vendor, impl_version_name) using the
--- toolkit-first resolution policy. Shared by associate() and dicom-enum.
-function resolve_vendor_info(received_version_str, received_uid_str)
-  local impl_version_name = received_version_str
-
-  local toolkit_name = identify_toolkit(received_version_str)
-  local uid_name, uid_category = identify_vendor_from_uid(received_uid_str)
-
-  local parsed_vendor, parsed_clean_version, device_vendor = nil, nil, nil
-
-  if toolkit_name then
-    parsed_vendor = toolkit_name
-    parsed_clean_version = extract_clean_version(received_version_str, toolkit_name)
-    stdnse.debug1("DICOM: Vendor from 0x55: %s", toolkit_name)
-
-    if uid_name then
-      if uid_category == "manufacturer" then
-        device_vendor = uid_name
-        stdnse.debug1("DICOM: Device manufacturer from 0x52: %s", uid_name)
-      elseif uid_category == "toolkit" and not names_match(uid_name, toolkit_name) then
-        stdnse.debug1("DICOM: 0x52 toolkit (%s) differs from 0x55 (%s) — using 0x55", uid_name, toolkit_name)
-      end
-    end
-
-  elseif uid_name and uid_category == "toolkit" then
-    parsed_vendor = uid_name
-    stdnse.debug1("DICOM: Vendor from 0x52 toolkit: %s", uid_name)
-    if received_version_str then
-      parsed_clean_version = extract_clean_version(received_version_str, uid_name)
-    end
-
-  elseif uid_name and uid_category == "manufacturer" then
-    device_vendor = uid_name
-    stdnse.debug1("DICOM: 0x52 manufacturer (%s), no toolkit from 0x55", uid_name)
-    if received_version_str then
-      parsed_clean_version = extract_clean_version(received_version_str, nil)
-    end
-
-  elseif received_version_str then
-    local v = received_version_str:lower()
-    if     v:find("dcm4che",   1, true) then parsed_vendor = "dcm4che"
-    elseif v:find("dcmtk",     1, true) then parsed_vendor = "DCMTK"
-    elseif v:find("pynetdicom",1, true) then parsed_vendor = "pynetdicom"
-    elseif v:find("orthanc",   1, true) then parsed_vendor = "Orthanc"
-    end
-    if parsed_vendor then
-      stdnse.debug1("DICOM: Vendor from 0x55 fallback: %s", parsed_vendor)
-    else
-      stdnse.debug1("DICOM: No vendor. 0x55=%s, 0x52=%s",
-        tostring(received_version_str), tostring(received_uid_str))
-    end
-    parsed_clean_version = extract_clean_version(received_version_str, parsed_vendor)
-  else
-    stdnse.debug1("DICOM: No identification data (0x55 and 0x52 both empty)")
-  end
-
-  local final_version = parsed_clean_version or impl_version_name
-  return final_version, parsed_vendor, parsed_clean_version, device_vendor, impl_version_name
-end
-
--- ==================== Association ====================
 
 -- Close an accepted association with A-RELEASE-RQ and wait for A-RELEASE-RP
--- (PS3.8 §9.1, §9.3.6). Skipping the release makes SCPs log an abort, which
--- fires abort-rate alerts in clinical environments. If the RP never arrives
--- (timeout, stray PDU), fall back to A-ABORT rather than leaving the
--- association half-released on the SCP.
-local function release(dcm)
-  local _, header = pdu_header_encode(PDU_CODES["RELEASE_REQUEST"], 4)
-  local ok, resp = send(dcm, header .. "\0\0\0\0")
+-- (PS3.8 sections 9.1, 9.3.6). Skipping the release makes SCPs log an
+-- abort, which fires abort-rate alerts in clinical environments. If the RP
+-- never arrives (timeout, stray PDU), fall back to A-ABORT rather than
+-- leaving the association half-released on the SCP.
+local function release(conn)
+  local ok, resp = tcp_send(conn.sock, string.pack(">B B I4 I4",
+      PDU_CODES.RELEASE_REQUEST, 0, 4, 0))
   if ok then
-    ok, resp = receive(dcm)
+    ok, resp = recv(conn)
   end
   local resp_type = ok and string.byte(resp, 1) or nil
-  if resp_type == PDU_CODES["RELEASE_RESPONSE"] or resp_type == PDU_CODES["ABORT"] then
-    close(dcm)
+  if resp_type == PDU_CODES.RELEASE_RESPONSE or resp_type == PDU_CODES.ABORT then
+    close(conn)
   else
     stdnse.debug1("DICOM: No A-RELEASE-RP (%s); aborting",
-      ok and ("got PDU type " .. tostring(resp_type)) or tostring(resp))
-    abort(dcm)
+        ok and ("got PDU type " .. tostring(resp_type)) or tostring(resp))
+    abort(conn)
   end
+end
+
+-- Decode an A-ASSOCIATE-RJ PDU (PS3.8 Table 9-21). The body bytes after the
+-- 6-byte PDU header are: reserved, result, source, reason/diag.
+local function decode_reject(pdu)
+  local result, source, reason
+  if #pdu >= 10 then
+    result, source, reason = string.byte(pdu, 8, 10)
+  end
+  return {
+    err         = "ASSOCIATE REJECT received",
+    result      = result,
+    source      = source,
+    reason      = reason,
+    result_text = result and ASSOC_RJ_RESULT[result],
+    source_text = source and ASSOC_RJ_SOURCE[source],
+    reason_text = source and ASSOC_RJ_REASON[source]
+        and ASSOC_RJ_REASON[source][reason],
+  }
 end
 
 -- Run one association over a connected transport: send the A-ASSOCIATE-RQ,
 -- read the reply, then release. Every exit either ends cleanly (release
 -- completed, or the SCP already ended it with A-ASSOCIATE-RJ / A-ABORT) or
 -- sends A-ABORT. On accept returns true, nil, results, info where
--- results[k] is the outcome of presentation_contexts[k].
-local function negotiate(dcm, calling_aet, called_aet, presentation_contexts)
-  local pc_blocks = {}
-  for k, pc in ipairs(presentation_contexts) do
-    -- odd IDs per PS3.8 §9.3.2.2
-    pc_blocks[k] = item_presentation_context(2 * k - 1, pc.abstract_syntax, pc.transfer_syntaxes)
+-- results[k] is the outcome of pcs[k].
+local function negotiate(conn, calling_aet, called_aet, pcs)
+  local ok, err = tcp_send(conn.sock,
+      build_assoc_rq(called_aet, calling_aet, pcs, MAX_PDU_DEFAULT))
+  if not ok then
+    abort(conn)
+    return false, "Couldn't send ASSOCIATE request: " .. tostring(err)
   end
 
-  local fixed = string.pack(">I2 I2 c16 c16 c32",
-    0x0001, 0x0000, pad16(called_aet or "ANY-SCP"), pad16(calling_aet or "ECHOSCU"), string.rep("\0", 32))
-  local assoc_body = fixed .. item_application_context(APPLICATION_CONTEXT_NAME)
-    .. table.concat(pc_blocks)
-    .. item_user_information(IMPLEMENTATION_CLASS_UID, IMPLEMENTATION_VERSION_NAME, MAX_PDU_LEN)
-  local _, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"], #assoc_body)
-
-  local send_status, send_err = send(dcm, header .. assoc_body)
-  if not send_status then
-    abort(dcm)
-    return false, string.format("Couldn't send ASSOCIATE request: %s", send_err or "Unknown error")
-  end
-
-  local receive_status, response_data = receive(dcm)
-  if not receive_status then
+  local resp
+  ok, resp = recv(conn)
+  if not ok then
     -- Timeout or short read: the SCP may still hold a half-open association.
-    abort(dcm)
-    return false, string.format("Couldn't read ASSOCIATE response: %s", response_data)
+    abort(conn)
+    return false, "Couldn't read ASSOCIATE response: " .. tostring(resp)
   end
 
-  local resp_type = string.byte(response_data, 1)
-  if resp_type == PDU_CODES["ASSOCIATE_REJECT"] then
+  local resp_type = string.byte(resp, 1)
+  if resp_type == PDU_CODES.ASSOCIATE_REJECT then
     -- The SCP closes the transport after A-ASSOCIATE-RJ; nothing to abort.
-    close(dcm)
-    -- PS3.8 §9.3.4 Table 9-21: A-ASSOCIATE-RJ body bytes after the 6-byte
-    -- PDU header are: reserved, result, source, reason/diag.
-    local result, source, reason
-    if #response_data >= 10 then
-      result = string.byte(response_data, 8)
-      source = string.byte(response_data, 9)
-      reason = string.byte(response_data, 10)
-    end
-    return false, {
-      err         = "ASSOCIATE REJECT received",
-      result      = result,
-      source      = source,
-      reason      = reason,
-      result_text = result and ASSOC_RJ_RESULT[result] or nil,
-      source_text = source and ASSOC_RJ_SOURCE[source] or nil,
-      reason_text = (source and ASSOC_RJ_REASON[source] and reason)
-                    and ASSOC_RJ_REASON[source][reason] or nil,
-    }
-  elseif resp_type == PDU_CODES["ABORT"] then
-    close(dcm)
+    close(conn)
+    return false, decode_reject(resp)
+  elseif resp_type == PDU_CODES.ABORT then
+    close(conn)
     return false, string.format("Received A-ABORT (source=%s, reason=%s)",
-      tostring(string.byte(response_data, 9)), tostring(string.byte(response_data, 10)))
-  elseif resp_type ~= PDU_CODES["ASSOCIATE_ACCEPT"] then
-    abort(dcm, ABORT_SOURCE_PROVIDER, ABORT_REASON_UNEXPECTED_PDU)
+        tostring(string.byte(resp, 9)), tostring(string.byte(resp, 10)))
+  elseif resp_type ~= PDU_CODES.ASSOCIATE_ACCEPT then
+    abort(conn, ABORT_SOURCE_PROVIDER, ABORT_REASON_UNEXPECTED_PDU)
     return false, "Received unexpected response PDU type: " .. tostring(resp_type)
   end
 
-  local parsed = parse_associate_accept(response_data)
-
-  -- On a TLS association, grab the peer certificate before we close the
-  -- socket so the caller can report issuer/validity/key-strength. Best-effort:
-  -- a stack without get_ssl_certificate just yields a nil cert.
-  local peer_cert
-  if dcm['is_ssl'] then
-    local okc, cert = pcall(function() return dcm['socket']:get_ssl_certificate() end)
-    if okc then peer_cert = cert end
-  end
+  local ac = parse_assoc_ac(resp)
+  -- Grab the peer certificate before the socket closes.
+  local cert = conn.tls and get_cert(conn.sock) or nil
 
   if stdnse.get_script_args("dicom.no_release") ~= nil then
-    abort(dcm)
+    abort(conn)
   else
-    release(dcm)
+    release(conn)
   end
 
   local results = {}
-  for k in ipairs(presentation_contexts) do
+  for k in ipairs(pcs) do
     local pc_id = 2 * k - 1
-    local raw   = parsed.pc_results[pc_id] or {}
-    results[k] = { pc_id = pc_id, result = raw.result, accepted_ts = raw.accepted_ts }
+    local pc = ac.pctxs[pc_id] or {}
+    results[k] = {
+      pc_id       = pc_id,
+      result      = pc.result,
+      accepted_ts = pc.accepted and nonempty(pc.transfer_syntax) or nil,
+    }
   end
-
   return true, nil, results, {
-    max_pdu      = parsed.max_pdu,
-    impl_uid     = parsed.impl_uid,
-    impl_version = parsed.impl_version,
-    tls          = dcm['is_ssl'] or false,
-    cert         = peer_cert,
+    max_pdu      = ac.max_pdu,
+    impl_uid     = nonempty(ac.impl_class_uid),
+    impl_version = nonempty(ac.impl_version),
+    tls          = conn.tls,
+    cert         = cert,
   }
 end
 
@@ -1170,13 +1951,13 @@ end
 -- tripped by a malformed A-ASSOCIATE-AC) still sends A-ABORT before it
 -- propagates.
 local function associate_once(host, port, calling_aet, called_aet, pcs)
-  local status, dcm = start_connection(host, port)
+  local status, conn = connect(host, port)
   if not status then
-    return false, dcm
+    return false, conn
   end
-  local r = table.pack(pcall(negotiate, dcm, calling_aet, called_aet, pcs))
+  local r = table.pack(pcall(negotiate, conn, calling_aet, called_aet, pcs))
   if not r[1] then
-    abort(dcm)
+    abort(conn)
     error(r[2], 0)
   end
   return table.unpack(r, 2, r.n)
@@ -1184,20 +1965,23 @@ end
 
 -- A-ASSOCIATE-RJ from the UL service-provider (presentation related) with
 -- temporary-congestion or local-limit-exceeded: the SCP's association pool
--- is full, so a later attempt may succeed (PS3.8 §9.3.4).
+-- is full, so a later attempt may succeed (PS3.8 section 9.3.4).
 local function is_busy_reject(err)
-  return type(err) == "table" and err.source == 3 and (err.reason == 1 or err.reason == 2)
+  return type(err) == "table" and err.source == 3
+      and (err.reason == 1 or err.reason == 2)
 end
 
 local function associate_with_retry(host, port, calling_aet, called_aet, pcs)
-  local retries = math.max(0, math.floor(tonumber(stdnse.get_script_args("dicom.retries")) or DEFAULT_RETRIES))
-  local backoff = tonumber(stdnse.get_script_args("dicom.backoff_ms")) or DEFAULT_BACKOFF_MS
+  local retries = math.max(0, math.floor(
+      tonumber(stdnse.get_script_args("dicom.retries")) or DEFAULT_RETRIES))
+  local backoff = tonumber(stdnse.get_script_args("dicom.backoff_ms"))
+      or DEFAULT_BACKOFF_MS
   local r
   for attempt = 0, retries do
     if attempt > 0 then
       local delay = math.floor(backoff * 2 ^ (attempt - 1))
       stdnse.debug1("DICOM: SCP busy (%s); retry %d/%d in %d ms",
-        r[2].reason_text or "?", attempt, retries, delay)
+          r[2].reason_text or "?", attempt, retries, delay)
       stdnse.sleep(delay / 1000)
     end
     r = table.pack(associate_once(host, port, calling_aet, called_aet, pcs))
@@ -1206,41 +1990,40 @@ local function associate_with_retry(host, port, calling_aet, called_aet, pcs)
   return table.unpack(r, 1, r.n)
 end
 
--- Serialize associations to one host across every DICOM script in the run.
--- SCPs cap concurrent associations (often 10-50, shared with modalities and
--- workstations), and parallel NSE threads -- several DICOM ports on one PACS,
--- or dicom-ping and dicom-enum together -- could otherwise fill the pool and
--- lock out clinical traffic. The lock is held through retry backoff so the
--- wait is genuinely quiet on the wire.
+-- Serialize associations to one host across every script in the run. SCPs
+-- cap concurrent associations (often 10-50, shared with modalities and
+-- workstations), and parallel NSE threads -- several DICOM ports on one
+-- PACS, or several DICOM scripts at once -- could otherwise fill the pool
+-- and lock out clinical traffic. The lock is held through retry backoff so
+-- the wait is genuinely quiet on the wire.
 local function associate_serialized(host, port, calling_aet, called_aet, pcs)
   local key = type(host) == "table" and host.ip or tostring(host)
   local mutex = nmap.mutex("dicom-association-" .. key)
   mutex "lock"
-  local r = table.pack(pcall(associate_with_retry, host, port, calling_aet, called_aet, pcs))
+  local r = table.pack(pcall(associate_with_retry, host, port, calling_aet,
+      called_aet, pcs))
   mutex "done"
   if not r[1] then error(r[2], 0) end
   return table.unpack(r, 2, r.n)
 end
 
--- Encoded length of one presentation-context item. The PC ID is a fixed
--- one-byte field, so a placeholder ID gives the exact size.
-local function pc_item_len(pc)
-  return #item_presentation_context(1, pc.abstract_syntax, pc.transfer_syntaxes)
-end
-
--- A-ASSOCIATE-RQ size before any presentation-context items.
-local RQ_BASE_LEN = MIN_HEADER_LEN + RQ_FIXED_LEN
-  + #item_application_context(APPLICATION_CONTEXT_NAME)
-  + #item_user_information(IMPLEMENTATION_CLASS_UID, IMPLEMENTATION_VERSION_NAME, MAX_PDU_LEN)
+-- A-ASSOCIATE-RQ size before any presentation context items.
+local RQ_BASE_LEN = #build_assoc_rq("", "", {}, MAX_PDU_DEFAULT)
 
 -- Follow-up associations also propose Verification, which virtually every
 -- SCP accepts. SCPs that reject or abort a request with no acceptable
 -- context (pynetdicom aborts) would otherwise turn "nothing in this batch is
 -- supported" into a failed association.
 local ANCHOR_PC = {
-  abstract_syntax   = "1.2.840.10008.1.1",
-  transfer_syntaxes = { TRANSFER_SYNTAX_UIDS.IMPLICIT_VR_LE },
+  abstract_syntax   = SOP_CLASS.VERIFICATION,
+  transfer_syntaxes = { TRANSFER_SYNTAX.IMPLICIT_LE },
 }
+
+-- Encoded length of one presentation context item. The PC ID is a fixed
+-- one-byte field, so a placeholder ID gives the exact size.
+local function pc_item_len(pc)
+  return #mk_pres_ctx(1, pc.abstract_syntax, pc.transfer_syntaxes)
+end
 
 -- Split proposal indices into per-association batches under max_pcs and
 -- max_bytes. Batches after the first start with the anchor (index 0). A
@@ -1266,44 +2049,64 @@ end
 local function err_text(err)
   if type(err) == "table" then
     return string.format("%s (%s / %s / %s)", err.err,
-      err.result_text or "?", err.source_text or "?", err.reason_text or "?")
+        err.result_text or "?", err.source_text or "?", err.reason_text or "?")
   end
   return tostring(err)
 end
 
 ---
--- associate_extended(host, port, calling_aet, called_aet, presentation_contexts)
--- Generalized A-ASSOCIATE that accepts a list of presentation contexts:
---   { {abstract_syntax = uid, transfer_syntaxes = {uid, ...}}, ... }
+-- Proposes a list of presentation contexts, each with its own transfer
+-- syntaxes, and reports the SCP's answer for every one of them.
+--
 -- A proposal over dicom.max_pcs contexts or dicom.max_rq_bytes bytes is split
 -- across sequential associations. If a follow-up association fails, the
 -- remaining ones are skipped rather than pressing a struggling SCP further.
--- On accept, returns:
---   true, nil, pc_results, info
--- where:
---   pc_results[i] = {pc_id, result, accepted_ts, abstract_syntax, transfer_syntaxes}
---   info          = {max_pdu, impl_uid, impl_version, tls, cert,
---                    associations, associations_planned, errors}
--- pc_results is keyed by the index of the input list (1..N), preserving order.
--- info.associations counts the accepted associations out of the
--- info.associations_planned the proposal was split into; info.errors (nil
--- when complete) describes a failed follow-up association, whose contexts and
--- any after it have a nil result.
--- If the first association fails, returns false, err (a string, or a table
--- decoding the A-ASSOCIATE-RJ).
-function associate_extended(host, port, calling_aet, called_aet, presentation_contexts)
+-- Every accepted association is closed with A-RELEASE-RQ (A-ABORT with
+-- dicom.no_release).
+--
+-- @param host Host table
+-- @param port Port table
+-- @param calling_aet Calling AE Title (default: dicom.calling_aet, then
+--                    ECHOSCU)
+-- @param called_aet Called AE Title (default: dicom.called_aet, then ANY-SCP)
+-- @param presentation_contexts List of
+--        {abstract_syntax = uid, transfer_syntaxes = {uid, ...}}
+-- @return true on accept, false if the first association failed
+-- @return nil on accept; otherwise an error string, or a table decoding the
+--         A-ASSOCIATE-RJ: {err, result, source, reason, result_text,
+--         source_text, reason_text}
+-- @return pc_results, keyed by the index of presentation_contexts:
+--         {pc_id, result, accepted_ts, abstract_syntax, transfer_syntaxes}.
+--         result is a PC_RESULT_NAMES code, or nil when a failed follow-up
+--         association left the context unanswered.
+-- @return info: {max_pdu, impl_uid, impl_version, tls, cert, associations,
+--         associations_planned, errors}. associations counts the accepted
+--         associations out of the associations_planned the proposal was
+--         split into; errors (nil when complete) describes a failed
+--         follow-up association.
+function associate_extended(host, port, calling_aet, called_aet,
+    presentation_contexts)
   if not presentation_contexts or #presentation_contexts == 0 then
     return false, "presentation_contexts must contain at least one entry"
   end
+  called_aet = called_aet or stdnse.get_script_args("dicom.called_aet")
+      or "ANY-SCP"
+  calling_aet = calling_aet or stdnse.get_script_args("dicom.calling_aet")
+      or "ECHOSCU"
+  if #called_aet > 16 or #calling_aet > 16 then
+    return false, "Calling/Called Application Entity Title must be at most 16 bytes"
+  end
 
-  local max_pcs = math.floor(tonumber(stdnse.get_script_args("dicom.max_pcs")) or DEFAULT_MAX_PCS)
+  local max_pcs = math.floor(tonumber(stdnse.get_script_args("dicom.max_pcs"))
+      or DEFAULT_MAX_PCS)
   max_pcs = math.max(2, math.min(MAX_PCS_PER_RQ, max_pcs))
-  local max_bytes = tonumber(stdnse.get_script_args("dicom.max_rq_bytes")) or DEFAULT_MAX_RQ_BYTES
+  local max_bytes = tonumber(stdnse.get_script_args("dicom.max_rq_bytes"))
+      or DEFAULT_MAX_RQ_BYTES
 
   local batches = plan_batches(presentation_contexts, max_pcs, max_bytes)
   if #batches > 1 then
     stdnse.debug1("DICOM: Splitting %d presentation contexts across %d associations",
-      #presentation_contexts, #batches)
+        #presentation_contexts, #batches)
   end
 
   local pc_results, info, errors, accepted = {}, nil, {}, 0
@@ -1315,10 +2118,12 @@ function associate_extended(host, port, calling_aet, called_aet, presentation_co
     if b > 1 then
       stdnse.sleep(BATCH_GAP_MS / 1000)
     end
-    local ok, err, results, batch_info = associate_serialized(host, port, calling_aet, called_aet, pcs)
+    local ok, err, results, batch_info =
+        associate_serialized(host, port, calling_aet, called_aet, pcs)
     if not ok then
       if b == 1 then return false, err end
-      errors[#errors + 1] = string.format("association %d of %d failed: %s", b, #batches, err_text(err))
+      errors[#errors + 1] = string.format("association %d of %d failed: %s",
+          b, #batches, err_text(err))
       break
     end
     accepted = accepted + 1
@@ -1343,59 +2148,199 @@ function associate_extended(host, port, calling_aet, called_aet, presentation_co
   return true, nil, pc_results, info
 end
 
----
--- associate(host, port) Attempts to associate to a DICOM Service Provider
--- using a single Verification PC with Implicit + Explicit VR LE transfer
--- syntaxes (still ping-shaped — one PC, ~22 bytes more on the wire).
--- Returns on success:
---   true, nil, version, vendor, uid, impl_version_name, device_vendor
--- On failure:
---   false, err_string[, reject] where reject is the decoded A-ASSOCIATE-RJ
---   table (see associate_extended) when the SCP rejected the association.
---
-function associate(host, port, calling_aet, called_aet)
-  local pcs = {{
-    abstract_syntax   = "1.2.840.10008.1.1",
-    transfer_syntaxes = {
-      "1.2.840.10008.1.2",   -- Implicit VR Little Endian
-      "1.2.840.10008.1.2.1", -- Explicit VR Little Endian
-    },
-  }}
+-----------------------------------------------------------------------
+-- 15. IMPLEMENTATION IDENTIFICATION
+-----------------------------------------------------------------------
 
-  local ok, err, _pc_results, info = associate_extended(host, port, calling_aet, called_aet, pcs)
-  if not ok then
-    -- Preserve the legacy string contract for callers (dicom-brute.nse) that
-    -- pre-date the structured RJ table return.
-    if type(err) == "table" then return false, err.err, err end
-    return false, err
-  end
+-- Implementation Class UID (0x52) roots. "toolkit" is the DICOM library on
+-- the wire (where the parser bugs and CVEs live); "manufacturer" is the
+-- device OEM (asset inventory). Most-specific patterns first.
+local TOOLKIT_UID_PATTERNS = {
+  {"^1%.3%.6%.1%.4%.1%.25403%.",              "ClearCanvas"},
+  {"^1%.3%.6%.1%.4%.1%.30071%.8",             "fo-dicom"},
+  {"^1%.2%.826%.0%.1%.3680043%.9%.3811%.",    "pynetdicom"},
+  {"^1%.2%.826%.0%.1%.3680043%.8%.641%.",     "Orthanc"},
+  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.",    "OsiriX/Horos"},
+  {"^1%.2%.276%.0%.7230010%.3%.",             "DCMTK"},
+  {"^1%.2%.40%.0%.13%.1%.3",                  "dcm4che"},
+  {"^1%.2%.826%.0%.1%.3680043%.2%.135%.1066%.101", "ConQuest"},
+}
 
-  local impl_version = info and info.impl_version or nil
-  local impl_uid     = info and info.impl_uid or nil
-  local final_version, parsed_vendor, _clean, device_vendor, impl_version_name =
-    resolve_vendor_info(impl_version, impl_uid)
+local MANUFACTURER_UID_PATTERNS = {
+  {"^1%.2%.840%.113619%.",                    "GE Healthcare"},
+  {"^1%.3%.12%.2%.1107%.",                    "Siemens"},
+  {"^1%.2%.840%.114257%.",                    "Agfa"},
+  {"^1%.2%.840%.113704%.",                    "Philips"},
+  {"^1%.3%.46%.670589%.",                     "Philips"},
+  {"^1%.2%.840%.113564%.",                    "Carestream"},
+  {"^1%.2%.392%.200036%.",                    "Fujifilm"},
+  {"^1%.2%.840%.113669%.",                    "Merge Healthcare"},
+}
 
-  return true, nil, final_version, parsed_vendor, impl_uid, impl_version_name, device_vendor
+-- Toolkit signatures in the Implementation Version Name (0x55): a
+-- case-insensitive plain-text match against the cleaned value. More
+-- specific substrings come before any that would also match.
+local TOOLKIT_PATTERNS = {
+  {"offis",          "DCMTK"},
+  {"dcmtk",          "DCMTK"},
+  {"mergecom",       "Merge Healthcare SDK"},
+  {"dcm4che",        "dcm4che"},
+  {"pynetdicom",     "pynetdicom"},
+  {"leadtools",      "LeadTools"},
+  {"clearcanvas",    "ClearCanvas"},
+  {"orthanc",        "Orthanc"},
+  {"osirix",         "OsiriX"},
+  {"horos",          "Horos"},
+  {"conquest",       "ConQuest"},
+  {"dgate",          "ConQuest"},
+  {"fo-dicom",       "fo-dicom"},
+  {"dicomobjects",   "DICOMObjects"},  -- DicomObjects.NET default
+  {"dcmobj",         "DICOMObjects"},  -- DicomObjects.COM ("DCMOBJw.x.y.z")
+  {"logipacs",       "LogiPACS"},
+  {"neologica",      "LogiPACS"},
+}
+
+local function trim(s)
+  return (s:gsub("%z", ""):match("^%s*(.-)%s*$"))
 end
 
-function send_pdata(dicom, data)
-  local status, header = pdu_header_encode(PDU_CODES["DATA"], #data)
-  if status == false then
-    return false, header
-  end
-  local err
-  status, err = send(dicom, header .. data)
-  if status == false then
-    return false, err
-  end
-  return true
+-- Whether two canonical names refer to the same entity, e.g. toolkit
+-- "OsiriX" and UID root "OsiriX/Horos".
+local function names_match(a, b)
+  return a == b or a:find(b, 1, true) ~= nil or b:find(a, 1, true) ~= nil
 end
 
-function extract_uid_root(uid)
+-- Match an Implementation Class UID against both UID tables.
+-- Returns name, category ("toolkit" or "manufacturer"), or nil.
+local function identify_vendor_from_uid(uid)
   if not uid then return nil end
-  local trimmed = uid:gsub("%z",""):match("^%s*(.-)%s*$")
-  if trimmed == "" then return nil end
-  return trimmed:match("^([%d%.]+)%.[^%.]+$") or trimmed
+  uid = trim(uid)
+  for _, entry in ipairs(TOOLKIT_UID_PATTERNS) do
+    if uid:match(entry[1]) then return entry[2], "toolkit" end
+  end
+  for _, entry in ipairs(MANUFACTURER_UID_PATTERNS) do
+    if uid:match(entry[1]) then return entry[2], "manufacturer" end
+  end
+  stdnse.debug1("DICOM: 0x52 UID unrecognized: %s", uid)
+  return nil
+end
+
+-- Match an Implementation Version Name against TOOLKIT_PATTERNS.
+local function identify_toolkit(version_str)
+  if not version_str then return nil end
+  local low = trim(version_str):lower()
+  if low == "" then return nil end
+  for _, entry in ipairs(TOOLKIT_PATTERNS) do
+    if low:find(entry[1], 1, true) then return entry[2] end
+  end
+  stdnse.debug1("DICOM: 0x55 unrecognized: %s", version_str)
+  return nil
+end
+
+-- Pull a version number out of an Implementation Version Name, using the
+-- toolkit's own format where it is known. Returns the cleaned string as-is
+-- when no version number is found.
+local function extract_clean_version(version_str, vendor)
+  if not version_str then return nil end
+  local s = trim(version_str)
+  if s == "" then return nil end
+  local v = vendor and vendor:lower()
+  local low = s:lower()
+
+  if v == "dcmtk" or low:find("dcmtk", 1, true) or low:find("offis", 1, true) then
+    -- DCMTK-3.6.9, or OFFIS_DCMTK_369 / OFFIS_DCMTK_3610 (3.6.10)
+    local sem = low:match("dcmtk%D*(%d+%.%d+%.%d+)")
+    if sem then return sem end
+    local a, b, c = low:match("dcmtk%D*(%d)(%d)(%d+)")
+    if a then return string.format("%s.%s.%s", a, b, c) end
+  end
+
+  if v == "pynetdicom" or low:find("pynetdicom", 1, true) then
+    -- pynetdicom 3.x sends PYNETDICOM_304, which is unambiguous only for
+    -- single-digit components, so only the dotted form is parsed.
+    local sem = low:match("pynetdicom[%s_/:-]+(%d+%.%d+%.?%d*)")
+    if sem then return sem end
+  end
+
+  if v == "dcm4che" or low:find("dcm4che", 1, true) then
+    local sem = low:match("dcm4che[%w-]*[%s/:-]+(%d+%.%d+%.%d+)")
+    if sem then return sem end
+  end
+
+  if v == "orthanc" or low:find("orthanc", 1, true) then
+    local sem = low:match("orthanc[%s/-]*v?(%d+%.%d+%.?%d*)")
+    if sem then return sem end
+  end
+
+  if v == "osirix" or v == "horos" or low:find("osirix", 1, true)
+      or low:find("horos", 1, true) then
+    local sem = low:match("v(%d+%.%d+%.%d+)")
+    if sem then return sem end
+  end
+
+  if v == "clearcanvas" or low:find("clearcanvas", 1, true) then
+    local sem = low:match("clearcanvas[_-](%d+%.%d+%.?%d*)")
+    if sem then return sem end
+  end
+
+  -- fo-dicom sends "fo-dicom <Major>.<Minor>.<Build>"
+  -- (FO-DICOM.Core/DicomImplementation.cs).
+  if v == "fo-dicom" or low:find("fo-dicom", 1, true) then
+    local sem = low:match("fo%-dicom[%s_/:-]+(%d+%.%d+%.?%d*)")
+    if sem then return sem end
+  end
+
+  -- DicomObjects.COM sends "DCMOBJw.x.y.z"; DicomObjects.NET sends
+  -- "DicomObjects.NET" with no version.
+  if v == "dicomobjects" or low:find("dcmobj", 1, true) then
+    local sem = low:match("dcmobj[%s_/:-]*(%d+%.%d+[%.%d]*)")
+    if sem then return sem end
+  end
+
+  return s:match("(%d+%.%d+%.%d+)") or s:match("(%d+%.%d+)") or s
+end
+
+---
+-- Identifies the implementation behind an A-ASSOCIATE-AC.
+--
+-- The toolkit named in the Implementation Version Name wins over the
+-- Implementation Class UID, because device manufacturers often ship a
+-- commercial toolkit (DCMTK, MergeCOM3, dcm4che) under their own UID root
+-- without changing the version name, and the toolkit is the code actually
+-- listening on the wire. A manufacturer UID root is reported separately as
+-- device_vendor.
+--
+-- @param impl_version Implementation Version Name (User Information 0x55)
+-- @param impl_uid Implementation Class UID (User Information 0x52)
+-- @return version: the cleaned version, or impl_version if none was found
+-- @return vendor: the toolkit name, or nil
+-- @return clean_version: the version number alone, or nil
+-- @return device_vendor: the manufacturer from the UID root, or nil
+-- @return impl_version unchanged
+function resolve_vendor_info(impl_version, impl_uid)
+  local toolkit = identify_toolkit(impl_version)
+  local uid_name, uid_category = identify_vendor_from_uid(impl_uid)
+  local vendor, clean_version, device_vendor
+
+  if toolkit then
+    vendor = toolkit
+    if uid_category == "manufacturer" then
+      device_vendor = uid_name
+    elseif uid_category == "toolkit" and not names_match(uid_name, toolkit) then
+      stdnse.debug1("DICOM: 0x52 toolkit (%s) differs from 0x55 (%s); using 0x55",
+          uid_name, toolkit)
+    end
+  elseif uid_category == "toolkit" then
+    vendor = uid_name
+  elseif uid_category == "manufacturer" then
+    device_vendor = uid_name
+  end
+  clean_version = extract_clean_version(impl_version, vendor)
+  stdnse.debug1("DICOM: vendor=%s device=%s version=%s",
+      tostring(vendor), tostring(device_vendor), tostring(clean_version))
+
+  return clean_version or impl_version, vendor, clean_version, device_vendor,
+      impl_version
 end
 
 return _ENV

@@ -2,65 +2,39 @@
 -- DICOM protocol library for Nmap NSE scripts.
 --
 -- Implements the DICOM Upper Layer protocol (PS3.8) and core DIMSE
--- services (PS3.7).  Provides connection management, A-ASSOCIATE
+-- services (PS3.7). Provides connection management, A-ASSOCIATE
 -- negotiation, P-DATA-TF PDU construction/parsing, and helpers for
 -- C-ECHO, C-STORE, C-FIND, C-GET, and C-MOVE.
 --
--- Supports both Implicit VR Little Endian and Explicit VR Little Endian
--- transfer syntaxes for dataset encoding and parsing.
+-- Supports Implicit VR Little Endian, Explicit VR Little Endian, and
+-- Explicit VR Big Endian transfer syntaxes for dataset parsing, and
+-- Implicit/Explicit VR Little Endian for dataset encoding.
 --
--- Designed to be shared across multiple DICOM NSE scripts
--- (dicom-ping, dicom-store-fuzzer, dicom-cfind-ls, etc.) so that
--- protocol logic lives in one place.
---
--- INSTALLATION:
--- Copy this file to your Nmap nselib/ directory to replace the
--- built-in minimal dicom.lua:
---   cp dicom.lua /usr/share/nmap/nselib/dicom.lua
--- (or /usr/local/share/nmap/nselib/dicom.lua on macOS)
--- This library is fully backward-compatible with the original: the legacy
--- API (start_connection, send, receive, pdu_header_encode, associate,
--- send_pdata) keeps its exact signatures and behaviour, so the official
--- dicom-ping and dicom-brute scripts run unchanged.
---
--- CHANGES vs. the upstream nmap nselib/dicom.lua:
---  * Legacy API preserved verbatim (drop-in compatible).
---  * Added DIMSE service support: C-ECHO, C-STORE, C-FIND, C-GET, C-MOVE.
---  * Added A-ASSOCIATE-RQ builder with multiple presentation contexts,
---    configurable max PDU, and SCP/SCU Role Selection (PS3.7 D.3.3.4) so
---    C-GET can receive C-STORE sub-operations.
---  * Added A-ASSOCIATE-AC parser (accepted contexts, transfer syntaxes,
---    max PDU, implementation identification, accepted roles) for
---    fingerprinting and negotiation.
---  * Added P-DATA-TF fragmentation/reassembly that surfaces the PDV
---    presentation-context ID (needed to answer C-STORE sub-ops correctly).
---  * Added Implicit/Explicit VR LE element encoders/decoders and Part-10
---    (.dcm) dataset extraction.
---
--- OPTIONS:
--- *<code>called_aet</code> - Called Application Entity Title (default:
--- ANY-SCP)
--- *<code>calling_aet</code> - Calling Application Entity Title (default:
--- ECHOSCU)
+-- Designed to be shared across all DICOM NSE scripts (dicom-ping,
+-- dicom-info, dicom-brute, dicom-cfind-ls, dicom-cmove, dicom-get,
+-- dicom-store-fuzzer, dicom-store-inject, dicom-slowloris) so that
+-- protocol logic lives in one place. The legacy API (start_connection,
+-- send, receive, pdu_header_encode, associate, send_pdata) keeps its
+-- exact signatures and behaviour for full backward compatibility.
 --
 -- associate_extended() proposes a list of presentation contexts, each with
 -- its own transfer syntaxes, and reports the SCP's answer for every one of
 -- them (PS3.8 section 9.3.3.2); resolve_vendor_info() turns the
 -- implementation identification in the A-ASSOCIATE-AC into a toolkit,
--- version and device manufacturer. associate_extended() is gentle on
--- production SCPs, whose association pool is shared with clinical traffic:
--- its associations to a host are serialized across all scripts, a transient
--- A-ASSOCIATE-RJ (temporary-congestion / local-limit-exceeded) is retried
--- with exponential backoff, large proposals are split across sequential
--- associations, and every error path after the A-ASSOCIATE-RQ sends A-ABORT
--- so the SCP frees the slot at once.
+-- version and device manufacturer. associate_extended() and
+-- with_host_lock() protect production PACS association pools by
+-- serializing associations per host across scripts, retrying transient
+-- A-ASSOCIATE-RJ (temporary-congestion / local-limit-exceeded) with
+-- exponential backoff, splitting large proposals across sequential
+-- associations, and sending A-ABORT on error paths so the SCP frees the
+-- slot immediately.
 --
 -- @args dicom.called_aet Called Application Entity Title. Default: ANY-SCP
 -- @args dicom.calling_aet Calling Application Entity Title. Default: ECHOSCU
 -- @args dicom.tls Transport: "true" forces DICOM-over-TLS, "false" forces
---                 plain TCP. When unset, associate_extended() follows Nmap's
---                 own service detection (-sV) and the other functions use
---                 plain TCP. Default: unset
+--                 plain TCP. When unset, follows Nmap's service detection
+--                 (-sV) when a port table is provided, otherwise plain TCP.
+--                 Default: unset
 -- @args dicom.timeout_ms Socket timeout of associate_extended() in
 --                        milliseconds. Default: 3000
 -- @args dicom.retries Retries after a transient A-ASSOCIATE-RJ
@@ -81,8 +55,8 @@
 --                        Default: unset
 --
 -- @author Paulino Calderon <paulino@calderonpale.com>
--- @author Tyler M <tmart234@gmail.com>
--- @author Nichelle Gilbert <nich.gilbert@gmail.com>
+-- @author Tyler M <tmart234()gmail.com>
+-- @author Nichelle Gilbert <nich.gilbert()gmail.com>
 -- @copyright Same as Nmap--See https://nmap.org/book/man-legal.html
 ---
 
@@ -145,6 +119,7 @@ COMMAND_FIELD = {
   C_MOVE_RSP  = 0x8021,
   C_ECHO_RQ   = 0x0030,
   C_ECHO_RSP  = 0x8030,
+  C_CANCEL_RQ = 0x0FFF,
 }
 
 ---
@@ -189,16 +164,19 @@ SOP_CLASS = {
 -- @class table
 -- @name TRANSFER_SYNTAX
 TRANSFER_SYNTAX = {
-  IMPLICIT_LE  = "1.2.840.10008.1.2",
-  EXPLICIT_LE  = "1.2.840.10008.1.2.1",
-  EXPLICIT_BE  = "1.2.840.10008.1.2.2",
-  DEFLATED_LE  = "1.2.840.10008.1.2.1.99",
-  JPEG_BASELINE = "1.2.840.10008.1.2.4.50",
-  JPEG_LOSSLESS = "1.2.840.10008.1.2.4.70",
-  JPEG_LS       = "1.2.840.10008.1.2.4.80",
-  JPEG2000_LOSSLESS = "1.2.840.10008.1.2.4.90",
-  JPEG2000      = "1.2.840.10008.1.2.4.91",
-  RLE           = "1.2.840.10008.1.2.5",
+  IMPLICIT_LE         = "1.2.840.10008.1.2",
+  EXPLICIT_LE         = "1.2.840.10008.1.2.1",
+  EXPLICIT_BE         = "1.2.840.10008.1.2.2",
+  DEFLATED_LE         = "1.2.840.10008.1.2.1.99",
+  JPEG_BASELINE       = "1.2.840.10008.1.2.4.50",
+  JPEG_EXTENDED       = "1.2.840.10008.1.2.4.51",
+  JPEG_LOSSLESS_NH    = "1.2.840.10008.1.2.4.57",
+  JPEG_LOSSLESS       = "1.2.840.10008.1.2.4.70",
+  JPEG_LS             = "1.2.840.10008.1.2.4.80",
+  JPEG_LS_LOSSY       = "1.2.840.10008.1.2.4.81",
+  JPEG2000_LOSSLESS   = "1.2.840.10008.1.2.4.90",
+  JPEG2000            = "1.2.840.10008.1.2.4.91",
+  RLE                 = "1.2.840.10008.1.2.5",
   HTJ2K_LOSSLESS      = "1.2.840.10008.1.2.4.201",
   HTJ2K_LOSSLESS_RPCL = "1.2.840.10008.1.2.4.202",
   HTJ2K               = "1.2.840.10008.1.2.4.203",
@@ -214,8 +192,11 @@ TRANSFER_SYNTAX_NAMES = {
   ["1.2.840.10008.1.2.2"]     = "Explicit VR Big Endian",
   ["1.2.840.10008.1.2.1.99"]  = "Deflated Explicit VR Little Endian",
   ["1.2.840.10008.1.2.4.50"]  = "JPEG Baseline (Process 1)",
+  ["1.2.840.10008.1.2.4.51"]  = "JPEG Extended (Process 2 & 4)",
+  ["1.2.840.10008.1.2.4.57"]  = "JPEG Lossless, Non-Hierarchical (Process 14)",
   ["1.2.840.10008.1.2.4.70"]  = "JPEG Lossless, Non-Hierarchical, First-Order Prediction",
   ["1.2.840.10008.1.2.4.80"]  = "JPEG-LS Lossless",
+  ["1.2.840.10008.1.2.4.81"]  = "JPEG-LS Lossy (Near-Lossless)",
   ["1.2.840.10008.1.2.4.90"]  = "JPEG 2000 Image Compression (Lossless Only)",
   ["1.2.840.10008.1.2.4.91"]  = "JPEG 2000 Image Compression",
   ["1.2.840.10008.1.2.5"]     = "RLE Lossless",
@@ -415,7 +396,7 @@ end
 -- 4. ASSOCIATION PDU BUILDERS
 -----------------------------------------------------------------------
 
---- Build an SCP/SCU Role Selection sub-item (PS3.7 §D.3.3.4, item type 0x54).
+--- Build an SCP/SCU Role Selection sub-item (PS3.7 section D.3.3.4, item type 0x54).
 -- Used to request role reversal so the SCU can receive C-STORE sub-operations
 -- (required for C-GET).
 -- @param uid  Abstract Syntax (SOP Class) UID the role applies to
@@ -454,7 +435,7 @@ function mk_user_info(max_pdu, roles)
 end
 
 --- Build a Presentation Context sub-item for A-ASSOCIATE-RQ.
--- @param pctx_id       Odd integer 1–255
+-- @param pctx_id       Odd integer 1-255
 -- @param sop_class     Abstract Syntax UID string
 -- @param transfer_uids List of Transfer Syntax UIDs
 --                      (default: Explicit VR LE + Implicit VR LE)
@@ -496,7 +477,10 @@ function build_assoc_rq(called_ae, calling_ae, sop_classes, max_pdu,
 
   for i, sop in ipairs(sop_classes) do
     local pctx_id = (2 * i - 1)
-    if pctx_id > 255 then pctx_id = 255 end
+    if pctx_id > 255 then
+      stdnse.debug1("DICOM: build_assoc_rq capped at 128 presentation contexts (PS3.8 limit)")
+      break
+    end
     if type(sop) == "table" then
       body = body .. mk_pres_ctx(pctx_id, sop.abstract_syntax,
           sop.transfer_syntaxes)
@@ -540,9 +524,9 @@ function parse_assoc_ac(data)
   end
 
   local pos = 75
-  if pos >= #data then return result end
+  if pos + 3 > #data then return result end
 
-  while pos <= #data - 4 do
+  while pos + 3 <= #data do
     local item_type = string.byte(data, pos)
     local item_len  = string.unpack(">I2", data, pos + 2)
     local item_data = data:sub(pos + 4, pos + 3 + item_len)
@@ -557,7 +541,7 @@ function parse_assoc_ac(data)
         local ts_type = string.byte(item_data, 5)
         if ts_type == 0x40 then
           local ts_len = string.unpack(">I2", item_data, 7)
-          ts_uid = item_data:sub(9, 8 + ts_len):gsub("%z", "")
+          ts_uid = item_data:sub(9, 8 + ts_len):gsub("%z", ""):gsub("%s+$", "")
         end
       end
       result.pctxs[pctx_id] = {
@@ -568,13 +552,13 @@ function parse_assoc_ac(data)
     elseif item_type == 0x50 then
       -- User Information sub-items (PS3.7 Annex D.3.3)
       local upos = 1
-      while upos <= #item_data - 4 do
+      while upos + 3 <= #item_data do
         local u_type = string.byte(item_data, upos)
         local u_len  = string.unpack(">I2", item_data, upos + 2)
         local u_val  = item_data:sub(upos + 4, upos + 3 + u_len)
-        if u_type == 0x51 and u_len == 4 then
-          -- Maximum Length sub-item
-          result.max_pdu = string.unpack(">I4", item_data, upos + 4)
+        if u_type == 0x51 and u_len == 4 and #u_val >= 4 then
+          -- Maximum Length sub-item (0 means unlimited per PS3.8 Annex D.1.1)
+          result.max_pdu = string.unpack(">I4", u_val, 1)
         elseif u_type == 0x52 then
           -- Implementation Class UID
           result.impl_class_uid = u_val:gsub("%z", ""):gsub("%s+$", "")
@@ -583,7 +567,7 @@ function parse_assoc_ac(data)
           result.impl_version = u_val:gsub("%z", ""):gsub("%s+$", "")
         elseif u_type == 0x54 then
           -- SCP/SCU Role Selection (accepted): UID-len(2)+UID+SCU(1)+SCP(1)
-          if u_len >= 4 then
+          if u_len >= 4 and #u_val >= 4 then
             local uid_len = string.unpack(">I2", u_val, 1)
             if uid_len + 2 <= #u_val then
               local uid    = u_val:sub(3, 2 + uid_len)
@@ -610,10 +594,10 @@ end
 -- @param pctx_id    Presentation context ID
 -- @param data       Raw bytes to send
 -- @param is_command true for command set, false for dataset
--- @param max_pdu    Max PDU length
+-- @param max_pdu    Max PDU length (0 means unlimited per PS3.8 Annex D.1.1)
 -- @return List of PDU byte strings
 function build_pdata_pdus(pctx_id, data, is_command, max_pdu)
-  max_pdu = max_pdu or MAX_PDU_DEFAULT
+  if not max_pdu or max_pdu == 0 then max_pdu = MAX_PDU_DEFAULT end
   -- Overhead: 6 (PDU header) + 4 (PDV length) + 1 (PC-ID) + 1 (MCH) = 12
   local frag_size = max_pdu - 12
   if frag_size < 1 then frag_size = 512 end
@@ -627,7 +611,7 @@ function build_pdata_pdus(pctx_id, data, is_command, max_pdu)
     local chunk   = data:sub(offset, chunk_end)
     local is_last = (chunk_end >= total)
 
-    -- PS3.8 §9.3.5.1: bit 0 = 1 → command, bit 0 = 0 → dataset; bit 1 = last
+    -- PS3.8 section 9.3.5.1: bit 0 = 1 -> command, bit 0 = 0 -> dataset; bit 1 = last
     local mch
     if is_command then
       mch = is_last and 0x03 or 0x01
@@ -683,7 +667,7 @@ function parse_pdata(data)
       local pdv_frag = pdu_data:sub(ppos + 6, ppos + 3 + pdv_len)
       ppos = ppos + 4 + pdv_len
 
-      -- PS3.8 §9.3.5.1:
+      -- PS3.8 section 9.3.5.1:
       --   Bit 0 = 1 -> command, Bit 0 = 0 -> dataset
       --   Bit 1 = 1 -> last fragment
       if pdv_mch and (pdv_mch & 0x01) == 0x01 then
@@ -704,20 +688,43 @@ end
 -- 6. DATA ELEMENT ENCODING
 -----------------------------------------------------------------------
 
---- Encode a single DICOM element in Implicit VR Little Endian (PS3.5 §7.1.2).
--- @param group  Group number (e.g. 0x0000, 0x0008, 0x0010)
+--- Check whether a DICOM group number is a Private Tag group (PS3.5 section 7.8).
+-- Private groups have an odd group number > 0x0007 (excluding 0xFFFE/0xFFFF).
+-- @param group  16-bit group number
+-- @return true if private group
+function is_private_tag(group)
+  return type(group) == "number" and (group % 2) == 1
+      and group > 0x0007 and group < 0xFFFE
+end
+
+--- Infer a default VR when none is given (used for private tag queries).
+-- Per PS3.5 section 7.8.1, Private Creator elements (gggg,0010-00FF) have VR = LO;
+-- private data elements (gggg,1000-FFFF) default to UN when VR is unknown.
+local function default_vr(group, elem, vr)
+  if vr and vr ~= "" then return vr end
+  if is_private_tag(group) and elem >= 0x0010 and elem <= 0x00FF then
+    return "LO"
+  end
+  return "UN"
+end
+
+--- Encode a single DICOM element in Implicit VR Little Endian (PS3.5 section 7.1.2).
+-- @param group  Group number (e.g. 0x0000, 0x0008, 0x0010, or odd private group)
 -- @param elem   Element number
--- @param vr     VR string ("US", "UL", "UI", "CS", "LO", etc.)
+-- @param vr     VR string ("US", "UL", "UI", "CS", "LO", "UN", etc.)
 -- @param val    Value (number for US/UL, string otherwise)
 -- @return Encoded element bytes
 function implicit_elem(group, elem, vr, val)
+  vr = default_vr(group, elem, vr)
   local tag_bytes = pack_le(group, 2) .. pack_le(elem, 2)
   local val_bytes
-  if vr == "US" then
+  if val == nil or val == "" then
+    val_bytes = ""
+  elseif vr == "US" and type(val) == "number" then
     val_bytes = pack_le(val, 2)
-  elseif vr == "UL" then
+  elseif vr == "UL" and type(val) == "number" then
     val_bytes = pack_le(val, 4)
-  elseif vr == "UI" then
+  elseif vr == "UI" or vr == "OB" or vr == "UN" then
     val_bytes = tostring(val)
     if #val_bytes % 2 ~= 0 then val_bytes = val_bytes .. "\x00" end
   else
@@ -728,26 +735,30 @@ function implicit_elem(group, elem, vr, val)
   return tag_bytes .. pack_le(#val_bytes, 4) .. val_bytes
 end
 
---- Encode a single DICOM element in Explicit VR Little Endian (PS3.5 §7.1.1).
+--- Encode a single DICOM element in Explicit VR Little Endian (PS3.5 section 7.1.1).
 -- Uses long format for OB/OD/OF/OL/OV/OW/SQ/UC/UN/UR/UT/SV/UV,
 -- short format for all other VRs.
 -- @param group  Group number
 -- @param elem   Element number
--- @param vr     VR string (2 characters)
+-- @param vr     VR string (2 characters; inferred for private tags if nil/"")
 -- @param val    Value (number for US/UL/SS/SL, string otherwise)
 -- @return Encoded element bytes
-function explicit_elem(group, elem, vr, val)
-  local tag_bytes = pack_le(group, 2) .. pack_le(elem, 2)
+function explicit_elem(group, elem, vr, val, endian)
+  vr = default_vr(group, elem, vr)
+  endian = endian or "<"
+  local tag_bytes = string.pack(endian .. "I2I2", group, elem)
   local val_bytes
-  if vr == "US" then
-    val_bytes = pack_le(val, 2)
-  elseif vr == "UL" then
-    val_bytes = pack_le(val, 4)
-  elseif vr == "SS" then
-    val_bytes = string.pack("<i2", val)
-  elseif vr == "SL" then
-    val_bytes = string.pack("<i4", val)
-  elseif vr == "UI" then
+  if val == nil or val == "" then
+    val_bytes = ""
+  elseif vr == "US" and type(val) == "number" then
+    val_bytes = string.pack(endian .. "I2", val)
+  elseif vr == "UL" and type(val) == "number" then
+    val_bytes = string.pack(endian .. "I4", val)
+  elseif vr == "SS" and type(val) == "number" then
+    val_bytes = string.pack(endian .. "i2", val)
+  elseif vr == "SL" and type(val) == "number" then
+    val_bytes = string.pack(endian .. "i4", val)
+  elseif vr == "UI" or vr == "OB" or vr == "UN" then
     val_bytes = tostring(val)
     if #val_bytes % 2 ~= 0 then val_bytes = val_bytes .. "\x00" end
   else
@@ -757,11 +768,11 @@ function explicit_elem(group, elem, vr, val)
 
   if LONG_VRS[vr] then
     -- Long format: tag(4) + VR(2) + reserved(2) + length(4) + value
-    return tag_bytes .. vr .. pack_le(0, 2) .. pack_le(#val_bytes, 4)
+    return tag_bytes .. vr .. string.pack(endian .. "I2I4", 0, #val_bytes)
         .. val_bytes
   else
     -- Short format: tag(4) + VR(2) + length(2) + value
-    return tag_bytes .. vr .. pack_le(#val_bytes, 2) .. val_bytes
+    return tag_bytes .. vr .. string.pack(endian .. "I2", #val_bytes) .. val_bytes
   end
 end
 
@@ -775,8 +786,10 @@ end
 function encode_element(group, elem, vr, val, transfer_syntax)
   if transfer_syntax == TRANSFER_SYNTAX.IMPLICIT_LE then
     return implicit_elem(group, elem, vr, val)
+  elseif transfer_syntax == TRANSFER_SYNTAX.EXPLICIT_BE then
+    return explicit_elem(group, elem, vr, val, ">")
   else
-    return explicit_elem(group, elem, vr, val)
+    return explicit_elem(group, elem, vr, val, "<")
   end
 end
 
@@ -789,7 +802,7 @@ end
 function encode_dataset(tags, transfer_syntax)
   transfer_syntax = transfer_syntax or TRANSFER_SYNTAX.EXPLICIT_LE
 
-  -- Sort by (group, elem) — DICOM requires ascending order
+  -- Sort by (group, elem) -- DICOM requires ascending order
   table.sort(tags, function(a, b)
     if a.group == b.group then return a.elem < b.elem end
     return a.group < b.group
@@ -835,6 +848,50 @@ function parse_command_set(cmd_bytes)
   return elements
 end
 
+-- Binary VRs whose private payloads should be rendered as hex rather than
+-- stripped of NUL bytes and treated as ASCII text.
+local BINARY_VRS = {
+  OB = true, OW = true, OF = true, OD = true, OL = true, OV = true,
+}
+
+-- Format a raw element value as a clean string. Standard (even-group) tags
+-- keep the exact string normalization used across all upstream scripts;
+-- private (odd-group) tags decode binary numeric VRs and render binary
+-- UN/OB/OW payloads as hex.
+local function format_elem_value(raw, vr, group, endian)
+  if not is_private_tag(group) then
+    return raw:gsub("%z", ""):gsub("%s+$", "")
+  end
+  if #raw == 0 then return "" end
+  local e = endian or "<"
+  if vr == "US" and #raw == 2 then
+    return tostring((string.unpack(e .. "I2", raw)))
+  elseif vr == "UL" and #raw == 4 then
+    return tostring((string.unpack(e .. "I4", raw)))
+  elseif vr == "SS" and #raw == 2 then
+    return tostring((string.unpack(e .. "i2", raw)))
+  elseif vr == "SL" and #raw == 4 then
+    return tostring((string.unpack(e .. "i4", raw)))
+  elseif vr == "FL" and #raw == 4 then
+    return tostring((string.unpack(e .. "f", raw)))
+  elseif vr == "FD" and #raw == 8 then
+    return tostring((string.unpack(e .. "d", raw)))
+  end
+  -- Per PS3.5 section 6.2, at most one trailing NUL is valid padding for
+  -- UI/UN; embedded NULs, all-NUL buffers, or binary VRs are raw bytes.
+  local is_binary = BINARY_VRS[vr]
+    or raw:find("^%z+$") ~= nil
+    or (#raw > 1 and raw:sub(1, #raw - 1):find("%z") ~= nil)
+  local cleaned = raw:gsub("%z+$", ""):gsub("%s+$", "")
+  if is_binary or cleaned:find("[^\32-\126\r\n\t]") then
+    local hex = {}
+    local n = math.min(#raw, 32)
+    for i = 1, n do hex[#hex + 1] = string.format("%02X", raw:byte(i)) end
+    return "0x" .. table.concat(hex) .. (#raw > 32 and "..." or "")
+  end
+  return cleaned
+end
+
 --- Parse Implicit VR LE dataset bytes into tag -> string table.
 -- @param ds_bytes  Raw dataset bytes
 -- @return Table { "GGGG,EEEE" -> cleaned_string }
@@ -846,7 +903,7 @@ function parse_dataset_implicit(ds_bytes)
     local elem  = string.unpack("<I2", ds_bytes, pos + 2)
     local vlen  = string.unpack("<I4", ds_bytes, pos + 4)
 
-    -- Undefined-length sequences (0xFFFFFFFF): skip to delimitation
+    -- Undefined-length sequences (0xFFFFFFFF): skip to delimitation (PS3.5 section 7.5)
     if vlen == 0xFFFFFFFF then
       pos = pos + 8
       local depth = 1
@@ -854,19 +911,18 @@ function parse_dataset_implicit(ds_bytes)
         local g2 = string.unpack("<I2", ds_bytes, pos)
         local e2 = string.unpack("<I2", ds_bytes, pos + 2)
         local l2 = string.unpack("<I4", ds_bytes, pos + 4)
-        if g2 == 0xFFFE and e2 == 0xE0DD then
+        if g2 == 0xFFFE and (e2 == 0xE0DD or e2 == 0xE00D) then
           depth = depth - 1
           pos = pos + 8
-        elseif g2 == 0xFFFE and e2 == 0xE000 then
-          if l2 == 0xFFFFFFFF then depth = depth + 1
-          pos = pos + 8
-          else pos = pos + 8 + l2 end
-        elseif g2 == 0xFFFE and e2 == 0xE00D then
+        elseif l2 == 0xFFFFFFFF then
+          depth = depth + 1
           pos = pos + 8
         else
-          if l2 == 0xFFFFFFFF then depth = depth + 1
-          pos = pos + 8
-          else pos = pos + 8 + l2 end
+          if pos + 7 + l2 > #ds_bytes + 1 then
+            pos = #ds_bytes + 1
+            break
+          end
+          pos = pos + 8 + l2
         end
       end
     else
@@ -874,30 +930,35 @@ function parse_dataset_implicit(ds_bytes)
       local raw = ds_bytes:sub(pos + 8, pos + 7 + vlen)
       pos = pos + 8 + vlen
       local key = string.format("%04X,%04X", group, elem)
-      elements[key] = raw:gsub("%z", ""):gsub("%s+$", "")
+      elements[key] = format_elem_value(raw, nil, group, "<")
     end
   end
   return elements
 end
 
---- Parse Explicit VR LE dataset bytes into tag -> string table.
--- Handles both short-format and long-format VRs per PS3.5 §7.1.1.
+--- Parse Explicit VR dataset bytes into tag -> string table.
+-- Handles both short-format and long-format VRs per PS3.5 section 7.1.1,
+-- and supports both Little Endian (default) and Big Endian (endian=">").
 -- @param ds_bytes  Raw dataset bytes
+-- @param endian    Optional byte order: "<" (default, LE) or ">" (BE)
 -- @return Table { "GGGG,EEEE" -> cleaned_string }
-function parse_dataset_explicit(ds_bytes)
+function parse_dataset_explicit(ds_bytes, endian)
+  local e = (endian == ">") and ">" or "<"
+  local i2_fmt = e .. "I2"
+  local i4_fmt = e .. "I4"
   local elements = {}
   local pos = 1
   while pos + 3 <= #ds_bytes do
-    local group = string.unpack("<I2", ds_bytes, pos)
-    local elem  = string.unpack("<I2", ds_bytes, pos + 2)
+    local group = string.unpack(i2_fmt, ds_bytes, pos)
+    local elem  = string.unpack(i2_fmt, ds_bytes, pos + 2)
 
     -- Sequence/item delimiters (group FFFE)
     if group == 0xFFFE then
-      if elem == 0xE0DD then pos = pos + 8
-      break          -- Seq delimitation
+      if pos + 7 > #ds_bytes then break end
+      if elem == 0xE0DD then pos = pos + 8                 -- Seq delimitation
       elseif elem == 0xE00D then pos = pos + 8             -- Item delimitation
       elseif elem == 0xE000 then                           -- Item
-        local l = string.unpack("<I4", ds_bytes, pos + 4)
+        local l = string.unpack(i4_fmt, ds_bytes, pos + 4)
         if l == 0xFFFFFFFF then pos = pos + 8 else pos = pos + 8 + l end
       else pos = pos + 8 end
       goto continue
@@ -911,36 +972,63 @@ function parse_dataset_explicit(ds_bytes)
     if LONG_VRS[vr] then
       -- Long: tag(4) + VR(2) + reserved(2) + length(4) = 12
       if pos + 11 > #ds_bytes then break end
-      vlen = string.unpack("<I4", ds_bytes, pos + 8)
+      vlen = string.unpack(i4_fmt, ds_bytes, pos + 8)
       data_start = pos + 12
     else
       -- Short: tag(4) + VR(2) + length(2) = 8
       if pos + 7 > #ds_bytes then break end
-      vlen = string.unpack("<I2", ds_bytes, pos + 6)
+      vlen = string.unpack(i2_fmt, ds_bytes, pos + 6)
       data_start = pos + 8
     end
 
-    -- Undefined-length sequences: skip to delimitation
+    -- Undefined-length sequences/fragments: skip to delimitation using Explicit VR
+    -- framing for nested elements inside items (PS3.5 section 7.5).
     if vlen == 0xFFFFFFFF then
       pos = data_start
       local depth = 1
-      while pos <= #ds_bytes - 7 and depth > 0 do
-        local g2 = string.unpack("<I2", ds_bytes, pos)
-        local e2 = string.unpack("<I2", ds_bytes, pos + 2)
-        local l2 = string.unpack("<I4", ds_bytes, pos + 4)
-        if g2 == 0xFFFE and e2 == 0xE0DD then
-          depth = depth - 1
-          pos = pos + 8
-        elseif g2 == 0xFFFE and e2 == 0xE000 then
-          if l2 == 0xFFFFFFFF then depth = depth + 1
-          pos = pos + 8
-          else pos = pos + 8 + l2 end
-        elseif g2 == 0xFFFE and e2 == 0xE00D then
-          pos = pos + 8
+      while pos + 7 <= #ds_bytes and depth > 0 do
+        local g2 = string.unpack(i2_fmt, ds_bytes, pos)
+        local e2 = string.unpack(i2_fmt, ds_bytes, pos + 2)
+        if g2 == 0xFFFE then
+          local l2 = string.unpack(i4_fmt, ds_bytes, pos + 4)
+          if e2 == 0xE0DD or e2 == 0xE00D then
+            depth = depth - 1
+            pos = pos + 8
+          elseif e2 == 0xE000 then
+            if l2 == 0xFFFFFFFF then
+              depth = depth + 1
+              pos = pos + 8
+            else
+              if pos + 7 + l2 > #ds_bytes + 1 then
+                pos = #ds_bytes + 1
+                break
+              end
+              pos = pos + 8 + l2
+            end
+          else
+            pos = pos + 8
+          end
         else
-          if l2 == 0xFFFFFFFF then depth = depth + 1
-          pos = pos + 8
-          else pos = pos + 8 + l2 end
+          local vr2 = ds_bytes:sub(pos + 4, pos + 5)
+          local l2, dstart
+          if LONG_VRS[vr2] then
+            if pos + 11 > #ds_bytes then pos = #ds_bytes + 1; break end
+            l2 = string.unpack(i4_fmt, ds_bytes, pos + 8)
+            dstart = pos + 12
+          else
+            l2 = string.unpack(i2_fmt, ds_bytes, pos + 6)
+            dstart = pos + 8
+          end
+          if l2 == 0xFFFFFFFF then
+            depth = depth + 1
+            pos = dstart
+          else
+            if dstart + l2 - 1 > #ds_bytes then
+              pos = #ds_bytes + 1
+              break
+            end
+            pos = dstart + l2
+          end
         end
       end
     else
@@ -948,7 +1036,7 @@ function parse_dataset_explicit(ds_bytes)
       local raw = ds_bytes:sub(data_start, data_start + vlen - 1)
       pos = data_start + vlen
       local key = string.format("%04X,%04X", group, elem)
-      elements[key] = raw:gsub("%z", ""):gsub("%s+$", "")
+      elements[key] = format_elem_value(raw, vr, group, e)
     end
 
     ::continue::
@@ -956,11 +1044,91 @@ function parse_dataset_explicit(ds_bytes)
   return elements
 end
 
+--- Parse a user-supplied tag list into {group, elem, vr, value} entries.
+-- Accepts semicolon- or pipe-separated specs of the form:
+--   "GGGGEEEE" | "GGGG.EEEE" | "GGGG-EEEE" | "GGGG,EEEE"
+-- optionally followed by ":VR", "=VAL", or ":VR=VAL". Using "GGGGEEEE" or
+-- "GGGG.EEEE" avoids nested quoting inside Nmap's comma-separated
+-- --script-args. Private Creator tags (gggg,0010-00FF) default to VR="LO";
+-- other private tags default to VR="UN" when no VR is specified.
+-- @param spec  Tag specification string
+-- @return List of {group=int, elem=int, vr=string, value=string}
+function parse_tag_spec(spec)
+  local out = {}
+  if not spec or spec == "" then return out end
+  for token in tostring(spec):gmatch("[^;|]+") do
+    local s = token:match("^%s*(.-)%s*$")
+    if s ~= "" then
+      local g_hex, e_hex, rest =
+        s:match("^([%x][%x][%x][%x])[.,%-]?([%x][%x][%x][%x])(.*)$")
+      if g_hex and e_hex then
+        local grp  = tonumber(g_hex, 16)
+        local elem = tonumber(e_hex, 16)
+        local vr, val = nil, ""
+        if rest and rest ~= "" then
+          local v_vr, v_eq = rest:match("^:([A-Za-z][A-Za-z])=(.*)$")
+          if v_vr then
+            vr, val = v_vr:upper(), v_eq
+          else
+            v_vr = rest:match("^:([A-Za-z][A-Za-z])$")
+            if v_vr then
+              vr = v_vr:upper()
+            else
+              local eq = rest:match("^=(.*)$")
+              if eq then val = eq end
+            end
+          end
+        end
+        vr = default_vr(grp, elem, vr)
+        out[#out + 1] = { group = grp, elem = elem, vr = vr, value = val }
+      else
+        stdnse.debug1("DICOM: ignoring invalid tag spec %q", s)
+      end
+    end
+  end
+  return out
+end
+
+--- Extract all Private Tags (odd group numbers, PS3.5 section 7.8) from a parsed
+-- dataset table, resolving each private element (gggg,xxee) against its
+-- Private Creator (gggg,00xx) when present in the dataset.
+-- @param ds_elems  Table { "GGGG,EEEE" -> value_string } from parse_dataset
+-- @return Sorted list of { tag = "GGGG,EEEE", creator = string or nil,
+--         is_creator = bool, value = string }
+function extract_private_tags(ds_elems)
+  local list = {}
+  if type(ds_elems) ~= "table" then return list end
+  for key, val in pairs(ds_elems) do
+    local g_hex, e_hex = key:match("^([%x][%x][%x][%x]),([%x][%x][%x][%x])$")
+    if g_hex and e_hex then
+      local grp  = tonumber(g_hex, 16)
+      local elem = tonumber(e_hex, 16)
+      if is_private_tag(grp) and val ~= "" then
+        local is_creator = (elem >= 0x0010 and elem <= 0x00FF)
+        local creator = nil
+        if not is_creator and elem >= 0x1000 then
+          local block = math.floor(elem / 0x100)
+          local ckey = string.format("%04X,00%02X", grp, block)
+          creator = ds_elems[ckey]
+          if creator == "" then creator = nil end
+        end
+        list[#list + 1] = {
+          tag        = key,
+          creator    = creator,
+          is_creator = is_creator,
+          value      = val,
+        }
+      end
+    end
+  end
+  table.sort(list, function(a, b) return a.tag < b.tag end)
+  return list
+end
+
 --- Parse a dataset using the appropriate decoder for the transfer syntax.
--- If the TS indicates Implicit VR LE, uses the implicit parser; otherwise
--- uses the Explicit VR parser.  Includes a heuristic fallback: if explicit
--- parsing is expected but the first element's VR bytes aren't valid ASCII
--- uppercase, falls back to implicit.
+-- Handles Implicit VR LE, Explicit VR LE, and Explicit VR BE. Includes a
+-- heuristic fallback: if Explicit VR is expected but the first element's VR
+-- bytes are not a valid DICOM VR (PS3.5 Table 6.2-1), falls back to Implicit.
 -- @param ds_bytes        Raw dataset bytes
 -- @param transfer_syntax Transfer syntax UID
 -- @return Table { "GGGG,EEEE" -> cleaned_string }
@@ -969,25 +1137,26 @@ function parse_dataset(ds_bytes, transfer_syntax)
   if transfer_syntax == TRANSFER_SYNTAX.IMPLICIT_LE then
     return parse_dataset_implicit(ds_bytes)
   end
-  -- Heuristic: check if bytes 5-6 look like a valid 2-char VR
+  local endian = (transfer_syntax == TRANSFER_SYNTAX.EXPLICIT_BE) and ">" or "<"
+  -- Heuristic: check if bytes 5-6 are a valid 2-char DICOM VR
   if #ds_bytes >= 6 then
-    local b5 = string.byte(ds_bytes, 5)
-    local b6 = string.byte(ds_bytes, 6)
-    if (b5 >= 0x41 and b5 <= 0x5A) and (b6 >= 0x41 and b6 <= 0x5A) then
-      return parse_dataset_explicit(ds_bytes)
+    local vr = ds_bytes:sub(5, 6)
+    if KNOWN_VRS[vr] then
+      return parse_dataset_explicit(ds_bytes, endian)
     else
+      local b5, b6 = string.byte(ds_bytes, 5, 6)
       stdnse.debug1("DICOM: Expected Explicit VR but VR bytes 0x%02X%02X" ..
                     " invalid; falling back to Implicit", b5, b6)
       return parse_dataset_implicit(ds_bytes)
     end
   end
-  return parse_dataset_explicit(ds_bytes)
+  return parse_dataset_explicit(ds_bytes, endian)
 end
 
 -----------------------------------------------------------------------
 -- 8. DIMSE COMMAND SET BUILDERS
 -----------------------------------------------------------------------
--- Command sets are ALWAYS encoded in Implicit VR LE (PS3.7 §6.3.1).
+-- Command sets are ALWAYS encoded in Implicit VR LE (PS3.7 section 6.3.1).
 
 --- Build a C-ECHO-RQ command set.
 -- @param msg_id  Message ID
@@ -1095,6 +1264,19 @@ function build_cstore_rsp(msg_id_rsp, sop_class_uid, sop_inst_uid, status_code)
   return implicit_elem(0x0000, 0x0000, "UL", #cmd) .. cmd
 end
 
+--- Build a C-CANCEL-RQ command set (PS3.7 Table 9.3-5) to terminate an
+-- in-flight C-FIND, C-GET, or C-MOVE cleanly before releasing the association.
+-- @param msg_id_rsp  Message ID Being Responded To (default: 1)
+-- @return Command set bytes (Implicit VR LE)
+function build_ccancel_rq(msg_id_rsp)
+  msg_id_rsp = msg_id_rsp or 1
+  local cmd = ""
+  cmd = cmd .. implicit_elem(0x0000, 0x0100, "US", COMMAND_FIELD.C_CANCEL_RQ)
+  cmd = cmd .. implicit_elem(0x0000, 0x0120, "US", msg_id_rsp)
+  cmd = cmd .. implicit_elem(0x0000, 0x0800, "US", DATASET_NOT_PRESENT)
+  return implicit_elem(0x0000, 0x0000, "UL", #cmd) .. cmd
+end
+
 --- Build a C-FIND query dataset for a given Q/R level.
 -- @param level      QR_LEVEL value ("STUDY", "SERIES", "IMAGE")
 -- @param query_tags List of {group, elem, vr, value} tag tables
@@ -1174,6 +1356,24 @@ end
 -- 10. NETWORK LAYER
 -----------------------------------------------------------------------
 
+--- Parse a boolean script-arg value (accepts flag-style 1/true and string
+-- "true"/"1"/"yes"/"on" vs "false"/"0"/"no"/"off").
+-- @param val      Script-arg value (nil, boolean, number, or string)
+-- @param default  Value to return when val is nil or unrecognized
+-- @return boolean (or default)
+function parse_bool_arg(val, default)
+  if val == nil then return default end
+  if type(val) == "boolean" then return val end
+  if type(val) == "number" then return val ~= 0 end
+  local s = tostring(val):lower()
+  if s == "true" or s == "1" or s == "yes" or s == "on" then
+    return true
+  elseif s == "false" or s == "0" or s == "no" or s == "off" then
+    return false
+  end
+  return default
+end
+
 --- Create a new Nmap socket with timeout.
 function new_sock(timeout_s)
   local s = nmap.new_socket()
@@ -1186,25 +1386,28 @@ end
 -- detection decides instead: an SSL tunnel or a dicom-tls service name from
 -- -sV means TLS.
 -- @param port (optional) Port table
--- @return true if dicom.tls=true was supplied on the command line, or if it
---         is unset and the port was detected as TLS
+-- @return true if dicom.tls is truthy on the command line, or if it is unset
+--         and the port was detected as TLS
 function tls_enabled(port)
   local arg = stdnse.get_script_args("dicom.tls")
-  if arg ~= nil or type(port) ~= "table" or not port.version then
-    return arg == "true"
+  if arg ~= nil then
+    return parse_bool_arg(arg, false)
+  end
+  if type(port) ~= "table" or not port.version then
+    return false
   end
   local v = port.version
   return v.service_tunnel == "ssl"
       or (type(v.name) == "string" and v.name:match("tls") ~= nil)
 end
 
---- Connect a socket.  Returns ok, err.
+--- Connect a socket. Returns ok, err.
 -- @param sock Nmap socket
 -- @param host Host object
 -- @param port Port object (or number)
--- @param tls  true = TLS, false = plain TCP, nil = honor the dicom.tls arg
+-- @param tls  true = TLS, false = plain TCP, nil = honor dicom.tls / -sV
 function tcp_connect(sock, host, port, tls)
-  if tls == nil then tls = tls_enabled() end
+  if tls == nil then tls = tls_enabled(port) end
   return sock:connect(host, port, tls and "ssl" or "tcp")
 end
 
@@ -1217,37 +1420,78 @@ function get_cert(sock)
   return nil
 end
 
---- Send all bytes on a socket.  Returns ok, err.
+--- Send all bytes on a socket. Returns ok, err.
 function tcp_send(sock, data)
   if not data or #data == 0 then return true end
   return sock:send(data)
 end
 
+-- Maximum P-DATA-TF PDU body accepted when receiving large images (16 MB).
+local MAX_DATA_PDU_LEN = 16 * 1024 * 1024
+
+-- Extract one complete DICOM PDU from buf if ready. Returns:
+--   "ok", pdu_data, remaining  when a full PDU (or non-DICOM banner) is ready
+--   "err", err_str, ""         when the declared PDU length exceeds safe bounds
+--   nil                        when more bytes are needed from the socket
+local function try_extract_pdu(buf)
+  if #buf < 1 then return nil end
+  local ptype = string.byte(buf, 1)
+  -- Non-DICOM protocol response (HTTP, SSH, TLS alert 0x15, etc.): return
+  -- immediately instead of waiting for bogus length bytes.
+  if ptype < PDU_CODES.ASSOCIATE_REQUEST or ptype > PDU_CODES.ABORT then
+    return "ok", buf, ""
+  end
+  if #buf < 6 then return nil end
+  local pdu_len = string.unpack(">I4", buf, 3)
+  local max_len
+  if ptype == PDU_CODES.DATA then
+    max_len = MAX_DATA_PDU_LEN
+  elseif ptype == PDU_CODES.ASSOCIATE_REQUEST
+      or ptype == PDU_CODES.ASSOCIATE_ACCEPT then
+    max_len = MAX_SIZE_PDU
+  else
+    -- A-ASSOCIATE-RJ, A-RELEASE-RQ/RP, A-ABORT have a fixed 4-byte body.
+    max_len = 64
+  end
+  if pdu_len > max_len then
+    return "err", string.format("PDU_TOO_LARGE(%d)", pdu_len), ""
+  end
+  if #buf >= 6 + pdu_len then
+    return "ok", buf:sub(1, 6 + pdu_len), buf:sub(6 + pdu_len + 1)
+  end
+  return nil
+end
+
 --- Receive bytes until one complete PDU is assembled.
 -- Accepts an optional carry buffer containing leftover bytes from a
 -- previous call (when multiple PDUs arrive in a single TCP segment).
--- Returns the extracted PDU **and** any remaining bytes so the caller
+-- Returns the extracted PDU and any remaining bytes so the caller
 -- can feed them back into the next call.
 --
 -- @param sock      Nmap socket
--- @param timeout_s Timeout in seconds (used for error classification)
+-- @param timeout_s Optional timeout in seconds (bounds overall PDU assembly)
 -- @param carry     (optional) leftover bytes from a previous recv_pdu call
--- @return ok (bool), data_or_err (string), remaining (string – leftover bytes,
+-- @return ok (bool), data_or_err (string), remaining (string - leftover bytes,
 -- empty on error)
 function recv_pdu(sock, timeout_s, carry)
   local buf = carry or ""
-  -- If carry already contains a full PDU, extract it without reading the
-  -- socket
-  if #buf >= 6 then
-    local pdu_len = string.unpack(">I4", buf, 3)
-    if #buf >= 6 + pdu_len then
-      local pdu_data  = buf:sub(1, 6 + pdu_len)
-      local remaining = buf:sub(6 + pdu_len + 1)
-      return true, pdu_data, remaining
-    end
+  local state, pdu_or_err, rem = try_extract_pdu(buf)
+  if state == "ok" then
+    return true, pdu_or_err, rem
+  elseif state == "err" then
+    return false, pdu_or_err, ""
   end
+
+  local deadline_ms = nil
+  if type(timeout_s) == "number" and timeout_s > 0 then
+    deadline_ms = nmap.clock_ms() + math.max(timeout_s * 1000 * 3, 15000)
+  end
+
   local ok, chunk
-  for _ = 1, 30 do
+  for _ = 1, 4096 do
+    if deadline_ms and nmap.clock_ms() > deadline_ms then
+      return false, "TIMEOUT", ""
+    end
     ok, chunk = sock:receive()
     if not ok then
       if chunk and chunk:find("TIMEOUT") then
@@ -1256,16 +1500,14 @@ function recv_pdu(sock, timeout_s, carry)
       return false, "CONNECTION_RESET", ""
     end
     buf = buf .. chunk
-    if #buf >= 6 then
-      local pdu_len = string.unpack(">I4", buf, 3)
-      if #buf >= 6 + pdu_len then
-        local pdu_data  = buf:sub(1, 6 + pdu_len)
-        local remaining = buf:sub(6 + pdu_len + 1)
-        return true, pdu_data, remaining
-      end
+    state, pdu_or_err, rem = try_extract_pdu(buf)
+    if state == "ok" then
+      return true, pdu_or_err, rem
+    elseif state == "err" then
+      return false, pdu_or_err, ""
     end
   end
-  if #buf > 0 then return true, buf, "" end
+  if #buf > 0 then return false, "TRUNCATED_PDU", "" end
   return false, "NO_DATA", ""
 end
 
@@ -1275,36 +1517,34 @@ end
 
 --- Send a DIMSE message (command set + optional dataset) as P-DATA-TF PDU(s).
 --
--- When both the command and dataset fit within a single PDU, they are
--- combined into one P-DATA-TF PDU with two PDV items (matching the
--- behaviour of DCMTK and pynetdicom).  For larger payloads, the dataset
--- is fragmented across multiple PDUs.
+-- Sends the command set in its own P-DATA-TF PDU followed by the dataset
+-- fragmented across P-DATA-TF PDUs sized to max_pdu (PS3.8 section 9.3.5).
 --
--- Command sets are always Implicit VR LE.  The dataset must already be
+-- Command sets are always Implicit VR LE. The dataset must already be
 -- encoded in the negotiated transfer syntax before calling this function.
 --
 -- @param sock      Nmap socket
 -- @param pctx_id   Accepted presentation context ID
 -- @param cmd_bytes Command set bytes (Implicit VR LE)
 -- @param ds_bytes  Dataset bytes (already encoded in negotiated TS), or nil
--- @param max_pdu   Max PDU size (use server's negotiated value)
+-- @param max_pdu   Max PDU size (0 means unlimited per PS3.8 Annex D.1.1)
 -- @return ok (bool), err (string or nil)
 function send_dimse(sock, pctx_id, cmd_bytes, ds_bytes, max_pdu)
-  max_pdu = max_pdu or MAX_PDU_DEFAULT
+  if not max_pdu or max_pdu == 0 then max_pdu = MAX_PDU_DEFAULT end
   local max_frag = max_pdu - 12
   if max_frag < 1 then max_frag = 512 end
 
   -- Build command PDV: MCH 0x03 = command + last fragment
-  -- PS3.8 §9.3.5.1: Bit 0 = 1 → command, Bit 1 = 1 → last fragment
+  -- PS3.8 section 9.3.5.1: Bit 0 = 1 -> command, Bit 1 = 1 -> last fragment
   local cmd_pdv = string.pack(">I4 B B", 2 + #cmd_bytes, pctx_id, 0x03)
       .. cmd_bytes
 
   -- Always send command in its own P-DATA-TF PDU.
   -- Some DICOM implementations (including certain Orthanc/DCMTK builds)
   -- do not correctly handle multi-PDV P-DATA-TF PDUs where both the
-  -- command and dataset PDV items are combined into one PDU.  Sending
+  -- command and dataset PDV items are combined into one PDU. Sending
   -- them in separate PDUs is the most compatible approach and is
-  -- explicitly allowed by PS3.8 §9.3.5.
+  -- explicitly allowed by PS3.8 section 9.3.5.
   local pdu1 = string.pack(">B B I4", PDU_CODES.DATA, 0x00, #cmd_pdv)
       .. cmd_pdv
   local ok, err = tcp_send(sock, pdu1)
@@ -1321,7 +1561,7 @@ function send_dimse(sock, pctx_id, cmd_bytes, ds_bytes, max_pdu)
     local chunk   = ds_bytes:sub(offset, chunk_end)
     local is_last = (chunk_end >= #ds_bytes)
     local mch = is_last and 0x02
-        or 0x00 -- PS3.8: bit 0=0 → dataset, bit 1=1 → last
+        or 0x00 -- PS3.8: bit 0=0 -> dataset, bit 1=1 -> last
     local ds_pdv  = string.pack(">I4 B B", 2 + #chunk, pctx_id, mch) .. chunk
     local pdu = string.pack(">B B I4", PDU_CODES.DATA, 0x00, #ds_pdv) .. ds_pdv
     ok, err = tcp_send(sock, pdu)
@@ -1334,10 +1574,9 @@ end
 --- Receive a single DIMSE response (command + optional dataset).
 --
 -- The server may send the command and dataset in a single P-DATA-TF PDU
--- (with two PDV items) or in separate P-DATA-TF PDUs.  This function
--- handles both cases by checking CommandDataSetType (0000,0800) in the
--- command set: if a dataset is expected but not yet received, it reads
--- the next PDU to obtain it.
+-- (with two PDV items) or in separate P-DATA-TF PDUs, and either part may
+-- be fragmented across multiple PDUs. This function reassembles both
+-- fragments and checks CommandDataSetType (0000,0800) to read any dataset.
 --
 -- Accepts and returns a carry buffer so the caller can chain calls
 -- without losing bytes when multiple PDUs arrive in one TCP segment.
@@ -1346,13 +1585,13 @@ end
 -- @param timeout_s Timeout in seconds
 -- @param carry     (optional) leftover bytes from previous recv_pdu
 -- @return pdu_type (int or nil), cmd_elems (table), ds_bytes (string),
---         raw_pdu (string), remaining (string – leftover bytes for next call),
---         pctx_id (int or nil – presentation context the message arrived on;
+--         raw_pdu (string), remaining (string - leftover bytes for next call),
+--         pctx_id (int or nil - presentation context the message arrived on;
 --         needed to reply on the correct context during C-GET sub-operations)
 function recv_dimse(sock, timeout_s, carry)
   local remaining = carry or ""
 
-  -- Read first PDU (should contain at least the command set)
+  -- Read first PDU (should contain at least the start of the command set)
   local ok, data
   ok, data, remaining = recv_pdu(sock, timeout_s, remaining)
   if not ok then return nil, nil, "", data, remaining, nil end
@@ -1364,6 +1603,36 @@ function recv_dimse(sock, timeout_s, carry)
 
   local cmd_bytes, ds_bytes, cmd_complete, ds_complete,
       pctx_id = parse_pdata(data)
+
+  -- Reassemble fragmented command sets if the peer split command across PDUs.
+  local cmd_reads = 0
+  while #cmd_bytes > 0 and not cmd_complete and cmd_reads < 64 do
+    cmd_reads = cmd_reads + 1
+    local okc, datac
+    okc, datac, remaining = recv_pdu(sock, timeout_s, remaining)
+    if not okc then
+      stdnse.debug2("recv_dimse: command reassembly read error: %s",
+          tostring(datac))
+      break
+    end
+    local pdu_type_c = string.byte(datac, 1)
+    if pdu_type_c ~= PDU_CODES.DATA then
+      remaining = datac .. remaining
+      break
+    end
+    local extra_cmd, extra_ds, extra_cmd_complete, extra_ds_complete, extra_pcid =
+        parse_pdata(datac)
+    if #extra_cmd > 0 then
+      cmd_bytes = cmd_bytes .. extra_cmd
+      cmd_complete = extra_cmd_complete
+    end
+    if #extra_ds > 0 then
+      ds_bytes = ds_bytes .. extra_ds
+      ds_complete = extra_ds_complete
+    end
+    if pctx_id == nil then pctx_id = extra_pcid end
+  end
+
   local cmd_elems = {}
   if #cmd_bytes > 0 then
     cmd_elems = parse_command_set(cmd_bytes)
@@ -1417,14 +1686,14 @@ end
 -- 12. CONNECTION / ASSOCIATION MANAGEMENT
 -----------------------------------------------------------------------
 
--- ── Legacy API (backward-compatible with built-in dicom.lua) ───────
+-- --- Legacy API (backward-compatible with built-in dicom.lua) -------
 
---- Legacy: start_connection(host, port) — opens TCP socket.
+--- Legacy: start_connection(host, port) - opens TCP socket.
 function start_connection(host, port)
   local dcm = {}
   local status, err
   dcm['socket'] = nmap.new_socket()
-  local proto = tls_enabled() and "ssl" or "tcp"
+  local proto = tls_enabled(port) and "ssl" or "tcp"
   status, err = dcm['socket']:connect(host, port, proto)
   if status == false then
     return false, "DICOM: Failed to connect to host: " .. err
@@ -1454,20 +1723,16 @@ end
 
 --- Legacy: associate(host, port, calling_aet, called_aet)
 function associate(host, port, calling_aet, called_aet)
-  local application_context = ""
-  local presentation_context = ""
-  local userinfo_context = ""
-
   local status, dcm = start_connection(host, port)
   if status == false then return false, dcm end
 
   local application_context_name = "1.2.840.10008.3.1.1.1"
-  application_context = string.pack(">B B s2", 0x10, 0x0,
+  local application_context = string.pack(">B B s2", 0x10, 0x0,
       application_context_name)
 
   local abstract_syntax_name = "1.2.840.10008.1.1"
   local transfer_syntax_name = "1.2.840.10008.1.2"
-  presentation_context = string.pack(">B B I2 B B B B B B s2 B B s2",
+  local presentation_context = string.pack(">B B I2 B B B B B B s2 B B s2",
     0x20, 0x0, 0x2e,
     0x1, 0x0, 0x0, 0x0,
     0x30, 0x0, abstract_syntax_name,
@@ -1475,7 +1740,7 @@ function associate(host, port, calling_aet, called_aet)
 
   local implementation_id = IMPL_CLASS_UID
   local implementation_version = IMPL_VERSION
-  userinfo_context = string.pack(">B B I2 B B I2 I4 B B s2 B B s2",
+  local userinfo_context = string.pack(">B B I2 B B I2 I4 B B s2 B B s2",
     0x50, 0x0, 0x3a,
     0x51, 0x0, 0x04, 0x4000,
     0x52, 0x0, implementation_id,
@@ -1498,7 +1763,8 @@ function associate(host, port, calling_aet, called_aet)
     .. presentation_context
     .. userinfo_context
 
-  local status, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"],
+  local header
+  status, header = pdu_header_encode(PDU_CODES["ASSOCIATE_REQUEST"],
       #assoc_request)
   if status == false then return false, header end
 
@@ -1510,7 +1776,8 @@ function associate(host, port, calling_aet, called_aet)
       " %d.",
       MIN_SIZE_ASSOC_REQ, #assoc_request)
   end
-  local status, err = send(dcm, assoc_request)
+  local err
+  status, err = send(dcm, assoc_request)
   if status == false then
     return false, string.format("Couldn't send ASSOCIATE request:%s", err)
   end
@@ -1541,7 +1808,7 @@ function send_pdata(dicom, data)
   if status == false then return false, err end
 end
 
--- ── New API ────────────────────────────────────────────────────────
+-- --- New API --------------------------------------------------------
 
 --- Perform A-ASSOCIATE-RQ and parse A-ASSOCIATE-AC.
 -- @param host           Nmap host object
@@ -1561,11 +1828,12 @@ end
 -- @return ok, sock_or_err, pctx_map, server_max_pdu, elapsed_ms, ac_info
 function do_associate(host, port, called_ae, calling_ae, sop_classes, max_pdu,
     timeout_s, transfer_uids, roles, tls)
-  if tls == nil then tls = tls_enabled() end
+  if tls == nil then tls = tls_enabled(port) end
   local sock = new_sock(timeout_s)
   local t0 = nmap.clock_ms()
   local ok, err = tcp_connect(sock, host, port, tls)
   if not ok then
+    stdnse.debug2("DICOM: do_associate connect failed: %s", tostring(err))
     sock:close()
     return false, "CONN_REFUSED", nil, nil, nmap.clock_ms() - t0
   end
@@ -1574,6 +1842,7 @@ function do_associate(host, port, called_ae, calling_ae, sop_classes, max_pdu,
       transfer_uids, roles)
   ok, err = tcp_send(sock, assoc_rq)
   if not ok then
+    stdnse.debug2("DICOM: do_associate send failed: %s", tostring(err))
     sock:close()
     return false, "SEND_FAILED", nil, nil, nmap.clock_ms() - t0
   end
@@ -1582,7 +1851,7 @@ function do_associate(host, port, called_ae, calling_ae, sop_classes, max_pdu,
   ok, resp = recv_pdu(sock, timeout_s)
   local elapsed = nmap.clock_ms() - t0
   if not ok then
-    sock:close()
+    do_abort(sock)
     return false, resp, nil, nil, elapsed
   end
 
@@ -1607,21 +1876,66 @@ function do_associate(host, port, called_ae, calling_ae, sop_classes, max_pdu,
     sock:close()
     return false, "A-ABORT", nil, nil, elapsed
   else
-    sock:close()
+    do_abort(sock, 2, 2)
     return false,
       string.format("UNEXPECTED_PDU(0x%02X)", pdu_type),
       nil, nil, elapsed
   end
 end
 
+--- Send A-ABORT (PS3.8 section 9.3.8) and close the socket (best-effort).
+-- Frees the association slot immediately on error/timeout paths instead of
+-- leaving the SCP waiting for its ARTIM/idle timer.
+-- @param sock   Nmap socket
+-- @param source Abort source byte (default: 0 = DICOM UL service-user)
+-- @param reason Reason/diag byte (default: 0 = not-specified)
+function do_abort(sock, source, reason)
+  if not sock then return end
+  source = source or 0
+  reason = reason or 0
+  pcall(function()
+    tcp_send(sock, string.pack(">B B I4 B B B B",
+      PDU_CODES.ABORT, 0x00, 0x04, 0x00, 0x00, source, reason))
+  end)
+  pcall(function() sock:close() end)
+end
+
 --- Send A-RELEASE-RQ and wait for A-RELEASE-RP (best-effort).
+-- Falls back to A-ABORT if the release response never arrives so the SCP
+-- frees the association slot promptly.
 function do_release(sock, timeout_s)
+  if not sock then return end
   local rel_rq = string.pack(">B B I4 I4",
     PDU_CODES.RELEASE_REQUEST, 0x00, 0x04, 0x00000000)
   sock:set_timeout((timeout_s or 3) * 1000)
-  tcp_send(sock, rel_rq)
-  pcall(function() sock:receive() end)
-  sock:close()
+  local ok = tcp_send(sock, rel_rq)
+  local rok, resp = false, nil
+  if ok then
+    rok, resp = recv_pdu(sock, timeout_s or 3)
+  end
+  local ptype = rok and string.byte(resp, 1) or nil
+  if ptype == PDU_CODES.RELEASE_RESPONSE or ptype == PDU_CODES.ABORT then
+    pcall(function() sock:close() end)
+  else
+    do_abort(sock)
+  end
+end
+
+--- Execute fn(...) while holding the per-host DICOM association mutex.
+-- Shared by associate_extended() and safe DIMSE scripts (such as
+-- dicom-cfind-ls) so concurrent scripts or ports on the same PACS never
+-- open parallel associations and exhaust clinical association pools.
+-- @param host  Host table or IP string
+-- @param fn    Function to run under the lock
+-- @return      Whatever fn(...) returns
+function with_host_lock(host, fn, ...)
+  local key = type(host) == "table" and host.ip or tostring(host)
+  local mutex = nmap.mutex("dicom-association-" .. key)
+  mutex "lock"
+  local r = table.pack(pcall(fn, ...))
+  mutex "done"
+  if not r[1] then error(r[2], 0) end
+  return table.unpack(r, 2, r.n)
 end
 
 --- Find the first accepted presentation context ID from a pctx map.
@@ -1727,7 +2041,7 @@ function read_dcm_dataset(filepath)
     end
     return data:sub(pos), sop_class, sop_instance, ts_uid
   else
-    stdnse.debug2("No DICM magic in %s — sending raw file as dataset",
+    stdnse.debug2("No DICM magic in %s -- sending raw file as dataset",
         filepath)
     return data, SOP_CLASS.CT_IMAGE_STORAGE, generate_fake_uid(),
         TRANSFER_SYNTAX.EXPLICIT_LE
@@ -1798,11 +2112,17 @@ local function nonempty(s)
   return s
 end
 
--- Open the transport for one association, honoring dicom.tls and -sV.
-local function connect(host, port)
-  local tls = tls_enabled(port)
-  local timeout = math.floor(tonumber(stdnse.get_script_args("dicom.timeout_ms"))
-      or DEFAULT_TIMEOUT_MS)
+-- Open the transport for one association, honoring dicom.tls, opts.tls, and -sV.
+local function connect(host, port, opts)
+  local tls
+  if opts and opts.tls ~= nil then
+    tls = opts.tls
+  else
+    tls = tls_enabled(port)
+  end
+  local timeout = math.max(100, math.floor(tonumber(
+      (opts and opts.timeout_ms) or stdnse.get_script_args("dicom.timeout_ms"))
+      or DEFAULT_TIMEOUT_MS))
   local sock = nmap.new_socket()
   sock:set_timeout(timeout)
   local ok, err = tcp_connect(sock, host, port, tls)
@@ -1811,11 +2131,11 @@ local function connect(host, port)
     return false, "DICOM: Failed to connect to host: " .. tostring(err)
   end
   if tls then stdnse.debug1("DICOM: Using DICOM-over-TLS") end
-  return true, { sock = sock, tls = tls, carry = "" }
+  return true, { sock = sock, tls = tls, carry = "", timeout_s = timeout / 1000 }
 end
 
 local function recv(conn)
-  local ok, data, remaining = recv_pdu(conn.sock, nil, conn.carry)
+  local ok, data, remaining = recv_pdu(conn.sock, conn.timeout_s, conn.carry)
   conn.carry = remaining or ""
   return ok, data
 end
@@ -1888,9 +2208,9 @@ end
 -- completed, or the SCP already ended it with A-ASSOCIATE-RJ / A-ABORT) or
 -- sends A-ABORT. On accept returns true, nil, results, info where
 -- results[k] is the outcome of pcs[k].
-local function negotiate(conn, calling_aet, called_aet, pcs)
+local function negotiate(conn, calling_aet, called_aet, pcs, max_pdu)
   local ok, err = tcp_send(conn.sock,
-      build_assoc_rq(called_aet, calling_aet, pcs, MAX_PDU_DEFAULT))
+      build_assoc_rq(called_aet, calling_aet, pcs, max_pdu or MAX_PDU_DEFAULT))
   if not ok then
     abort(conn)
     return false, "Couldn't send ASSOCIATE request: " .. tostring(err)
@@ -1922,7 +2242,7 @@ local function negotiate(conn, calling_aet, called_aet, pcs)
   -- Grab the peer certificate before the socket closes.
   local cert = conn.tls and get_cert(conn.sock) or nil
 
-  if stdnse.get_script_args("dicom.no_release") ~= nil then
+  if parse_bool_arg(stdnse.get_script_args("dicom.no_release"), false) then
     abort(conn)
   else
     release(conn)
@@ -1950,12 +2270,13 @@ end
 -- One association attempt. A Lua error mid-negotiation (say, a parser bug
 -- tripped by a malformed A-ASSOCIATE-AC) still sends A-ABORT before it
 -- propagates.
-local function associate_once(host, port, calling_aet, called_aet, pcs)
-  local status, conn = connect(host, port)
+local function associate_once(host, port, calling_aet, called_aet, pcs, opts)
+  local status, conn = connect(host, port, opts)
   if not status then
     return false, conn
   end
-  local r = table.pack(pcall(negotiate, conn, calling_aet, called_aet, pcs))
+  local r = table.pack(pcall(negotiate, conn, calling_aet, called_aet, pcs,
+      opts and opts.max_pdu))
   if not r[1] then
     abort(conn)
     error(r[2], 0)
@@ -1971,11 +2292,11 @@ local function is_busy_reject(err)
       and (err.reason == 1 or err.reason == 2)
 end
 
-local function associate_with_retry(host, port, calling_aet, called_aet, pcs)
+local function associate_with_retry(host, port, calling_aet, called_aet, pcs, opts)
   local retries = math.max(0, math.floor(
       tonumber(stdnse.get_script_args("dicom.retries")) or DEFAULT_RETRIES))
-  local backoff = tonumber(stdnse.get_script_args("dicom.backoff_ms"))
-      or DEFAULT_BACKOFF_MS
+  local backoff = math.max(0, tonumber(stdnse.get_script_args("dicom.backoff_ms"))
+      or DEFAULT_BACKOFF_MS)
   local r
   for attempt = 0, retries do
     if attempt > 0 then
@@ -1984,7 +2305,7 @@ local function associate_with_retry(host, port, calling_aet, called_aet, pcs)
           r[2].reason_text or "?", attempt, retries, delay)
       stdnse.sleep(delay / 1000)
     end
-    r = table.pack(associate_once(host, port, calling_aet, called_aet, pcs))
+    r = table.pack(associate_once(host, port, calling_aet, called_aet, pcs, opts))
     if r[1] or not is_busy_reject(r[2]) then break end
   end
   return table.unpack(r, 1, r.n)
@@ -1996,15 +2317,9 @@ end
 -- PACS, or several DICOM scripts at once -- could otherwise fill the pool
 -- and lock out clinical traffic. The lock is held through retry backoff so
 -- the wait is genuinely quiet on the wire.
-local function associate_serialized(host, port, calling_aet, called_aet, pcs)
-  local key = type(host) == "table" and host.ip or tostring(host)
-  local mutex = nmap.mutex("dicom-association-" .. key)
-  mutex "lock"
-  local r = table.pack(pcall(associate_with_retry, host, port, calling_aet,
-      called_aet, pcs))
-  mutex "done"
-  if not r[1] then error(r[2], 0) end
-  return table.unpack(r, 2, r.n)
+local function associate_serialized(host, port, calling_aet, called_aet, pcs, opts)
+  return with_host_lock(host, associate_with_retry, host, port, calling_aet,
+      called_aet, pcs, opts)
 end
 
 -- A-ASSOCIATE-RQ size before any presentation context items.
@@ -2071,6 +2386,8 @@ end
 -- @param called_aet Called AE Title (default: dicom.called_aet, then ANY-SCP)
 -- @param presentation_contexts List of
 --        {abstract_syntax = uid, transfer_syntaxes = {uid, ...}}
+-- @param opts (optional) Table overriding {max_pcs, max_rq_bytes, max_pdu,
+--             timeout_ms, tls}
 -- @return true on accept, false if the first association failed
 -- @return nil on accept; otherwise an error string, or a table decoding the
 --         A-ASSOCIATE-RJ: {err, result, source, reason, result_text,
@@ -2085,7 +2402,7 @@ end
 --         split into; errors (nil when complete) describes a failed
 --         follow-up association.
 function associate_extended(host, port, calling_aet, called_aet,
-    presentation_contexts)
+    presentation_contexts, opts)
   if not presentation_contexts or #presentation_contexts == 0 then
     return false, "presentation_contexts must contain at least one entry"
   end
@@ -2097,10 +2414,12 @@ function associate_extended(host, port, calling_aet, called_aet,
     return false, "Calling/Called Application Entity Title must be at most 16 bytes"
   end
 
-  local max_pcs = math.floor(tonumber(stdnse.get_script_args("dicom.max_pcs"))
+  local max_pcs = math.floor(tonumber(
+      (opts and opts.max_pcs) or stdnse.get_script_args("dicom.max_pcs"))
       or DEFAULT_MAX_PCS)
   max_pcs = math.max(2, math.min(MAX_PCS_PER_RQ, max_pcs))
-  local max_bytes = tonumber(stdnse.get_script_args("dicom.max_rq_bytes"))
+  local max_bytes = tonumber(
+      (opts and opts.max_rq_bytes) or stdnse.get_script_args("dicom.max_rq_bytes"))
       or DEFAULT_MAX_RQ_BYTES
 
   local batches = plan_batches(presentation_contexts, max_pcs, max_bytes)
@@ -2119,7 +2438,7 @@ function associate_extended(host, port, calling_aet, called_aet,
       stdnse.sleep(BATCH_GAP_MS / 1000)
     end
     local ok, err, results, batch_info =
-        associate_serialized(host, port, calling_aet, called_aet, pcs)
+        associate_serialized(host, port, calling_aet, called_aet, pcs, opts)
     if not ok then
       if b == 1 then return false, err end
       errors[#errors + 1] = string.format("association %d of %d failed: %s",
@@ -2156,13 +2475,21 @@ end
 -- the wire (where the parser bugs and CVEs live); "manufacturer" is the
 -- device OEM (asset inventory). Most-specific patterns first.
 local TOOLKIT_UID_PATTERNS = {
-  {"^1%.3%.6%.1%.4%.1%.25403%.",              "ClearCanvas"},
-  {"^1%.3%.6%.1%.4%.1%.30071%.8",             "fo-dicom"},
-  {"^1%.2%.826%.0%.1%.3680043%.9%.3811%.",    "pynetdicom"},
-  {"^1%.2%.826%.0%.1%.3680043%.8%.641%.",     "Orthanc"},
-  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.",    "OsiriX/Horos"},
-  {"^1%.2%.276%.0%.7230010%.3%.",             "DCMTK"},
-  {"^1%.2%.40%.0%.13%.1%.3",                  "dcm4che"},
+  {"^1%.3%.6%.1%.4%.1%.25403%.",                   "ClearCanvas"},
+  {"^1%.2%.826%.0%.1%.3680043%.2%.1343%.",         "ClearCanvas"},
+  {"^1%.3%.6%.1%.4%.1%.30071%.8",                  "fo-dicom"},
+  {"^1%.2%.826%.0%.1%.3680043%.9%.3811%.",         "pynetdicom"},
+  {"^1%.2%.826%.0%.1%.3680043%.8%.498%.",          "pydicom"},
+  {"^1%.2%.826%.0%.1%.3680043%.2%.1545%.1%.2%.1%.9$", "MicroDicom"},
+  {"^1%.2%.826%.0%.1%.3680043%.8%.641%.",          "Orthanc"},
+  {"^1%.2%.826%.0%.1%.3680043%.2%.1545%.",         "Orthanc"},
+  {"^1%.2%.826%.0%.1%.3680043%.8%.1057%.",         "OsiriX/Horos"},
+  {"^1%.2%.276%.0%.7238010%.3%.",                  "Horos"},
+  {"^2%.16%.756%.5%.5%.100%.3611%.",               "OsiriX"},
+  {"^1%.2%.276%.0%.7230010%.3%.",                  "DCMTK"},
+  {"^1%.2%.40%.0%.13%.",                           "dcm4che"},
+  {"^1%.2%.826%.0%.1%.3680043%.2%.1143%.",         "GDCM"},
+  {"^1%.2%.826%.0%.1%.3680043%.2%.46%.",           "Merge Healthcare SDK"},
   {"^1%.2%.826%.0%.1%.3680043%.2%.135%.1066%.101", "ConQuest"},
 }
 
@@ -2170,11 +2497,17 @@ local MANUFACTURER_UID_PATTERNS = {
   {"^1%.2%.840%.113619%.",                    "GE Healthcare"},
   {"^1%.3%.12%.2%.1107%.",                    "Siemens"},
   {"^1%.2%.840%.114257%.",                    "Agfa"},
+  {"^1%.2%.124%.113532%.",                    "Agfa"},
   {"^1%.2%.840%.113704%.",                    "Philips"},
   {"^1%.3%.46%.670589%.",                     "Philips"},
   {"^1%.2%.840%.113564%.",                    "Carestream"},
-  {"^1%.2%.392%.200036%.",                    "Fujifilm"},
+  {"^1%.2%.392%.200036%.9116%.",              "Canon Medical / Toshiba"},
+  {"^1%.2%.392%.200036%.9125%.",              "Fujifilm"},
+  {"^1%.2%.392%.200036%.9123%.",              "Fujifilm Healthcare / Hitachi"},
+  {"^1%.2%.840%.114302%.",                    "Fujifilm"},
   {"^1%.2%.840%.113669%.",                    "Merge Healthcare"},
+  {"^1%.2%.752%.24%.7%.",                     "Sectra"},
+  {"^1%.2%.826%.0%.1%.3680043%.2%.228%.",     "Visage Imaging"},
 }
 
 -- Toolkit signatures in the Implementation Version Name (0x55): a
@@ -2186,6 +2519,9 @@ local TOOLKIT_PATTERNS = {
   {"mergecom",       "Merge Healthcare SDK"},
   {"dcm4che",        "dcm4che"},
   {"pynetdicom",     "pynetdicom"},
+  {"pydicom",        "pydicom"},
+  {"gdcm",           "GDCM"},
+  {"microdicom",     "MicroDicom"},
   {"leadtools",      "LeadTools"},
   {"clearcanvas",    "ClearCanvas"},
   {"orthanc",        "Orthanc"},
@@ -2237,13 +2573,13 @@ local function identify_toolkit(version_str)
   return nil
 end
 
--- Pull a version number out of an Implementation Version Name, using the
--- toolkit's own format where it is known. Returns the cleaned string as-is
--- when no version number is found.
-local function extract_clean_version(version_str, vendor)
-  if not version_str then return nil end
-  local s = trim(version_str)
-  if s == "" then return nil end
+-- Pull a version number out of an Implementation Version Name (or a
+-- version-bearing Implementation Class UID such as DCMTK or pynetdicom),
+-- using the toolkit's own format where it is known. Returns nil when no
+-- version number is found.
+local function extract_clean_version(version_str, vendor, impl_uid)
+  local s = version_str and trim(version_str) or ""
+  local u = impl_uid and trim(impl_uid) or ""
   local v = vendor and vendor:lower()
   local low = s:lower()
 
@@ -2253,14 +2589,23 @@ local function extract_clean_version(version_str, vendor)
     if sem then return sem end
     local a, b, c = low:match("dcmtk%D*(%d)(%d)(%d+)")
     if a then return string.format("%s.%s.%s", a, b, c) end
+    -- DCMTK embeds its version in the Implementation Class UID:
+    -- 1.2.276.0.7230010.3.0.<major>.<minor>.<patch>
+    local uid_ver = u:match("^1%.2%.276%.0%.7230010%.3%.0%.(%d+%.%d+%.%d+)$")
+    if uid_ver then return uid_ver end
   end
 
   if v == "pynetdicom" or low:find("pynetdicom", 1, true) then
-    -- pynetdicom 3.x sends PYNETDICOM_304, which is unambiguous only for
-    -- single-digit components, so only the dotted form is parsed.
+    -- pynetdicom 3.x sends PYNETDICOM_304 in 0x55 (unambiguous only for
+    -- single-digit components), but embeds the dotted version at the tail of
+    -- its Implementation Class UID (1.2.826.0.1.3680043.9.3811.<ver>).
     local sem = low:match("pynetdicom[%s_/:-]+(%d+%.%d+%.?%d*)")
     if sem then return sem end
+    local uid_ver = u:match("^1%.2%.826%.0%.1%.3680043%.9%.3811%.(%d+%.%d+%.?%d*)$")
+    if uid_ver then return uid_ver end
   end
+
+  if s == "" then return nil end
 
   if v == "dcm4che" or low:find("dcm4che", 1, true) then
     local sem = low:match("dcm4che[%w-]*[%s/:-]+(%d+%.%d+%.%d+)")
@@ -2297,7 +2642,7 @@ local function extract_clean_version(version_str, vendor)
     if sem then return sem end
   end
 
-  return s:match("(%d+%.%d+%.%d+)") or s:match("(%d+%.%d+)") or s
+  return s:match("(%d+%.%d+%.%d+)") or s:match("(%d+%.%d+)")
 end
 
 ---
@@ -2335,7 +2680,7 @@ function resolve_vendor_info(impl_version, impl_uid)
   elseif uid_category == "manufacturer" then
     device_vendor = uid_name
   end
-  clean_version = extract_clean_version(impl_version, vendor)
+  clean_version = extract_clean_version(impl_version, vendor, impl_uid)
   stdnse.debug1("DICOM: vendor=%s device=%s version=%s",
       tostring(vendor), tostring(device_vendor), tostring(clean_version))
 

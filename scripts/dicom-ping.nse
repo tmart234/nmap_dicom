@@ -95,13 +95,21 @@ local stdnse    = require "stdnse"
 local nmap      = require "nmap"
 local string    = require "string"
 
--- Parse a comma/space separated port list into a lookup set.
+-- Parse a comma/space separated port list (or Lua table from --script-args)
+-- into a lookup set.
 local function parse_ports_arg(ports_str)
   if not ports_str then return nil end
   local set = {}
-  for num in string.gmatch(ports_str, "%d+") do
-    local n = tonumber(num)
-    if n then set[n] = true end
+  if type(ports_str) == "table" then
+    for _, v in pairs(ports_str) do
+      local n = tonumber(v)
+      if n then set[n] = true end
+    end
+  else
+    for num in string.gmatch(tostring(ports_str), "%d+") do
+      local n = tonumber(num)
+      if n then set[n] = true end
+    end
   end
   return (next(set) and set) or nil
 end
@@ -118,12 +126,39 @@ local VERIFICATION_PC = {
   transfer_syntaxes = { dicom.TRANSFER_SYNTAX.IMPLICIT_LE, dicom.TRANSFER_SYNTAX.EXPLICIT_LE },
 }
 
--- Default/common DICOM ports:
-local COMMON_DICOM_PORTS = {104, 11112, 2761, 2762, 4242}
+-- Default/common DICOM ports (preserving upstream port 2345):
+local COMMON_DICOM_PORTS = {104, 2345, 2761, 2762, 4242, 11112}
 
--- Cache custom ports at script load
+-- Cache custom ports and version-aware portrule at script load.
 local custom_ports_arg = stdnse.get_script_args("dicom-ping.ports")
 local custom_ports_set = parse_ports_arg(custom_ports_arg)
+local default_portrule = shortport.version_port_or_service(
+  COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, "tcp", "open")
+
+local function is_likely_mtls_error(err)
+  local s = tostring(err or "")
+  if s:find("unexpected response PDU", 1, true)
+      or s:find("PDU_TOO_LARGE", 1, true)
+      or s:find("TRUNCATED_PDU", 1, true) then
+    return false
+  end
+  return s:find("Failed to connect", 1, true) ~= nil
+    or s:find("Couldn't send ASSOCIATE request", 1, true) ~= nil
+    or s:find("CONNECTION_RESET", 1, true) ~= nil
+    or s:find("EOF", 1, true) ~= nil
+    or s:find("TIMEOUT", 1, true) ~= nil
+    or s:find("ERROR", 1, true) ~= nil
+end
+
+local function is_expected_dicom_tls_port(port)
+  if stdnse.get_script_args("dicom.tls") ~= nil then return true end
+  local vname = port.version and port.version.name
+  if vname == "dicom-tls" or vname == "dicom" then return true end
+  if vname and vname ~= "" and vname ~= "unknown" then return false end
+  if tonumber(port.number) == 2762 then return true end
+  if custom_ports_set and custom_ports_set[port.number] then return true end
+  return port.service == "dicom-tls" or port.service == "dicom"
+end
 
 portrule = function(host, port)
   if not (port.protocol == "tcp" and port.state == "open") then
@@ -135,7 +170,7 @@ portrule = function(host, port)
     return true
   end
 
-  if shortport.port_or_service(COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, "tcp")(host, port) then
+  if default_portrule(host, port) then
     stdnse.debug1("dicom-ping: matched common DICOM port/service (%d)", port.number)
     return true
   end
@@ -148,7 +183,7 @@ action = function(host, port)
   local out = stdnse.output_table()
 
   local called_aet = stdnse.get_script_args("dicom.called_aet")
-  local extended   = stdnse.get_script_args("dicom-ping.extended") ~= nil
+  local extended   = dicom.parse_bool_arg(stdnse.get_script_args("dicom-ping.extended"), false)
 
   local is_tls = dicom.tls_enabled(port)
 
@@ -175,20 +210,23 @@ action = function(host, port)
       return out
     end
 
-    if is_tls then
+    if is_tls and is_likely_mtls_error(err) and is_expected_dicom_tls_port(port) then
       out.dicom    = "TLS endpoint detected, but DICOM association failed."
       out.tls_hint = "Server likely requires Mutual TLS (mTLS) with valid client certificates."
       out.error    = e
 
-      port.version.name = "dicom-tls"
-      nmap.set_port_version(host, port)
+      local cur = port.version and port.version.name
+      if not cur or cur == "" or cur == "unknown" or cur == "dicom" or cur == "dicom-tls" then
+        port.version.name = "dicom-tls"
+        nmap.set_port_version(host, port)
+      end
       return out
     end
 
     -- Heuristic: plaintext association failed on the IANA DICOM-TLS port
-    if tonumber(port.number) == 2762 then
+    if not is_tls and tonumber(port.number) == 2762 then
       out.dicom    = "Possible DICOM/TLS endpoint (plaintext A-ASSOCIATE not accepted)"
-      out.tls_hint = "Port 2762 is open, but DICOM associate could not be completed. Rerun with -sV or --script+ssl to confirm."
+      out.tls_hint = "Port 2762 is open, but DICOM associate could not be completed. Rerun with -sV or --script-args dicom.tls=true to confirm."
       out.error    = e
       return out
     end
@@ -203,7 +241,7 @@ action = function(host, port)
   if not called_aet or called_aet == "ANY-SCP" then
     out.config = "Any AET is accepted (Insecure)"
   else
-    out.config = string.format("Called AET enforced (used: %s)", called_aet)
+    out.config = string.format("Called AET accepted (used: %s)", called_aet)
   end
 
   if is_tls then
@@ -212,7 +250,7 @@ action = function(host, port)
     out.tls_hint = "Warning: Plaintext DICOM detected on IANA TLS port"
   end
 
-  local is_verbose = nmap.verbosity() > 0 or extended
+  local is_verbose = nmap.verbosity() > 1 or extended
   local identified = (vendor ~= nil)
 
   if vendor then

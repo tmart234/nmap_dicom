@@ -7,6 +7,16 @@ on:
     branches: [ main ]
 
 jobs:
+  luacheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install luacheck
+        run: sudo apt-get update && sudo apt-get install -y lua-check
+      - name: Lint Lua library and NSE scripts
+        run: luacheck nselib/dicom.lua scripts/*.nse
+
   test-nmap-dicom:
     runs-on: ubuntu-latest
     strategy:
@@ -59,15 +69,18 @@ jobs:
         run: |
           set -eux
           NMAP_SCRIPT_SRC="scripts/dicom-ping.nse"
-          NMAP_ENUM_SRC="scripts/dicom-enum.nse"
+          NMAP_INFO_SRC="scripts/dicom-info.nse"
+          NMAP_CFIND_SRC="scripts/dicom-cfind-ls.nse"
           NMAP_LIB_SRC="nselib/dicom.lua"
           NMAP_DIR="/usr/share/nmap"
           [ -f "$NMAP_SCRIPT_SRC" ] || { echo "::error::Missing $NMAP_SCRIPT_SRC"; exit 1; }
-          [ -f "$NMAP_ENUM_SRC" ]   || { echo "::error::Missing $NMAP_ENUM_SRC"; exit 1; }
+          [ -f "$NMAP_INFO_SRC" ]   || { echo "::error::Missing $NMAP_INFO_SRC"; exit 1; }
+          [ -f "$NMAP_CFIND_SRC" ]  || { echo "::error::Missing $NMAP_CFIND_SRC"; exit 1; }
           [ -f "$NMAP_LIB_SRC" ]    || { echo "::error::Missing $NMAP_LIB_SRC"; exit 1; }
           sudo mkdir -p "$NMAP_DIR/scripts" "$NMAP_DIR/nselib"
           sudo cp "$NMAP_SCRIPT_SRC" "$NMAP_DIR/scripts/"
-          sudo cp "$NMAP_ENUM_SRC"   "$NMAP_DIR/scripts/"
+          sudo cp "$NMAP_INFO_SRC"   "$NMAP_DIR/scripts/"
+          sudo cp "$NMAP_CFIND_SRC"  "$NMAP_DIR/scripts/"
           sudo cp "$NMAP_LIB_SRC"    "$NMAP_DIR/nselib/"
           sudo nmap --script-updatedb
 
@@ -190,41 +203,80 @@ jobs:
           grep -E '^[|]_?\s*version:\s*\S' "$OUT" || grep -E '^[|]\s+version:\s*\S' "$OUT" || { echo "::error::Missing version"; tail -n 200 "$OUT"; exit 1; }
           grep -E '^[|]_?\s*version:\s*.*[0-9]' "$OUT" || grep -E '^[|]\s+version:\s*.*[0-9]' "$OUT" || { echo "::error::Non-numeric version"; exit 1; }
 
-      - name: Run Nmap dicom-enum (${{ matrix.dicom_server.name }})
-        id: test_enum
+      - name: Run Nmap dicom-info (${{ matrix.dicom_server.name }})
+        id: test_info
         if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.expect_vendor_version != 'false'
         run: |
           set -euxo pipefail
           mkdir -p artifacts
-          OUT="artifacts/nmap_${{ matrix.dicom_server.name }}_enum.out"
-          # Reuse the row's nmap_args, swapping dicom-ping.ports → dicom-enum.ports
-          ENUM_ARGS=$(echo "${{ matrix.dicom_server.nmap_args }}" | sed 's/dicom-ping\.ports/dicom-enum.ports/g')
+          OUT="artifacts/nmap_${{ matrix.dicom_server.name }}_info.out"
+          # Reuse the row's nmap_args, swapping dicom-ping.ports -> dicom-info.ports
+          INFO_ARGS=$(echo "${{ matrix.dicom_server.nmap_args }}" | sed 's/dicom-ping\.ports/dicom-info.ports/g')
           nmap -p ${{ matrix.dicom_server.host_port }} \
                -n -Pn -dd -sV \
-               --script dicom-enum \
-               $ENUM_ARGS \
+               --script dicom-info \
+               $INFO_ARGS \
                --script-trace \
                localhost | tee "$OUT"
-          echo "enum_out=$OUT" >> $GITHUB_OUTPUT
+          echo "info_out=$OUT" >> $GITHUB_OUTPUT
 
-      - name: Assert dicom-enum result map (${{ matrix.dicom_server.name }})
+      - name: Assert dicom-info result map (${{ matrix.dicom_server.name }})
         if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.expect_vendor_version != 'false'
         run: |
-          OUT="${{ steps.test_enum.outputs.enum_out }}"
+          OUT="${{ steps.test_info.outputs.info_out }}"
           grep -qE 'association:\s+accepted' "$OUT" \
-            || { echo "::error::dicom-enum did not get an accept"; tail -n 200 "$OUT"; exit 1; }
-          # Result buckets are now nested tables: "accepted:" on one line then
-          # "count: N" indented underneath, replacing the old "accepted (N):"
-          # count-in-key form. Look for an "accepted:" line whose two-line
-          # follow-up contains a non-zero count.
+            || { echo "::error::dicom-info did not get an accept"; tail -n 200 "$OUT"; exit 1; }
+          # Result buckets are nested tables: "accepted:" on one line then
+          # "count: N" indented underneath.
           grep -A2 -E '^[|][[:space:]]+accepted:[[:space:]]*$' "$OUT" \
             | grep -qE '^.*count:[[:space:]]*[1-9][0-9]*$' \
-            || { echo "::error::dicom-enum produced no accepted bucket with non-zero count"; tail -n 200 "$OUT"; exit 1; }
+            || { echo "::error::dicom-info produced no accepted bucket with non-zero count"; tail -n 200 "$OUT"; exit 1; }
           grep -qE '\bVerification\b' "$OUT" \
-            || { echo "::error::Verification not present in dicom-enum output"; tail -n 200 "$OUT"; exit 1; }
+            || { echo "::error::Verification not present in dicom-info output"; tail -n 200 "$OUT"; exit 1; }
           # Sanity-check the new structural fields landed.
-          grep -qE '^[|]\s+service_classes:' "$OUT" \
-            || { echo "::error::dicom-enum missing service_classes block"; tail -n 200 "$OUT"; exit 1; }
+          grep -qE '^[|]\s+services:' "$OUT" \
+            || { echo "::error::dicom-info missing services block"; tail -n 200 "$OUT"; exit 1; }
+
+      - name: Run Nmap dicom-cfind-ls (orthanc)
+        id: test_cfind
+        if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.name == 'orthanc'
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+          OUT="artifacts/nmap_${{ matrix.dicom_server.name }}_cfind.out"
+          nmap -p ${{ matrix.dicom_server.host_port }} \
+               -n -Pn -dd -sV \
+               --script dicom-cfind-ls \
+               --script-args dicom-cfind-ls.ports=11112 \
+               --script-trace \
+               localhost | tee "$OUT"
+          echo "cfind_out=$OUT" >> $GITHUB_OUTPUT
+
+      - name: Assert dicom-cfind-ls (orthanc)
+        if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.name == 'orthanc'
+        run: |
+          OUT="${{ steps.test_cfind.outputs.cfind_out }}"
+          ! grep -qE 'NSE:.*failed|stack traceback:' "$OUT" \
+            || { echo "::error::dicom-cfind-ls hit a Lua error"; tail -n 200 "$OUT"; exit 1; }
+          grep -qE 'No studies found|studies:|studies_found:' "$OUT" \
+            || { echo "::error::dicom-cfind-ls produced unexpected output"; tail -n 200 "$OUT"; exit 1; }
+
+      - name: Run Nmap dicom-info (TLS row)
+        id: test_info_tls
+        if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.expect_vendor_version == 'false'
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+          OUT="artifacts/nmap_${{ matrix.dicom_server.name }}_info.out"
+          INFO_ARGS=$(echo "${{ matrix.dicom_server.nmap_args }}" | sed 's/dicom-ping\.ports/dicom-info.ports/g')
+          nmap -p ${{ matrix.dicom_server.host_port }} \
+               -n -Pn -dd -sV \
+               --script dicom-info \
+               --max-retries 0 --host-timeout 60s --script-timeout 10s \
+               $INFO_ARGS \
+               --script-trace \
+               localhost | tee "$OUT"
+          echo "info_tls_out=$OUT" >> $GITHUB_OUTPUT
 
       - name: Assert TLS row (no vendor/version)
         if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.expect_vendor_version == 'false'
@@ -233,6 +285,11 @@ jobs:
           ! grep -qE '^[|]_?\s*vendor:' "$OUT" || { echo "::error::Unexpected vendor on TLS row"; exit 1; }
           ! grep -qE '^[|]_?\s*version:' "$OUT" || { echo "::error::Unexpected version on TLS row"; exit 1; }
           grep -q "PORT" "$OUT" || { echo "::error::Nmap output missing PORT section"; exit 1; }
+          INFO_OUT="${{ steps.test_info_tls.outputs.info_tls_out }}"
+          ! grep -qE 'NSE:.*failed|stack traceback:' "$INFO_OUT" \
+            || { echo "::error::dicom-info hit a Lua error on TLS row"; tail -n 200 "$INFO_OUT"; exit 1; }
+          grep -qE 'Mutual TLS|mTLS|TLS endpoint detected|Possible DICOM/TLS' "$INFO_OUT" \
+            || { echo "::error::dicom-info missing TLS/mTLS diagnostic on TLS row"; tail -n 200 "$INFO_OUT"; exit 1; }
 
       - name: Show Server Logs (${{ matrix.dicom_server.name }})
         if: always()

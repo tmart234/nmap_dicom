@@ -63,7 +63,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y \
-            nmap tcpdump tshark docker-compose netcat-openbsd openssl
+            nmap tcpdump tshark docker-compose-v2 netcat-openbsd openssl
 
       - name: Copy custom Nmap files
         run: |
@@ -112,15 +112,15 @@ jobs:
           debug_stack() {
             local reason="$1"
             echo "==== DEBUG (${reason}) for ${{ matrix.dicom_server.name }} ===="
-            echo "---- docker-compose ps ----"
-            docker-compose ps || true
+            echo "---- docker compose ps ----"
+            docker compose ps || true
 
             # Loop over all services in compose_services (e.g. 'orthanc stunnel')
             for svc in ${{ matrix.dicom_server.compose_services }}; do
               echo "---- logs for service: ${svc} ----"
-              docker-compose logs --no-color "${svc}" || true
+              docker compose logs --no-color "${svc}" || true
 
-              cid="$(docker-compose ps -q "${svc}" || true)"
+              cid="$(docker compose ps -q "${svc}" || true)"
               if [ -n "${cid}" ]; then
                 echo "---- docker inspect .State for ${svc} (${cid}) ----"
                 docker inspect "${cid}" --format='{{json .State}}' || true
@@ -132,11 +132,11 @@ jobs:
           }
 
           echo "Validating compose file..."
-          docker-compose config >/dev/null
+          docker compose config >/dev/null
 
           echo "Starting: ${{ matrix.dicom_server.compose_services }}"
-          if ! docker-compose up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}; then
-            echo "::error:: docker-compose up failed for ${{ matrix.dicom_server.name }}"
+          if ! docker compose up -d --remove-orphans ${{ matrix.dicom_server.compose_services }}; then
+            echo "::error:: docker compose up failed for ${{ matrix.dicom_server.name }}"
             debug_stack "compose up failed"
             echo "startup_success=false" >> $GITHUB_OUTPUT
             exit 1
@@ -144,7 +144,7 @@ jobs:
 
           # Warm up
           sleep 30
-          STATUS=$(docker-compose ps -q ${{ matrix.dicom_server.service_name }} | xargs -r docker inspect --format='{{.State.Status}}' || echo "notfound")
+          STATUS=$(docker compose ps -q ${{ matrix.dicom_server.service_name }} | xargs -r docker inspect --format='{{.State.Status}}' || echo "notfound")
           echo "Service status: $STATUS"
           test "$STATUS" = "running"
 
@@ -295,7 +295,7 @@ jobs:
         if: always()
         working-directory: docker
         run: |
-          docker-compose logs --tail="80" ${{ matrix.dicom_server.service_name }} || true
+          docker compose logs --tail="80" ${{ matrix.dicom_server.service_name }} || true
 
       - name: Stop tcpdump capture (${{ matrix.dicom_server.name }})
         if: always()
@@ -329,4 +329,4 @@ jobs:
         if: always()
         working-directory: docker
         run: |
-          docker-compose down --volumes --remove-orphans
+          docker compose down --volumes --remove-orphans

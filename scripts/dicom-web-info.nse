@@ -31,23 +31,25 @@ Security checks (non-intrusive):
 -- @output
 -- PORT     STATE SERVICE   REASON  VERSION
 -- 8042/tcp open  dicom-web syn-ack Orthanc 1.12.10
--- | dicom-web-info: 
+-- | dicom-web-info:
 -- |   Orthanc: 1.12.10 (Path: /system)
 -- |   Authentication: Basic realm="Orthanc Secure Area"
--- |   
--- |   DICOMweb Endpoints: 
+-- |
+-- |   DICOMweb Endpoints:
 -- |     /dcm4chee-arc/aets/DCM4CHEE/rs (impl: dcm4chee, qido: secured)
 -- |     /dcm4chee-arc/rs (impl: dcm4chee, qido: secured)
 -- |     /dicom-web (impl: orthanc, qido: secured)
--- |     
--- |   Features: 
+-- |
+-- |   Features:
 -- |     WADO-URI: Enabled
--- |     
--- |   Warnings: 
+-- |
+-- |   Warnings:
 -- |     [DWI-003] http (no TLS) detected
 -- |_    [DWI-002] VULN: Orthanc accepts default credentials (orthanc:orthanc)
 --
-author = "Tyler M"
+author = {
+  "Tyler M <tmart234()gmail.com>"
+}
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
 categories = {"discovery", "safe", "version"}
 
@@ -111,11 +113,11 @@ end
 
 local function _generic(host, port, method, path, hdr)
   local opts = { header = hdr or {}, timeout = 7000 }
-  if port.tunnel == "ssl" then opts.ssl = true end -- explicit TLS
+  if port.version and port.version.service_tunnel == "ssl" then opts.ssl = true end -- explicit TLS
   local ok, resp = pcall(http.generic_request, host, port, method, path, opts)
-  if not ok then 
+  if not ok then
     stdnse.debug1("Request failed: %s %s", method, path)
-    return nil 
+    return nil
   end
   return resp
 end
@@ -209,13 +211,13 @@ portrule = function(host, port)
   if shortport.port_or_service({80, 443, 8042, 3000, 8080, 8443}, {"http","https","http-alt"}, "tcp")(host, port) then
     return true
   end
-  
+
   -- Fallback: explicit ports even if service detection failed or claimed weird service
   -- This fixes the "fs-agent" or "nagios-nsca" issue in CI
   if port.number == 8042 or port.number == 8080 or port.number == 3000 then
      return true
   end
-  
+
   return false
 end
 
@@ -261,7 +263,7 @@ action = function(host, port)
   local do_stow   = truthy(stdnse.get_script_args("dicom-web.stow-test") or "false")
   local no_defs   = truthy(stdnse.get_script_args("dicom-web.no-defaults") or "false")
 
-  -- Reduce false positives: treat clean HTTP→HTTPS redirect to same host as acceptable
+  -- Reduce false positives: treat clean HTTP->HTTPS redirect to same host as acceptable
   local function is_https_redirect()
     local r = http_get_cached(host, port, "/")
     if not (r and (r.status == 301 or r.status == 302 or r.status == 307 or r.status == 308)) then
@@ -275,7 +277,7 @@ action = function(host, port)
   end
 
   -- TLS (advisory only)
-  if port.tunnel ~= "ssl" then
+  if not (port.version and port.version.service_tunnel == "ssl") then
     if not is_https_redirect() then
       warn_code("DWI-003", "http (no TLS) detected")
     end
@@ -283,7 +285,6 @@ action = function(host, port)
 
   -- -------- Orthanc detection --------
   local orthanc_seen, orthanc_auth, orthanc_version = false, "unknown", nil
-  local orthanc_wa = nil
   do
     local hdr_json = { ["Accept"] = "application/json" }
     local r_no = http_get_cached(host, port, "/system", hdr_json)
@@ -302,8 +303,8 @@ action = function(host, port)
       elseif r_no.status == 401 or r_no.status == 403 then
         orthanc_seen = true
         orthanc_auth = "auth-required"
-        orthanc_wa = hget(r_no.header, "WWW-Authenticate")
-        
+        local orthanc_wa = hget(r_no.header, "WWW-Authenticate")
+
         -- Default: assume the first WWW-Authenticate we see is the "Global" one for this server
         if not global_auth then global_auth = orthanc_wa end
 
@@ -322,7 +323,7 @@ action = function(host, port)
                 desc  = "The Orthanc REST API accepted factory default credentials.",
                 refs  = { "Orthanc Security Recommendations" },
                 ids   = { CWE = "CWE-521" },
-                evidence = "GET /system → 200 with Basic auth (redacted)",
+                evidence = "GET /system -> 200 with Basic auth (redacted)",
               }
               orthanc_version = r_def.body:match('"version"%s*:%s*"([^"]+)"') or
                                 r_def.body:match('"Version"%s*:%s*"([^"]+)"') or orthanc_version
@@ -343,19 +344,19 @@ action = function(host, port)
   -- Checks for Dicoogle, Kheops, etc via root path
   do
     local r_root = http_get_cached(host, port, "/")
-    if r_root and r_root.status then 
+    if r_root and r_root.status then
        stdnse.debug1("Root check /: %s. Server: %s", r_root.status, hget(r_root.header, "Server") or "nil")
        local srv = lc(hget(r_root.header, "Server") or "")
        local bdy = lc(r_root.body or "")
        local ttl = bdy:match("<title>([^<]+)</title>") or ""
-       
+
        -- Dicoogle Detection
        if srv:find("dicoogle", 1, true) or ttl:find("dicoogle", 1, true) or bdy:find("dicoogle", 1, true) then
           local v = srv:match("dicoogle/([%d%.]+)")
           ui_found["Dicoogle"] = v and ("Version " .. v) or "/"
           stdnse.debug1("Dicoogle detected via root check")
        end
-       
+
        -- Kheops Detection (Proxy)
        if srv:find("kheops", 1, true) or hget(r_root.header, "X-Kheops-Version") then
           ui_found["Kheops"] = "API Proxy"
@@ -404,17 +405,17 @@ action = function(host, port)
         local b = lc(r.body)
         -- IMPROVED: More comprehensive OHIF detection
         -- Check for common OHIF markers in the HTML
-        local is_ohif = body_has(r.body, "data-cy-root") 
-                     or body_has(r.body, "ohif") 
+        local is_ohif = body_has(r.body, "data-cy-root")
+                     or body_has(r.body, "ohif")
                      or body_has(r.body, "app-config.js")
                      or body_has(r.body, "OHIF")
                      or b:find("<title>ohif", 1, true)
                      -- Also check for common OHIF React app patterns
                      or (body_has(r.body, "cornerstone") and body_has(r.body, "dicom"))
                      or body_has(r.body, "dicomImageLoader")
-        
+
         stdnse.debug1("OHIF detection for %s: %s", p, tostring(is_ohif))
-        
+
         if is_ohif then
           ohif = true
           mount = p
@@ -425,7 +426,7 @@ action = function(host, port)
         end
       end
     end
-    
+
     -- Fallback: check for app-config.js directly
     if not ohif then
       local r2 = http_get_cached(host, port, "/app-config.js")
@@ -438,7 +439,7 @@ action = function(host, port)
         end
       end
     end
-    
+
     if ohif then
       -- Best-effort OHIF version from app-config.js (no warning if missing)
       local rjs = http_get_cached(host, port, (mount or "/") .. "app-config.js")
@@ -477,7 +478,7 @@ action = function(host, port)
     {impl="generic",   base="/dicom-web"},      -- Generic DICOMweb path (Orthanc, Dicoogle, others)
     {impl="dcm4chee",  base="/dcm4chee-arc/rs"},
     {impl="dcm4chee",  base="/dcm4chee-arc/aets/DCM4CHEE/rs"}, -- common AET route
-    {impl="kheops",    base="/api"},  
+    {impl="kheops",    base="/api"},
   }
   table.sort(bases, function(a,b) return a.base < b.base end)
 
@@ -523,12 +524,12 @@ action = function(host, port)
       stdnse.debug1("Skipping DICOMweb check for %s (SPA detected)", b.base)
       break
     end
-    
+
     local r = http_get_cached(host, port, b.base .. "/")
     stdnse.debug1("DICOMweb base check %s/: status=%s", b.base, r and r.status or "nil")
-    
+
     if r and (r.status == 200 or r.status == 204 or r.status == 401 or r.status == 403) then
-      
+
       -- Found a valid base!
       local qido_status = "unknown"
       local local_wa = hget(r.header, "WWW-Authenticate")
@@ -537,9 +538,9 @@ action = function(host, port)
       if do_qido then
         local rq, used_path = qido_try_paths(b.base)
         if rq then
-          stdnse.debug1("QIDO response for %s: status=%s, is_dicom_json=%s", 
+          stdnse.debug1("QIDO response for %s: status=%s, is_dicom_json=%s",
                         used_path, rq.status, tostring(is_dicom_json(rq)))
-          
+
           if is_dicom_json(rq) then
             qido_status = "open"
             -- True vulnerability: unauthenticated QIDO returns DICOM JSON
@@ -547,9 +548,9 @@ action = function(host, port)
               title = "DICOMweb QIDO-RS accessible without authentication",
               risk  = "High",
               desc  = "QIDO-RS returns study/series/instance metadata without authentication.",
-              refs  = { "DICOM PS3.18 Web Services – QIDO-RS security" },
+              refs  = { "DICOM PS3.18 Web Services - QIDO-RS security" },
               ids   = { CWE = "CWE-200" },
-              evidence = ("GET %s → %s, %s"):format(used_path, rq.status, hget(rq.header,"Content-Type") or "no CT"),
+              evidence = ("GET %s -> %s, %s"):format(used_path, rq.status, hget(rq.header,"Content-Type") or "no CT"),
             }
             warn_code("DWI-001", ("unauthenticated QIDO-RS listing at %s (GET %s)"):format(b.base, used_path))
           elseif rq.status == 401 or rq.status == 403 then
@@ -564,7 +565,7 @@ action = function(host, port)
             qido_status = "unavailable"
           else
             -- DEBUG: Why did QIDO check fail?
-            stdnse.debug1("QIDO %s check failed. Status: %s. CT: %s. Body start: %s", 
+            stdnse.debug1("QIDO %s check failed. Status: %s. CT: %s. Body start: %s",
                b.base, rq.status, hget(rq.header,"Content-Type") or "nil", (rq.body or ""):sub(1,100))
           end
         end
@@ -619,37 +620,37 @@ action = function(host, port)
   -- Build final output using stdnse.output_table for proper formatting
   local out = stdnse.output_table()
   local has_output = false
-  
-  if orthanc_info then 
-    out["Orthanc"] = orthanc_info 
+
+  if orthanc_info then
+    out["Orthanc"] = orthanc_info
     has_output = true
   end
-  
-  if global_auth then 
-    out["Authentication"] = global_auth 
+
+  if global_auth then
+    out["Authentication"] = global_auth
     has_output = true
   end
-  
+
   -- Check if ui_found has any entries
   local ui_count = 0
   for _ in pairs(ui_found) do ui_count = ui_count + 1 end
-  if ui_count > 0 then 
-    out["Web Interfaces"] = ui_found 
+  if ui_count > 0 then
+    out["Web Interfaces"] = ui_found
     has_output = true
     stdnse.debug1("Web Interfaces being added to output: %d items", ui_count)
   end
-  
-  if #endpoints_found > 0 then 
-    out["DICOMweb Endpoints"] = endpoints_found 
+
+  if #endpoints_found > 0 then
+    out["DICOMweb Endpoints"] = endpoints_found
     has_output = true
     stdnse.debug1("DICOMweb Endpoints being added: %d", #endpoints_found)
   end
-  
+
   -- Check if features_found has any entries
   local feat_count = 0
   for _ in pairs(features_found) do feat_count = feat_count + 1 end
-  if feat_count > 0 then 
-    out["Features"] = features_found 
+  if feat_count > 0 then
+    out["Features"] = features_found
     has_output = true
   end
 
@@ -668,40 +669,40 @@ action = function(host, port)
 
   -- Debug: show what we're returning
   stdnse.debug1("Final output check: has_output=%s", tostring(has_output))
-  
+
   if not has_output then return nil end
 
   -- SERVICE DETECTION FIX
   -- If we found Orthanc, UI, or specific endpoints, we know this is DICOMweb
   if orthanc_seen or #endpoints_found > 0 or next(ui_found) then
      port.version.name = "dicom-web"
-     
+
      if orthanc_seen then
         port.version.product = "Orthanc"
         if orthanc_version then port.version.version = orthanc_version end
-        
+
      elseif ui_found["Dicoogle"] then
         port.version.product = "Dicoogle"
         -- Extract version if we found one, otherwise leave blank (don't use server version)
         local dicoogle_str = ui_found["Dicoogle"]
         local v_match = dicoogle_str:match("Version ([%d%.]+)")
-        if v_match then 
-           port.version.version = v_match 
+        if v_match then
+           port.version.version = v_match
         else
            port.version.version = nil  -- Clear any server-detected version
         end
-        
+
      elseif ui_found["Kheops"] then
         port.version.product = "Kheops Proxy"
         port.version.version = nil
-        
+
      elseif ui_found["OHIF Viewer"] then
         port.version.product = "OHIF Viewer"
         -- Try to extract version from the string "/ (Version: 1.2.3)"
         local v_str = ui_found["OHIF Viewer"]
         local v_match = v_str:match("Version: ([%d%.]+)")
-        if v_match then 
-           port.version.version = v_match 
+        if v_match then
+           port.version.version = v_match
         else
            port.version.version = nil  -- Clear any server-detected version
         end
@@ -711,7 +712,7 @@ action = function(host, port)
         port.version.product = "Standard DICOMweb"
         port.version.version = nil
      end
-     
+
      nmap.set_port_version(host, port)
   end
 

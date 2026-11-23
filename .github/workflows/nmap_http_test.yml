@@ -49,7 +49,7 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y nmap docker-compose curl netcat-openbsd
+          sudo apt-get install -y nmap docker-compose-v2 curl netcat-openbsd
 
       - name: Install updated NSE into /usr/share
         run: |
@@ -88,7 +88,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          docker-compose -f ${{ matrix.target.compose }} up -d ${{ matrix.target.service }}
+          docker compose -f ${{ matrix.target.compose }} up -d ${{ matrix.target.service }}
 
           # Wait for TCP
           for i in {1..200}; do
@@ -192,12 +192,12 @@ jobs:
               echo "::error::Missing expected: $WANT"
               exit 1
             else
-              echo "✓ Found expected string: $WANT"
+              echo "Found expected string: $WANT"
             fi
           fi
 
       - name: Upload ${{ matrix.target.name }} artifact
-        if: always()
+        if: always() && steps.scan.outputs.out != ''
         uses: actions/upload-artifact@v4
         with:
           name: nmap-http-${{ matrix.target.name }}
@@ -205,8 +205,8 @@ jobs:
 
       - name: Logs ${{ matrix.target.name }}
         if: always()
-        run: docker-compose -f ${{ matrix.target.compose }} logs --tail=200 ${{ matrix.target.service }} || true
+        run: docker compose -f ${{ matrix.target.compose }} logs --tail=200 ${{ matrix.target.service }} || true
 
       - name: Down ${{ matrix.target.name }}
         if: always()
-        run: docker-compose -f ${{ matrix.target.compose }} down -v --remove-orphans
+        run: docker compose -f ${{ matrix.target.compose }} down -v --remove-orphans

@@ -25,6 +25,9 @@ finding for security assessments.
 -- @usage
 -- nmap -p 4242 --script dicom-cfind-ls <target>
 --
+-- @usage  (force against a non-standard port)
+-- nmap -p 11114 --script +dicom-cfind-ls <target>
+--
 -- @usage
 -- nmap -p 4242 --script dicom-cfind-ls \
 --   --script-args 'dicom-cfind-ls.called_ae=ORTHANC,dicom-cfind-ls.calling_ae=LAUNCHER' <target>
@@ -75,8 +78,9 @@ finding for security assessments.
 --                                    servers abort on unsupported tags; when
 --                                    set the script auto-retries with minimal
 --                                    tags on A-ABORT. Default: false
--- @args dicom-cfind-ls.ports         Optional comma-separated list of extra
---                                    ports to probe (e.g. "11114,11115").
+-- @args dicom.tls                    Force DICOM-over-TLS ("true"/"false").
+--                                    Auto-detected from Nmap -sV or port 2762
+--                                    when omitted.
 --
 -- @output
 -- PORT     STATE SERVICE
@@ -133,35 +137,11 @@ local stdnse    = require "stdnse"
 local string    = require "string"
 local table     = require "table"
 
-local COMMON_DICOM_PORTS = {104, 2345, 2761, 2762, 4242, 11112}
 local VALID_LEVELS = { PATIENT = true, STUDY = true, SERIES = true, IMAGE = true }
 local MAX_CANCEL_DRAIN = 64
 
-local function parse_ports_arg(s)
-  if not s then return nil end
-  local set = {}
-  if type(s) == "table" then
-    for _, v in pairs(s) do
-      local n = tonumber(v)
-      if n then set[n] = true end
-    end
-  else
-    for n in string.gmatch(tostring(s), "%d+") do
-      set[tonumber(n)] = true
-    end
-  end
-  return next(set) and set or nil
-end
-
-local custom_ports = parse_ports_arg(stdnse.get_script_args("dicom-cfind-ls.ports"))
-local default_portrule = shortport.port_or_service(
-  COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, "tcp", "open")
-
-portrule = function(host, port)
-  if not (port.protocol == "tcp" and port.state == "open") then return false end
-  if custom_ports and custom_ports[port.number] then return true end
-  return default_portrule(host, port)
-end
+portrule = shortport.port_or_service(
+  {104, 2345, 2761, 2762, 4242, 11112}, {"dicom", "dicom-tls"}, "tcp", "open")
 
 -----------------------------------------------------------------------
 -- HELPERS

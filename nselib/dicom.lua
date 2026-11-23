@@ -2688,4 +2688,44 @@ function resolve_vendor_info(impl_version, impl_uid)
       impl_version
 end
 
+---
+-- Returns true if an association failure error string over TLS is consistent
+-- with a mutual TLS (client-certificate) rejection (including TLS 1.3
+-- post-handshake certificate_required alerts) rather than a non-DICOM protocol
+-- banner.
+--
+-- @param err Error string returned by associate_extended / do_associate
+-- @return boolean
+function is_likely_mtls_error(err)
+  local s = tostring(err or "")
+  if s:find("unexpected response PDU", 1, true)
+      or s:find("PDU_TOO_LARGE", 1, true)
+      or s:find("TRUNCATED_PDU", 1, true) then
+    return false
+  end
+  return s:find("Failed to connect", 1, true) ~= nil
+    or s:find("Couldn't send ASSOCIATE request", 1, true) ~= nil
+    or s:find("CONNECTION_RESET", 1, true) ~= nil
+    or s:find("EOF", 1, true) ~= nil
+    or s:find("TIMEOUT", 1, true) ~= nil
+    or s:find("ERROR", 1, true) ~= nil
+end
+
+---
+-- Returns true if a port is explicitly expected to speak DICOM-over-TLS
+-- (explicit dicom.tls arg, IANA port 2762, or service identified as
+-- dicom/dicom-tls), preventing false mTLS diagnostics on non-DICOM HTTPS
+-- services running on overlapping default DICOM ports.
+--
+-- @param port Nmap port table
+-- @return boolean
+function is_expected_dicom_tls_port(port)
+  if stdnse.get_script_args("dicom.tls") ~= nil then return true end
+  local vname = port.version and port.version.name
+  if vname == "dicom-tls" or vname == "dicom" then return true end
+  if vname and vname ~= "" and vname ~= "unknown" then return false end
+  if tonumber(port.number) == 2762 then return true end
+  return port.service == "dicom-tls" or port.service == "dicom"
+end
+
 return _ENV

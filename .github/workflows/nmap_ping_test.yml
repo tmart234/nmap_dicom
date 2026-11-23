@@ -33,25 +33,25 @@ jobs:
             host_port: 11114
             service_name: pynetdicom-scp
             compose_services: "pynetdicom-scp"
-            nmap_args: "--script-args dicom-ping.ports=11114"
+            nmap_args: ""
             expect_vendor_version: "true"
           - name: dcm4che-scp
             host_port: 11115
             service_name: dcm4che-scp
             compose_services: "dcm4che-scp"
-            nmap_args: "--script-args dicom-ping.ports=11115,dicom.called_aet=DCM4CHETOOLS"
+            nmap_args: "--script-args dicom.called_aet=DCM4CHETOOLS"
             expect_vendor_version: "true"
           - name: conquest
             host_port: 5678
             service_name: conquest
             compose_services: "conquest"
-            nmap_args: "--script-args dicom-ping.ports=5678,dicom.called_aet=CONQUESTSRV1"
+            nmap_args: "--script-args dicom.called_aet=CONQUESTSRV1"
             expect_vendor_version: "true"
           - name: dicom-tls
             host_port: 2762
             service_name: stunnel
             compose_services: "orthanc stunnel"
-            nmap_args: "--script-args dicom-ping.ports=2762,dicom.timeout_ms=1500"
+            nmap_args: "--script-args dicom.timeout_ms=1500"
             expect_vendor_version: "false"
 
     steps:
@@ -188,7 +188,7 @@ jobs:
           fi
           nmap -p ${{ matrix.dicom_server.host_port }} \
                -n -Pn -dd -sV \
-               --script dicom-ping \
+               --script +dicom-ping \
                $EXTRA \
                ${{ matrix.dicom_server.nmap_args }} \
                --script-trace \
@@ -210,12 +210,10 @@ jobs:
           set -euxo pipefail
           mkdir -p artifacts
           OUT="artifacts/nmap_${{ matrix.dicom_server.name }}_info.out"
-          # Reuse the row's nmap_args, swapping dicom-ping.ports -> dicom-info.ports
-          INFO_ARGS=$(echo "${{ matrix.dicom_server.nmap_args }}" | sed 's/dicom-ping\.ports/dicom-info.ports/g')
           nmap -p ${{ matrix.dicom_server.host_port }} \
                -n -Pn -dd -sV \
-               --script dicom-info \
-               $INFO_ARGS \
+               --script +dicom-info \
+               ${{ matrix.dicom_server.nmap_args }} \
                --script-trace \
                localhost | tee "$OUT"
           echo "info_out=$OUT" >> $GITHUB_OUTPUT
@@ -247,7 +245,6 @@ jobs:
           nmap -p ${{ matrix.dicom_server.host_port }} \
                -n -Pn -dd -sV \
                --script dicom-cfind-ls \
-               --script-args dicom-cfind-ls.ports=11112 \
                --script-trace \
                localhost | tee "$OUT"
           echo "cfind_out=$OUT" >> $GITHUB_OUTPUT
@@ -268,12 +265,11 @@ jobs:
           set -euxo pipefail
           mkdir -p artifacts
           OUT="artifacts/nmap_${{ matrix.dicom_server.name }}_info.out"
-          INFO_ARGS=$(echo "${{ matrix.dicom_server.nmap_args }}" | sed 's/dicom-ping\.ports/dicom-info.ports/g')
           nmap -p ${{ matrix.dicom_server.host_port }} \
                -n -Pn -dd -sV \
                --script dicom-info \
                --max-retries 0 --host-timeout 60s --script-timeout 10s \
-               $INFO_ARGS \
+               ${{ matrix.dicom_server.nmap_args }} \
                --script-trace \
                localhost | tee "$OUT"
           echo "info_tls_out=$OUT" >> $GITHUB_OUTPUT

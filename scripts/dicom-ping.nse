@@ -26,15 +26,13 @@ way of detecting DICOM servers.
 ---
 -- @usage nmap -p4242 --script dicom-ping <target>
 -- @usage nmap -sV --script dicom-ping <target>
--- @usage nmap --script dicom-ping --script-args dicom-ping.ports=11114,11115 <target>
+-- @usage nmap -p11114 --script +dicom-ping <target>
 -- @usage nmap -v --script dicom-ping <target>
 -- @usage nmap --script dicom-ping --script-args dicom-ping.extended <target>
 --
 -- @args dicom.called_aet       Called Application Entity Title. Default: ANY-SCP
--- @args dicom-ping.ports       Optional comma-separated list of ports to probe
---                              (e.g. "104,11112,2761,2762,4242"). By default,
---                              the script runs on common DICOM ports or when
---                              the service is already identified as "dicom".
+-- @args dicom.tls              Force DICOM-over-TLS ("true"/"false"). Auto-detected
+--                              from Nmap -sV or port 2762 when omitted.
 -- @args dicom-ping.extended    If set, prints additional identification fields
 --                              (implementation class UID and implementation
 --                              version name) from the A-ASSOCIATE-AC. This behaves
@@ -87,32 +85,13 @@ author = {
   "Nichelle Gilbert <nich.gilbert()gmail.com>",
 }
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
-categories = {"discovery", "default", "version", "safe", "auth"}
+categories = {"discovery", "default", "safe", "auth"}
 
 local shortport = require "shortport"
 local dicom     = require "dicom"
 local stdnse    = require "stdnse"
 local nmap      = require "nmap"
 local string    = require "string"
-
--- Parse a comma/space separated port list (or Lua table from --script-args)
--- into a lookup set.
-local function parse_ports_arg(ports_str)
-  if not ports_str then return nil end
-  local set = {}
-  if type(ports_str) == "table" then
-    for _, v in pairs(ports_str) do
-      local n = tonumber(v)
-      if n then set[n] = true end
-    end
-  else
-    for num in string.gmatch(tostring(ports_str), "%d+") do
-      local n = tonumber(num)
-      if n then set[n] = true end
-    end
-  end
-  return (next(set) and set) or nil
-end
 
 -- Parent of a UID ("1.2.3.4" -> "1.2.3"), for looking up an unknown
 -- Implementation Class UID's organization in an OID registry.
@@ -126,57 +105,8 @@ local VERIFICATION_PC = {
   transfer_syntaxes = { dicom.TRANSFER_SYNTAX.IMPLICIT_LE, dicom.TRANSFER_SYNTAX.EXPLICIT_LE },
 }
 
--- Default/common DICOM ports (preserving upstream port 2345):
-local COMMON_DICOM_PORTS = {104, 2345, 2761, 2762, 4242, 11112}
-
--- Cache custom ports and version-aware portrule at script load.
-local custom_ports_arg = stdnse.get_script_args("dicom-ping.ports")
-local custom_ports_set = parse_ports_arg(custom_ports_arg)
-local default_portrule = shortport.version_port_or_service(
-  COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, "tcp", "open")
-
-local function is_likely_mtls_error(err)
-  local s = tostring(err or "")
-  if s:find("unexpected response PDU", 1, true)
-      or s:find("PDU_TOO_LARGE", 1, true)
-      or s:find("TRUNCATED_PDU", 1, true) then
-    return false
-  end
-  return s:find("Failed to connect", 1, true) ~= nil
-    or s:find("Couldn't send ASSOCIATE request", 1, true) ~= nil
-    or s:find("CONNECTION_RESET", 1, true) ~= nil
-    or s:find("EOF", 1, true) ~= nil
-    or s:find("TIMEOUT", 1, true) ~= nil
-    or s:find("ERROR", 1, true) ~= nil
-end
-
-local function is_expected_dicom_tls_port(port)
-  if stdnse.get_script_args("dicom.tls") ~= nil then return true end
-  local vname = port.version and port.version.name
-  if vname == "dicom-tls" or vname == "dicom" then return true end
-  if vname and vname ~= "" and vname ~= "unknown" then return false end
-  if tonumber(port.number) == 2762 then return true end
-  if custom_ports_set and custom_ports_set[port.number] then return true end
-  return port.service == "dicom-tls" or port.service == "dicom"
-end
-
-portrule = function(host, port)
-  if not (port.protocol == "tcp" and port.state == "open") then
-    return false
-  end
-
-  if custom_ports_set and custom_ports_set[port.number] then
-    stdnse.debug1("dicom-ping: matched script-arg port %d", port.number)
-    return true
-  end
-
-  if default_portrule(host, port) then
-    stdnse.debug1("dicom-ping: matched common DICOM port/service (%d)", port.number)
-    return true
-  end
-
-  return false
-end
+portrule = shortport.port_or_service(
+  {104, 2345, 2761, 2762, 4242, 11112}, {"dicom", "dicom-tls"}, "tcp", "open")
 
 action = function(host, port)
   stdnse.debug1("dicom-ping: ACTION for %s:%d", host.ip, port.number)
@@ -210,7 +140,7 @@ action = function(host, port)
       return out
     end
 
-    if is_tls and is_likely_mtls_error(err) and is_expected_dicom_tls_port(port) then
+    if is_tls and dicom.is_likely_mtls_error(err) and dicom.is_expected_dicom_tls_port(port) then
       out.dicom    = "TLS endpoint detected, but DICOM association failed."
       out.tls_hint = "Server likely requires Mutual TLS (mTLS) with valid client certificates."
       out.error    = e

@@ -50,11 +50,11 @@ From the accepted contexts the script reports:
                     up to 10 or with -v), and a one-line-per-reason count of
                     any rejected SOP classes. The full list of rejected
                     contexts is listed at debug level (-d).
-  security          the transport, the TLS certificate when there is one,
-                    and findings drawn from the association alone: no
-                    AE-title allowlist (or Q/R-only allowlist), Query/Retrieve
-                    and C-STORE exposure, plaintext transport, a weak or
-                    self-signed certificate, and no mutual TLS.
+  security          the transport, terse factual findings drawn from the
+                    association alone (AE-title restriction, Q/R and Storage
+                    exposure, plaintext transport, weak/expired/self-signed
+                    TLS cert, no mutual TLS), and with -v the TLS certificate
+                    details.
 
 An accepted context means the SCP will accept requests for that SOP class,
 not that an operation will succeed: destination AE allowlists, storage
@@ -69,21 +69,24 @@ dicom-store-inject test the DIMSE operations themselves.
 Every context is proposed with Implicit VR Little Endian included as the
 universal fallback (PS3.5 section 10.1), so even old devices negotiate. The
 dicom-info.probe argument trades breadth against A-ASSOCIATE-RQ size:
-  basic     core SOP classes, Explicit and Implicit VR only (about 3 KB;
-            for fragile or embedded legacy devices)
-  standard  core SOP classes with the commonly negotiated compressed
-            transfer syntaxes (about 7 KB; the default)
-  full      core and long-tail SOP classes (multi-frame SC, RT, extended SR,
-            3D X-Ray/CBCT, spatial registration, UPS, ophthalmic, waveform,
-            segmentation, whole-slide, legacy retired US/Q-R, ...) with
-            every transfer syntax (about 29 KB, split across two
-            associations at the default dicom.max_pcs / dicom.max_rq_bytes)
+  basic     Verification SOP class only, Explicit and Implicit VR (about
+            250 B, 1 association; minimal fingerprint matching legacy
+            dicom-info basic mode for whisper-quiet scans)
+  standard  36 core SOP classes + 8 commonly negotiated single-syntax
+            transfer-syntax codec probes (about 7.5 KB, 1 association;
+            the default)
+  full      81 SOP classes (core + 45 long-tail: multi-frame SC, RT,
+            extended SR, 3D X-Ray/CBCT, spatial registration, UPS,
+            ophthalmic, waveform, segmentation, whole-slide, legacy retired
+            US/Q-R, ...) + all 16 single-syntax codec probes (about 31 KB,
+            split across 2 associations at default limits)
 The probe line records the depth, the contexts proposed and the
 associations used, so a "not probed" service or a difference between two
-scans can be traced to the depth. If an older or embedded SCP aborts or
-resets a multi-kilobyte proposal while still accepting a minimal
-Verification request, the script automatically steps down to "basic" in
-small 4 KB / 16-context batches.
+scans can be traced to the depth. If an older or embedded SCP aborts,
+resets, or rejects a multi-kilobyte proposal while still accepting a
+minimal Verification canary, the script automatically steps down to an
+internal "fragile" profile (36 core SOP classes, Explicit + Implicit VR
+only) in small 4 KB / 16-context batches.
 
 The script does not guess Application Entity Titles. If the SCP enforces an
 AE-title allowlist it rejects the association and the script reports the
@@ -97,7 +100,7 @@ dicom-info.calling_ae).
 -- @usage nmap -sV --script dicom-info --script-args dicom-info.probe=full <target>
 -- @usage nmap -p 11112 --script dicom-info --script-args dicom.called_aet=ORTHANC <target>
 -- @usage nmap -p 2762 --script dicom-info --script-args dicom.tls=true <target>
--- @usage nmap --script dicom-info --script-args dicom-info.ports=11114 <target>
+-- @usage nmap -p 11114 --script +dicom-info <target>
 --
 -- @args dicom-info.probe      Probe depth: "basic", "standard" or "full"
 --                             (see the description). Default: standard
@@ -109,10 +112,11 @@ dicom-info.calling_ae).
 --                             dicom.timeout_ms, default 3s).
 -- @args dicom-info.max_pdu    Maximum PDU length proposed in A-ASSOCIATE-RQ
 --                             (default: 16384).
--- @args dicom-info.ports      Optional comma-separated list of extra ports
---                             to run on, e.g. "11114,11115", for SCPs on
---                             non-standard ports that -sV does not identify
---                             as DICOM.
+-- @args dicom.tls             Force DICOM-over-TLS ("true"/"false").
+--                             Auto-detected from Nmap -sV, port 2762, or
+--                             TLS alert fallback when omitted.
+-- @args dicom.called_aet      Suite-wide Called AE Title (default: ANY-SCP).
+-- @args dicom.calling_aet     Suite-wide Calling AE Title (default: ECHOSCU).
 --
 -- @output
 -- PORT      STATE SERVICE
@@ -126,12 +130,7 @@ dicom-info.calling_ae).
 -- |     query: yes - C-FIND (Patient Root, Study Root)
 -- |     retrieve: yes - C-GET, C-MOVE (Patient Root, Study Root)
 -- |     modality_worklist: yes - C-FIND
--- |   modalities:
--- |     CT
--- |     MRI
--- |     PET
--- |     PET-CT
--- |     Ultrasound
+-- |   modalities: CT, MRI, PET, PET-CT, Ultrasound
 -- |   inferred_device_class: PACS/VNA
 -- |   transfer_syntaxes:
 -- |     Explicit VR Little Endian
@@ -146,10 +145,10 @@ dicom-info.calling_ae).
 -- |   security:
 -- |     transport: plaintext (no TLS)
 -- |     findings:
--- |       Any called-AET accepted - no AE-title allowlist enforced
--- |       Query/Retrieve (C-FIND, C-GET, C-MOVE) accepted - patient/study enumeration and image retrieval surface
--- |       25 Storage SOP classes accepted - unauthenticated C-STORE (data/malware injection) surface
--- |_      Plaintext transport - associations and PHI exposed on the wire (consider DICOM-over-TLS, PS3.15 Annex B)
+-- |       No called-AET restriction (ANY-SCP accepted)
+-- |       Unauthenticated Query/Retrieve accepted (C-FIND, C-GET, C-MOVE)
+-- |       Unauthenticated Storage accepted (25 SOP classes)
+-- |_      Plaintext transport (no TLS)
 --
 -- @output
 -- PORT      STATE SERVICE
@@ -169,10 +168,7 @@ dicom-info.calling_ae).
 --   <elem key="retrieve">yes - C-GET, C-MOVE (Patient Root, Study Root)</elem>
 --   <elem key="modality_worklist">yes - C-FIND</elem>
 -- </table>
--- <table key="modalities">
---   <elem>CT</elem>
---   <elem>MRI</elem>
--- </table>
+-- <elem key="modalities">CT, MRI, PET, PET-CT, Ultrasound</elem>
 -- <elem key="inferred_device_class">PACS/VNA</elem>
 -- <table key="transfer_syntaxes">
 --   <elem>Explicit VR Little Endian</elem>
@@ -190,7 +186,7 @@ dicom-info.calling_ae).
 -- <table key="security">
 --   <elem key="transport">plaintext (no TLS)</elem>
 --   <table key="findings">
---     <elem>Any called-AET accepted - no AE-title allowlist enforced</elem>
+--     <elem>No called-AET restriction (ANY-SCP accepted)</elem>
 --   </table>
 -- </table>
 --
@@ -207,34 +203,8 @@ author = {
 license = "Same as Nmap--See https://nmap.org/book/man-legal.html"
 categories = {"default", "discovery", "safe"}
 
-local COMMON_DICOM_PORTS = {104, 2761, 2762, 4242, 11112}
-
--- Parse a comma/space separated port list (or Lua table from --script-args)
--- into a lookup set.
-local function parse_ports_arg(s)
-  if not s then return nil end
-  local set = {}
-  if type(s) == "table" then
-    for _, v in pairs(s) do
-      local n = tonumber(v)
-      if n then set[n] = true end
-    end
-  else
-    for n in string.gmatch(tostring(s), "%d+") do
-      set[tonumber(n)] = true
-    end
-  end
-  return next(set) and set or nil
-end
-
-local custom_ports = parse_ports_arg(stdnse.get_script_args(SCRIPT_NAME .. ".ports"))
-local default_portrule = shortport.port_or_service(COMMON_DICOM_PORTS, {"dicom", "dicom-tls"}, "tcp", "open")
-
-portrule = function(host, port)
-  if not (port.protocol == "tcp" and port.state == "open") then return false end
-  if custom_ports and custom_ports[port.number] then return true end
-  return default_portrule(host, port)
-end
+portrule = shortport.port_or_service(
+  {104, 2345, 2761, 2762, 4242, 11112}, {"dicom", "dicom-tls"}, "tcp", "open")
 
 -- ---------- Presentation context catalogue ----------
 
@@ -246,7 +216,8 @@ local TS = dicom.TRANSFER_SYNTAX
 -- universal fallback (PS3.5 section 10.1) so legacy Implicit-only devices and
 -- compressed-only SOP classes still negotiate cleanly.
 local TS_STORAGE = {
-  basic = { TS.EXPLICIT_LE, TS.IMPLICIT_LE },
+  basic   = { TS.EXPLICIT_LE, TS.IMPLICIT_LE },
+  fragile = { TS.EXPLICIT_LE, TS.IMPLICIT_LE },
   standard = {
     TS.EXPLICIT_LE, TS.DEFLATED_LE, TS.JPEG_LOSSLESS,
     TS.JPEG2000_LOSSLESS, TS.JPEG2000, TS.JPEG_BASELINE, TS.RLE,
@@ -373,6 +344,10 @@ local CATALOGUE = {
 -- per Abstract Syntax), so every supported Transfer Syntax is enumerated
 -- individually inside the existing association(s) with zero extra round-trips.
 local function build_pcs(depth)
+  if depth == "basic" then
+    local e = CATALOGUE[1] -- Verification only (~250 B, matches upstream basic)
+    return { { abstract_syntax = e.uid, transfer_syntaxes = TS_CMD } }, { e }
+  end
   local pcs, entries = {}, {}
   for _, e in ipairs(CATALOGUE) do
     if e.depth == "core" or depth == "full" then
@@ -381,7 +356,7 @@ local function build_pcs(depth)
       entries[#entries + 1] = e
     end
   end
-  if depth ~= "basic" then
+  if depth == "standard" or depth == "full" then
     for _, ts_uid in ipairs(TS_STORAGE[depth]) do
       pcs[#pcs + 1] = {
         abstract_syntax   = dicom.SOP_CLASS.CT_IMAGE_STORAGE,
@@ -670,18 +645,18 @@ local function cert_findings(cert, out)
     local ktype = tostring(cert.pubkey.type or ""):lower()
     if (ktype == "rsa" or ktype == "dsa") and cert.pubkey.bits < 2048 then
       out[#out + 1] = string.format(
-        "TLS certificate uses a weak %s key (%d-bit < 2048-bit)",
+        "Weak TLS %s key (%d-bit < 2048-bit)",
         ktype:upper(), cert.pubkey.bits)
     elseif ktype == "ec" and cert.pubkey.bits < 224 then
       out[#out + 1] = string.format(
-        "TLS certificate uses a weak EC key (%d-bit < 224-bit)",
+        "Weak TLS EC key (%d-bit < 224-bit)",
         cert.pubkey.bits)
     end
   end
   if cert.sig_algorithm then
     local low = tostring(cert.sig_algorithm):lower()
     if low:find("sha1", 1, true) or low:find("md5", 1, true) then
-      out[#out + 1] = "TLS certificate uses a weak signature algorithm (SHA-1/MD5)"
+      out[#out + 1] = "Weak TLS signature algorithm (SHA-1/MD5)"
     end
   end
   if cert.validity then
@@ -689,20 +664,20 @@ local function cert_findings(cert, out)
     if type(cert.validity.notAfter) == "table" then
       local ok_ts, exp = pcall(datetime.date_to_timestamp, cert.validity.notAfter, 0)
       if ok_ts and type(exp) == "number" and exp < now then
-        out[#out + 1] = "TLS certificate is expired (notAfter: "
+        out[#out + 1] = "Expired TLS certificate (notAfter: "
           .. cert_date(cert.validity.notAfter) .. ")"
       end
     end
     if type(cert.validity.notBefore) == "table" then
       local ok_ts, nb = pcall(datetime.date_to_timestamp, cert.validity.notBefore, 0)
       if ok_ts and type(nb) == "number" and nb > now then
-        out[#out + 1] = "TLS certificate is not yet valid (notBefore: "
+        out[#out + 1] = "TLS certificate not yet valid (notBefore: "
           .. cert_date(cert.validity.notBefore) .. ")"
       end
     end
   end
   if dn_equal(cert.subject, cert.issuer) then
-    out[#out + 1] = "TLS certificate is self-signed (no CA trust chain)"
+    out[#out + 1] = "Self-signed TLS certificate"
   end
 end
 
@@ -714,10 +689,10 @@ local function security_findings(services, called_aet, info, qr_aet_reject)
     local field = (qr_aet_reject.reason == 3) and "Calling-AET"
       or (qr_aet_reject.reason == 7) and "Called-AET" or "AE-title"
     findings[#findings + 1] = string.format(
-      "Partial AE-title allowlist (Q/R + MWL only) - Verification/Storage accepted the association, while Query/Retrieve enforced %s (%s)",
-      field, qr_aet_reject.reason_text or "rejected")
+      "Partial AE-title restriction (Q/R + MWL enforced %s; Verification/Storage open)",
+      field)
   elseif not called_aet or called_aet == "" or called_aet == "ANY-SCP" then
-    findings[#findings + 1] = "Any called-AET accepted - no AE-title allowlist enforced"
+    findings[#findings + 1] = "No called-AET restriction (ANY-SCP accepted)"
   end
 
   local query, retrieve, storage = services.query, services.retrieve, services.storage
@@ -727,22 +702,21 @@ local function security_findings(services, called_aet, info, qr_aet_reject)
   if retrieve and retrieve.ops["C-MOVE"] then qr_ops[#qr_ops + 1] = "C-MOVE" end
   if #qr_ops > 0 then
     findings[#findings + 1] = string.format(
-      "Query/Retrieve (%s) accepted - patient/study enumeration and image retrieval surface",
+      "Unauthenticated Query/Retrieve accepted (%s)",
       table.concat(qr_ops, ", "))
   end
   if storage and storage.accepted then
     findings[#findings + 1] = string.format(
-      "%d Storage SOP class%s accepted - unauthenticated C-STORE (data/malware injection) surface",
+      "Unauthenticated Storage accepted (%d SOP class%s)",
       storage.sop_classes, storage.sop_classes == 1 and "" or "es")
   end
 
   if info.tls then
     findings[#findings + 1] =
-      "TLS association completed without a client certificate - no mutual TLS / IHE ATNA node authentication"
+      "No mutual TLS (associated without client certificate)"
     if info.cert then cert_findings(info.cert, findings) end
   else
-    findings[#findings + 1] =
-      "Plaintext transport - associations and PHI exposed on the wire (consider DICOM-over-TLS, PS3.15 Annex B)"
+    findings[#findings + 1] = "Plaintext transport (no TLS)"
   end
 
   return findings
@@ -790,33 +764,6 @@ end
 local function is_aet_reject(err)
   return type(err) == "table" and err.source == 1
     and (err.reason == 3 or err.reason == 7)
-end
-
--- Whether an error looks like a TLS handshake / mTLS rejection rather than
--- a non-DICOM application protocol banner (such as HTTP 400 on an HTTPS port).
-local function is_likely_mtls_error(err)
-  local s = tostring(err or "")
-  if s:find("unexpected response PDU", 1, true)
-      or s:find("PDU_TOO_LARGE", 1, true)
-      or s:find("TRUNCATED_PDU", 1, true) then
-    return false
-  end
-  return s:find("Failed to connect", 1, true) ~= nil
-    or s:find("Couldn't send ASSOCIATE request", 1, true) ~= nil
-    or s:find("CONNECTION_RESET", 1, true) ~= nil
-    or s:find("EOF", 1, true) ~= nil
-    or s:find("TIMEOUT", 1, true) ~= nil
-    or s:find("ERROR", 1, true) ~= nil
-end
-
-local function is_expected_dicom_tls_port(port)
-  if stdnse.get_script_args("dicom.tls") ~= nil then return true end
-  local vname = port.version and port.version.name
-  if vname == "dicom-tls" or vname == "dicom" then return true end
-  if vname and vname ~= "" and vname ~= "unknown" then return false end
-  if tonumber(port.number) == 2762 then return true end
-  if custom_ports and custom_ports[port.number] then return true end
-  return port.service == "dicom-tls" or port.service == "dicom"
 end
 
 -- Some SCPs (e.g. DCMTK/PatientIEBridge with CheckCallingAET=qronly) accept
@@ -909,8 +856,8 @@ local function retry_fragile(host, port, calling_ae, called_ae, err, opts)
   if not cok then
     return false
   end
-  stdnse.debug1("Minimal Verification canary succeeded; stepping down to basic (4 KB / 16 PCs)")
-  local bpcs, bentries = build_pcs("basic")
+  stdnse.debug1("Minimal Verification canary succeeded; stepping down to fragile (36 core SOPs, 4 KB / 16 PCs)")
+  local bpcs, bentries = build_pcs("fragile")
   local fopts = merge_opts(opts, { max_pcs = 16, max_rq_bytes = 4096 })
   local bok, berr, bresults, binfo =
     dicom.associate_extended(host, port, calling_ae, called_ae, bpcs, fopts)
@@ -965,13 +912,16 @@ action = function(host, port)
         retry_without_qr(host, port, calling_ae, called_ae, pcs, nil, nil, err, active_opts)
       if recovered then ok = true end
     else
-      local recovered, bpcs, bentries, bresults, binfo, brj =
-        retry_fragile(host, port, calling_ae, called_ae, err, active_opts)
+      local recovered, bpcs, bentries, bresults, binfo, brj = false
+      if probe ~= "basic" then
+        recovered, bpcs, bentries, bresults, binfo, brj =
+          retry_fragile(host, port, calling_ae, called_ae, err, active_opts)
+      end
       if recovered then
         ok = true
         downgraded_from = probe
         probe, pcs, entries, pc_results, info, qr_aet_reject =
-          "basic", bpcs, bentries, bresults, binfo, brj
+          "fragile", bpcs, bentries, bresults, binfo, brj
       elseif type(err) ~= "table" and not is_tls and stdnse.get_script_args("dicom.tls") == nil then
         -- Auto-detect DICOM-over-TLS when run without -sV / dicom.tls=true
         -- and the peer rejected plaintext with a reset or TLS alert PDU.
@@ -993,13 +943,16 @@ action = function(host, port)
             end
           else
             -- Also support fragile 4 KB legacy SCPs fronted by TLS.
-            local frec, fpcs, fentries, fresults, finfo, frj =
-              retry_fragile(host, port, calling_ae, called_ae, terr, tls_opts)
+            local frec, fpcs, fentries, fresults, finfo, frj = false
+            if probe ~= "basic" then
+              frec, fpcs, fentries, fresults, finfo, frj =
+                retry_fragile(host, port, calling_ae, called_ae, terr, tls_opts)
+            end
             if frec then
               ok, is_tls, active_opts = true, true, tls_opts
               downgraded_from = probe
               probe, pcs, entries, pc_results, info, qr_aet_reject =
-                "basic", fpcs, fentries, fresults, finfo, frj
+                "fragile", fpcs, fentries, fresults, finfo, frj
             elseif type(terr) == "table" then
               err, is_tls, active_opts = terr, true, tls_opts
             end
@@ -1032,7 +985,7 @@ action = function(host, port)
   if not ok then
     if type(err) ~= "table" then
       stdnse.debug1("Association failed: %s", err)
-      if is_tls and is_likely_mtls_error(err) and is_expected_dicom_tls_port(port) then
+      if is_tls and dicom.is_likely_mtls_error(err) and dicom.is_expected_dicom_tls_port(port) then
         out.dicom    = "TLS endpoint detected, but DICOM association failed."
         out.tls_hint = "Server likely requires Mutual TLS (mTLS) with valid client certificates."
         out.error    = tostring(err or "")
@@ -1144,7 +1097,7 @@ action = function(host, port)
   -- Ultrasound-only modality SCP) while accepting another Storage SOP class,
   -- run one small codec probe against that accepted Storage SOP class.
   local fb_uid = fallback_img_uid or fallback_storage_uid
-  if probe ~= "basic" and not ct_supported and fb_uid then
+  if (probe == "standard" or probe == "full") and not ct_supported and fb_uid then
     local ts_pcs = {}
     for _, ts_uid in ipairs(TS_STORAGE[probe]) do
       ts_pcs[#ts_pcs + 1] = {
@@ -1184,8 +1137,9 @@ action = function(host, port)
     local dnote = downgraded_from
       and string.format(", auto-downgraded from %s for fragile SCP", downgraded_from) or ""
     local what = (ts_probe_count > 0)
-      and string.format("%d SOP classes + %d transfer syntaxes proposed", sop_count, ts_probe_count)
-      or string.format("%d SOP classes proposed", sop_count)
+      and string.format("%d SOP class%s + %d transfer syntaxes proposed",
+        sop_count, sop_count == 1 and "" or "es", ts_probe_count)
+      or string.format("%d SOP class%s proposed", sop_count, sop_count == 1 and "" or "es")
     out.probe = string.format("%s (%s, %d association%s%s)",
       probe, what, n, n == 1 and "" or "s", dnote)
   end
@@ -1217,8 +1171,12 @@ action = function(host, port)
     if next(classes) then out.service_classes = sorted_keys(classes) end
     if next(commands) then out.service_commands = sorted_keys(commands) end
   end
-  if next(modalities) then out.modalities = sorted_keys(modalities) end
-  out.inferred_device_class = device_class(classes)
+  if next(modalities) then
+    out.modalities = table.concat(sorted_keys(modalities), ", ")
+  end
+  if probe ~= "basic" then
+    out.inferred_device_class = device_class(classes)
+  end
   if next(accepted_ts_set) then
     out.transfer_syntaxes = sorted_keys(accepted_ts_set)
   end
@@ -1258,7 +1216,7 @@ action = function(host, port)
   local security = stdnse.output_table()
   if info.tls then
     security.transport = "DICOM over TLS"
-    if info.cert then security.certificate = cert_table(info.cert) end
+    if verbose and info.cert then security.certificate = cert_table(info.cert) end
   else
     security.transport = "plaintext (no TLS)"
   end

@@ -256,7 +256,7 @@ jobs:
         if: steps.start_stack.outputs.startup_success == 'true' && matrix.dicom_server.name == 'orthanc'
         run: |
           OUT="${{ steps.test_cfind.outputs.cfind_out }}"
-          ! grep -qE 'NSE:.*failed|stack traceback:' "$OUT" \
+          ! grep -qE 'ERROR: Script execution failed|stack traceback:' "$OUT" \
             || { echo "::error::dicom-cfind-ls hit a Lua error"; tail -n 200 "$OUT"; exit 1; }
           grep -qE 'No studies found|studies:|studies_found:' "$OUT" \
             || { echo "::error::dicom-cfind-ls produced unexpected output"; tail -n 200 "$OUT"; exit 1; }
@@ -286,7 +286,7 @@ jobs:
           ! grep -qE '^[|]_?\s*version:' "$OUT" || { echo "::error::Unexpected version on TLS row"; exit 1; }
           grep -q "PORT" "$OUT" || { echo "::error::Nmap output missing PORT section"; exit 1; }
           INFO_OUT="${{ steps.test_info_tls.outputs.info_tls_out }}"
-          ! grep -qE 'NSE:.*failed|stack traceback:' "$INFO_OUT" \
+          ! grep -qE 'ERROR: Script execution failed|stack traceback:' "$INFO_OUT" \
             || { echo "::error::dicom-info hit a Lua error on TLS row"; tail -n 200 "$INFO_OUT"; exit 1; }
           grep -qE 'Mutual TLS|mTLS|TLS endpoint detected|Possible DICOM/TLS' "$INFO_OUT" \
             || { echo "::error::dicom-info missing TLS/mTLS diagnostic on TLS row"; tail -n 200 "$INFO_OUT"; exit 1; }

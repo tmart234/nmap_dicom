@@ -15,13 +15,11 @@ services:
       - ORTHANC__REGISTERED_USERS__orthanc=orthanc
       - ORTHANC__DICOM_SERVER_ENABLED=true
       - VERBOSE_ENABLED=true
-      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_ECHO=true # Allow C-ECHO easily
-      # Disable AE Title verification for simplicity in testing C-ECHO
-      - ORTHANC__DICOM_SERVER_VERIFY_CALLED_AET=false
-      # The following are likely not needed just for C-ECHO but don't hurt
-      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_FIND=true
-      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_MOVE=true
-      - ORTHANC__DICOM_SERVER_ALWAYS_ALLOW_STORE=true
+      - ORTHANC__DICOM_ALWAYS_ALLOW_ECHO=true
+      - ORTHANC__DICOM_CHECK_CALLED_AET=false
+      - ORTHANC__DICOM_ALWAYS_ALLOW_FIND=true
+      - ORTHANC__DICOM_ALWAYS_ALLOW_STORE=true
+      - ORTHANC__DICOM_ALWAYS_ALLOW_GET=true
     volumes:
       - orthanc_db:/var/lib/orthanc/db
     restart: unless-stopped
